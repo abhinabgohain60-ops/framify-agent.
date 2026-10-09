@@ -58,20 +58,37 @@ async def handle_msg(update: Update, context: ContextTypes.DEFAULT_TYPE):
     result = await loop.run_in_executor(None, run_agent, task)
     await status.edit_text(result[:4000])
 
+async def run_telegram_worker():
+    """Runs polling in an isolated background loop with retry tolerance."""
+    while True:
+        try:
+            bot_app = (
+                ApplicationBuilder()
+                .token(TELEGRAM_TOKEN)
+                .connect_timeout(30.0)
+                .read_timeout(30.0)
+                .write_timeout(30.0)
+                .build()
+            )
+            bot_app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_msg))
+            
+            await bot_app.initialize()
+            await bot_app.start()
+            await bot_app.updater.start_polling(drop_pending_updates=True)
+            
+            # Keep worker alive
+            while True:
+                await asyncio.sleep(3600)
+        except Exception as e:
+            print(f"Telegram polling error, retrying in 5s: {e}")
+            await asyncio.sleep(5)
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    bot_app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
-    bot_app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_msg))
-    
-    await bot_app.initialize()
-    await bot_app.start()
-    await bot_app.updater.start_polling()
-    
+    # Launch telegram background loop as a task so it doesn't block FastAPI startup
+    task = asyncio.create_task(run_telegram_worker())
     yield
-    
-    await bot_app.updater.stop()
-    await bot_app.stop()
-    await bot_app.shutdown()
+    task.cancel()
 
 api = FastAPI(lifespan=lifespan)
 
