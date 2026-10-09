@@ -32,7 +32,7 @@ tools = [run_terminal_command, write_project_file]
 
 def run_agent(prompt: str) -> str:
     chat = client.chats.create(
-        model="gemini-2.0-flash",
+        model="gemini-3.0-flash",
         config=types.GenerateContentConfig(
             system_instruction=(
                 "You are an autonomous engineering agent with full bash terminal execution and file writing tools. "
