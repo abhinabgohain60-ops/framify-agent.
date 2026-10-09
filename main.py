@@ -2,6 +2,8 @@ import os
 import asyncio
 import subprocess
 import time
+import urllib.request
+import re
 from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from telegram import Update
@@ -14,10 +16,10 @@ TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 ALLOWED_USER_ID = int(os.getenv("TELEGRAM_ADMIN_ID", "8513926902"))
 
 client = genai.Client(api_key=GEMINI_API_KEY)
-
 MODEL_NAME = "gemini-3.8-flash"
 
 def run_terminal_command(command: str) -> str:
+    """Executes a bash shell command in the container environment."""
     try:
         res = subprocess.run(command, shell=True, capture_output=True, text=True, timeout=120)
         out = res.stdout if res.stdout else res.stderr
@@ -26,12 +28,31 @@ def run_terminal_command(command: str) -> str:
         return f"Execution error: {str(e)}"
 
 def write_project_file(file_path: str, content: str) -> str:
+    """Writes files to disk, creating directories as needed."""
     os.makedirs(os.path.dirname(file_path) if os.path.dirname(file_path) else ".", exist_ok=True)
     with open(file_path, "w", encoding="utf-8") as f:
         f.write(content)
     return f"File '{file_path}' written successfully."
 
-tools = [run_terminal_command, write_project_file]
+def fetch_webpage(url: str) -> str:
+    """Fetches raw text content from any public HTTP/HTTPS URL."""
+    try:
+        req = urllib.request.Request(
+            url, 
+            headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
+        )
+        with urllib.request.urlopen(req, timeout=15) as response:
+            html = response.read().decode("utf-8", errors="ignore")
+            # Strip style, scripts, and HTML tags to extract clean text
+            cleaned = re.sub(r"<(script|style).*?</\1>", "", html, flags=re.DOTALL | re.IGNORECASE)
+            text = re.sub(r"<[^>]+>", " ", cleaned)
+            text = " ".join(text.split())
+            return text[:4000] if text else "Page loaded but no readable text found."
+    except Exception as e:
+        return f"Failed to fetch {url}: {str(e)}"
+
+# Register all python tools for Gemini
+agent_tools = [run_terminal_command, write_project_file, fetch_webpage]
 
 def run_agent(prompt: str) -> str:
     max_retries = 3
@@ -43,11 +64,11 @@ def run_agent(prompt: str) -> str:
                 model=MODEL_NAME,
                 config=types.GenerateContentConfig(
                     system_instruction=(
-                        "You are an autonomous engineering agent with full bash terminal execution and file writing tools. "
-                        "You have complete freedom to write custom scripts, install dependencies with pip, run code, "
-                        "and build your own tools to accomplish user objectives. Return clean results."
+                        "You are an autonomous engineering agent with live internet access, terminal execution, "
+                        "and file writing tools. You can fetch webpages directly using fetch_webpage, run curl/pip/python "
+                        "commands in bash, and write code files. Always complete tasks completely and report back."
                     ),
-                    tools=tools,
+                    tools=agent_tools,
                     temperature=0.2
                 )
             )
