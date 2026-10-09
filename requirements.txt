@@ -6,3 +6,5 @@ uvicorn
 duckduckgo-search
 e2b-code-interpreter
 supabase
+pillow
+matplotlib
