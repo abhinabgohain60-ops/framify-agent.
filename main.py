@@ -3,6 +3,7 @@ import asyncio
 import subprocess
 import time
 import urllib.request
+import ssl
 import re
 from contextlib import asynccontextmanager
 from fastapi import FastAPI
@@ -16,14 +17,17 @@ TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 ALLOWED_USER_ID = int(os.getenv("TELEGRAM_ADMIN_ID", "8513926902"))
 
 client = genai.Client(api_key=GEMINI_API_KEY)
-MODEL_NAME = "gemini-3.8-flash"
+# Switched to gemini-2.5-flash for 250-1500 RPD free quota limit
+MODEL_NAME = "gemini-2.5-flash"
 
 def run_terminal_command(command: str) -> str:
-    """Executes a bash shell command in the container environment."""
+    """Executes a bash shell command with a safety timeout."""
     try:
-        res = subprocess.run(command, shell=True, capture_output=True, text=True, timeout=120)
+        res = subprocess.run(command, shell=True, capture_output=True, text=True, timeout=60)
         out = res.stdout if res.stdout else res.stderr
         return out[:3000] if out else "Command executed with no output."
+    except subprocess.TimeoutExpired:
+        return "Command timed out after 60 seconds."
     except Exception as e:
         return f"Execution error: {str(e)}"
 
@@ -35,23 +39,31 @@ def write_project_file(file_path: str, content: str) -> str:
     return f"File '{file_path}' written successfully."
 
 def fetch_webpage(url: str) -> str:
-    """Fetches raw text content from any public HTTP/HTTPS URL."""
+    """Fetches web text with a 10s non-blocking timeout and clean browser headers."""
     try:
         req = urllib.request.Request(
             url, 
-            headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
+            headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120.0.0.0 Safari/537.36"}
         )
-        with urllib.request.urlopen(req, timeout=15) as response:
+        ctx = ssl.create_default_context()
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+        
+        with urllib.request.urlopen(req, timeout=10, context=ctx) as response:
+            status_code = response.getcode()
             html = response.read().decode("utf-8", errors="ignore")
-            # Strip style, scripts, and HTML tags to extract clean text
             cleaned = re.sub(r"<(script|style).*?</\1>", "", html, flags=re.DOTALL | re.IGNORECASE)
             text = re.sub(r"<[^>]+>", " ", cleaned)
             text = " ".join(text.split())
-            return text[:4000] if text else "Page loaded but no readable text found."
+            preview = text[:2000] if text else "Empty body"
+            return f"Status {status_code}: {preview}"
+    except urllib.error.HTTPError as e:
+        return f"HTTP error {e.code}: {e.reason}"
+    except urllib.error.URLError as e:
+        return f"Connection failed: {str(e.reason)}"
     except Exception as e:
-        return f"Failed to fetch {url}: {str(e)}"
+        return f"Fetch error: {str(e)}"
 
-# Register all python tools for Gemini
 agent_tools = [run_terminal_command, write_project_file, fetch_webpage]
 
 def run_agent(prompt: str) -> str:
@@ -65,14 +77,14 @@ def run_agent(prompt: str) -> str:
                 config=types.GenerateContentConfig(
                     system_instruction=(
                         "You are an autonomous engineering agent with live internet access, terminal execution, "
-                        "and file writing tools. You can fetch webpages directly using fetch_webpage, run curl/pip/python "
-                        "commands in bash, and write code files. Always complete tasks completely and report back."
+                        "and file writing tools. Complete programming and systems tasks directly and completely."
                     ),
                     tools=agent_tools,
                     temperature=0.2
                 )
             )
-            return chat.send_message(prompt).text
+            response = chat.send_message(prompt)
+            return response.text if response.text else "Task completed with no text output."
         except Exception as e:
             err_str = str(e)
             if ("503" in err_str or "UNAVAILABLE" in err_str) and attempt < max_retries - 1:
@@ -91,7 +103,16 @@ async def handle_msg(update: Update, context: ContextTypes.DEFAULT_TYPE):
     task = update.message.text
     status = await update.message.reply_text(f"Task received:\n'{task[:60]}...'\nProcessing on {MODEL_NAME}...")
     loop = asyncio.get_running_loop()
-    result = await loop.run_in_executor(None, run_agent, task)
+    
+    try:
+        # Safety cutoff to ensure tasks never hang Telegram polling indefinitely
+        result = await asyncio.wait_for(
+            loop.run_in_executor(None, run_agent, task),
+            timeout=90.0
+        )
+    except asyncio.TimeoutError:
+        result = "Error: Agent task timed out after 90 seconds."
+
     await status.edit_text(result[:4000])
 
 async def run_telegram_worker():
