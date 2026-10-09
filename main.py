@@ -14,6 +14,28 @@ ALLOWED_USER_ID = int(os.getenv("TELEGRAM_ADMIN_ID", "8513926902"))
 
 client = genai.Client(api_key=GEMINI_API_KEY)
 
+# Resolve best available model dynamically
+def get_best_model() -> str:
+    candidates = [
+        "gemini-2.0-flash",
+        "gemini-1.5-flash",
+        "gemini-1.5-pro",
+        "gemini-flash"
+    ]
+    try:
+        supported = [m.name.replace("models/", "") for m in client.models.list()]
+        for candidate in candidates:
+            if candidate in supported:
+                return candidate
+        if supported:
+            return supported[0]
+    except Exception:
+        pass
+    return "gemini-1.5-flash"
+
+ACTIVE_MODEL = get_best_model()
+print(f"Selected AI model: {ACTIVE_MODEL}")
+
 def run_terminal_command(command: str) -> str:
     try:
         res = subprocess.run(command, shell=True, capture_output=True, text=True, timeout=120)
@@ -33,7 +55,7 @@ tools = [run_terminal_command, write_project_file]
 def run_agent(prompt: str) -> str:
     try:
         chat = client.chats.create(
-            model="gemini-1.5-flash",
+            model=ACTIVE_MODEL,
             config=types.GenerateContentConfig(
                 system_instruction=(
                     "You are an autonomous engineering agent with full bash terminal execution and file writing tools. "
@@ -56,7 +78,7 @@ async def handle_msg(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     task = update.message.text
-    status = await update.message.reply_text(f"Task received:\n'{task[:60]}...'\nProcessing in cloud...")
+    status = await update.message.reply_text(f"Task received:\n'{task[:60]}...'\nProcessing on {ACTIVE_MODEL}...")
     loop = asyncio.get_running_loop()
     result = await loop.run_in_executor(None, run_agent, task)
     await status.edit_text(result[:4000])
@@ -81,8 +103,8 @@ async def run_telegram_worker():
             while True:
                 await asyncio.sleep(3600)
         except Exception as e:
-            print(f"Telegram polling error, retrying in 5s: {e}")
-            await asyncio.sleep(5)
+            # Backs off slightly if Render is running a rolling duplicate deploy
+            await asyncio.sleep(10)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -94,12 +116,12 @@ api = FastAPI(lifespan=lifespan)
 
 @api.get("/")
 def home():
-    return {"status": "Agent Online"}
+    return {"status": "Agent Online", "model": ACTIVE_MODEL}
 
 @api.get("/models")
 def list_models():
     try:
         available = [m.name for m in client.models.list()]
-        return {"models": available}
+        return {"active": ACTIVE_MODEL, "available_models": available}
     except Exception as e:
         return {"error": str(e)}
