@@ -1,0 +1,6 @@
+google-genai
+python-telegram-bot
+fastapi
+uvicorn
+requests
+pillow
