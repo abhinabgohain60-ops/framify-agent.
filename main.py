@@ -12,10 +12,12 @@ from telegram.ext import ApplicationBuilder, MessageHandler, filters, ContextTyp
 from google import genai
 from google.genai import types
 from duckduckgo_search import DDGS
+from e2b_code_interpreter import Sandbox
 
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 ALLOWED_USER_ID = int(os.getenv("TELEGRAM_ADMIN_ID", "8513926902"))
+E2B_API_KEY = os.getenv("E2B_API_KEY")
 
 client = genai.Client(api_key=GEMINI_API_KEY)
 MODEL_NAME = "gemini-3.5-flash-lite"
@@ -26,10 +28,38 @@ def record_activity():
     global last_progress_time
     last_progress_time = time.time()
 
+# ----------------- ISOLATED CLOUD MICROVM (E2B) -----------------
+
+def execute_in_cloud_microvm(code: str) -> str:
+    """Spins up an isolated, dedicated Linux MicroVM sandbox in the cloud and executes Python code safely."""
+    record_activity()
+    if not E2B_API_KEY:
+        return "ERROR: E2B_API_KEY environment variable is missing on Render."
+    
+    try:
+        with Sandbox.create(api_key=E2B_API_KEY) as sandbox:
+            execution = sandbox.run_code(code)
+            record_activity()
+            
+            output = []
+            if execution.text:
+                output.append(f"Result:\n{execution.text}")
+            if execution.logs.stdout:
+                output.append("Stdout:\n" + "".join(execution.logs.stdout))
+            if execution.logs.stderr:
+                output.append("Stderr:\n" + "".join(execution.logs.stderr))
+            if execution.error:
+                output.append(f"Execution Error: {execution.error.name}: {execution.error.value}\n{execution.error.traceback}")
+                
+            return "\n---\n".join(output) if output else "Code executed successfully in cloud MicroVM with no output."
+    except Exception as e:
+        record_activity()
+        return f"MicroVM error: {str(e)}"
+
 # ----------------- CLAUDE-EQUIVALENT CORE TOOLS -----------------
 
 def web_search(query: str) -> str:
-    """Performs live web searches to find documentation, code libraries, and answers."""
+    """Performs live web searches to find documentation, code libraries, or real-time facts."""
     record_activity()
     try:
         with DDGS() as ddgs:
@@ -69,7 +99,7 @@ def fetch_webpage(url: str) -> str:
         return f"Fetch error: {str(e)}"
 
 def run_terminal_command(command: str) -> str:
-    """Executes a shell command in the workspace directory with output capture."""
+    """Executes a bash shell command directly on the Render server."""
     record_activity()
     try:
         res = subprocess.run(command, shell=True, capture_output=True, text=True, timeout=60)
@@ -84,7 +114,7 @@ def run_terminal_command(command: str) -> str:
         return f"ERROR: Execution failed: {str(e)}"
 
 def write_project_file(file_path: str, content: str) -> str:
-    """Creates or completely overwrites a file on disk."""
+    """Writes files cleanly to local workspace disk."""
     record_activity()
     try:
         os.makedirs(os.path.dirname(file_path) if os.path.dirname(file_path) else ".", exist_ok=True)
@@ -97,7 +127,7 @@ def write_project_file(file_path: str, content: str) -> str:
         return f"ERROR: Could not write file: {str(e)}"
 
 def read_file(file_path: str, start_line: int = 1, line_count: int = 100) -> str:
-    """Reads specific lines of a file to inspect code without loading huge files."""
+    """Reads specific lines of a file without loading massive context."""
     record_activity()
     try:
         if not os.path.exists(file_path):
@@ -114,7 +144,7 @@ def read_file(file_path: str, start_line: int = 1, line_count: int = 100) -> str
         return f"ERROR: Could not read file: {str(e)}"
 
 def patch_file(file_path: str, target_block: str, replacement_block: str) -> str:
-    """Surgically replaces a snippet of text inside a file without rewriting the entire file."""
+    """Surgically replaces a snippet of text inside a file without rewriting the whole file."""
     record_activity()
     try:
         if not os.path.exists(file_path):
@@ -135,6 +165,7 @@ def patch_file(file_path: str, target_block: str, replacement_block: str) -> str
         return f"ERROR: Patch failed: {str(e)}"
 
 agent_tools = [
+    execute_in_cloud_microvm,
     web_search, 
     fetch_webpage, 
     run_terminal_command, 
@@ -144,12 +175,13 @@ agent_tools = [
 ]
 
 SYSTEM_PROMPT = (
-    "You are an Elite Autonomous Full-Stack AI Engineer running on an Ubuntu container.\n\n"
-    "TOOL USAGE PROTOCOLS:\n"
-    "1. RESEARCH: Use `web_search` and `fetch_webpage` whenever you need current docs, solutions, or API specifications.\n"
-    "2. SAFE CODE EDITS: Use `read_file` to inspect code and `patch_file` for modifications. Do not rewrite large files if you can patch them.\n"
-    "3. TERMINAL RESILIENCE: Run terminal commands to test and verify your work. If a command fails, read the stderr, fix the problem, and retry.\n"
-    "4. MANDATORY REPORT: Always finish with a clear text summary detailing the actions you took and the outcome."
+    "You are an Elite Autonomous Full-Stack AI Engineer and Systems Architect.\n\n"
+    "OPERATIONAL CAPABILITIES:\n"
+    "1. CLOUD MICROVM EXECUTION: Whenever testing custom logic, running data pipelines, or trying complex code that could crash the host, run it inside `execute_in_cloud_microvm`.\n"
+    "2. INTERNET RESEARCH: Use `web_search` and `fetch_webpage` to retrieve live documentation, package details, or troubleshoot errors.\n"
+    "3. SAFE CODE EDITS: Use `read_file` to inspect code and `patch_file` for targeted changes.\n"
+    "4. TERMINAL RESILIENCE: Run terminal commands to test and verify workspace state. If a command fails, inspect stderr, adapt, and retry.\n"
+    "5. MANDATORY REPORT: Always finish with a clear text summary detailing the actions you took and the outcome."
 )
 
 def run_autonomous_agent(prompt: str) -> str:
@@ -186,13 +218,12 @@ async def handle_msg(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         task = update.message.text
-        status = await update.message.reply_text(f"Task Received:\n'{task[:60]}...'\nExecuting...")
+        status = await update.message.reply_text(f"Task Received:\n'{task[:60]}...'\nExecuting across cloud toolchain...")
         loop = asyncio.get_running_loop()
         
         record_activity()
         agent_future = loop.run_in_executor(None, run_autonomous_agent, task)
         
-        # 120s watchdog between tool operations
         max_idle_seconds = 120.0
         stuck = False
         while not agent_future.done():
