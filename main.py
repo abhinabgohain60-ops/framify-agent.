@@ -17,6 +17,7 @@ from groq import Groq
 from duckduckgo_search import DDGS
 from e2b_code_interpreter import Sandbox
 from supabase import create_client, Client
+from github import Github, GithubException
 
 # Environment Variables & Auth (Sanitized)
 GEMINI_API_KEY = (os.getenv("GEMINI_API_KEY") or "").strip()
@@ -26,16 +27,19 @@ ALLOWED_USER_ID = int((os.getenv("TELEGRAM_ADMIN_ID") or "8513926902").strip() o
 E2B_API_KEY = (os.getenv("E2B_API_KEY") or "").strip()
 SUPABASE_URL = (os.getenv("SUPABASE_URL") or "").strip().rstrip("/")
 SUPABASE_KEY = (os.getenv("SUPABASE_KEY") or "").strip()
+GITHUB_TOKEN = (os.getenv("GITHUB_TOKEN") or "").strip()
+DEFAULT_REPO = (os.getenv("GITHUB_REPO") or "abhinabgohain60-ops/framify-agent.").strip()
 
 # Clients
 gemini_client = genai.Client(api_key=GEMINI_API_KEY)
 groq_client = Groq(api_key=GROQ_API_KEY) if GROQ_API_KEY else None
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY) if (SUPABASE_URL and SUPABASE_KEY) else None
+github_client = Github(GITHUB_TOKEN) if GITHUB_TOKEN else None
 
 GEMINI_MODEL = "gemini-3.5-flash-lite"
 LLAMA_MODEL = "llama-3.3-70b-versatile"
 
-# Context tracking for Telegram file sending
+# Context tracking for Telegram file dispatch
 active_chat_id: contextvars.ContextVar[int] = contextvars.ContextVar("active_chat_id", default=0)
 bot_instance = None
 main_loop = None
@@ -46,10 +50,75 @@ def record_activity():
     global last_progress_time
     last_progress_time = time.time()
 
-# ----------------- TELEGRAM MEDIA DELIVERY TOOLS -----------------
+# ----------------- PHASE 3: GITHUB REPO & SELF-IMPROVEMENT TOOLS -----------------
+
+def github_read_file(file_path: str, repo_name: str = "", branch: str = "main") -> str:
+    """Reads the raw contents of a file directly from a GitHub repository."""
+    record_activity()
+    if not github_client:
+        return "ERROR: GITHUB_TOKEN is not configured on Render."
+    target_repo = repo_name.strip() if repo_name.strip() else DEFAULT_REPO
+    try:
+        repo = github_client.get_repo(target_repo)
+        file_content = repo.get_contents(file_path, ref=branch)
+        record_activity()
+        return file_content.decoded_content.decode("utf-8")
+    except Exception as e:
+        record_activity()
+        return f"GitHub read error: {str(e)}"
+
+def github_commit_file(file_path: str, content: str, commit_message: str, repo_name: str = "", branch: str = "main") -> str:
+    """Creates or updates a file directly in a GitHub repository and commits the change. Triggers auto-deployment on Render if committed to main."""
+    record_activity()
+    if not github_client:
+        return "ERROR: GITHUB_TOKEN is not configured on Render."
+    target_repo = repo_name.strip() if repo_name.strip() else DEFAULT_REPO
+    try:
+        repo = github_client.get_repo(target_repo)
+        try:
+            existing_file = repo.get_contents(file_path, ref=branch)
+            repo.update_file(
+                path=file_path,
+                message=commit_message,
+                content=content,
+                sha=existing_file.sha,
+                branch=branch
+            )
+            record_activity()
+            return f"SUCCESS: Updated '{file_path}' in '{target_repo}' ({branch}) with message: '{commit_message}'."
+        except GithubException as ge:
+            if ge.status == 404:
+                repo.create_file(
+                    path=file_path,
+                    message=commit_message,
+                    content=content,
+                    branch=branch
+                )
+                record_activity()
+                return f"SUCCESS: Created new file '{file_path}' in '{target_repo}' ({branch}) with message: '{commit_message}'."
+            raise ge
+    except Exception as e:
+        record_activity()
+        return f"GitHub commit error: {str(e)}"
+
+def github_create_repository(repo_name: str, description: str = "", private: bool = False) -> str:
+    """Creates a new GitHub repository under the authenticated user's account."""
+    record_activity()
+    if not github_client:
+        return "ERROR: GITHUB_TOKEN is not configured on Render."
+    try:
+        user = github_client.get_user()
+        new_repo = user.create_repo(name=repo_name, description=description, private=private, auto_init=True)
+        record_activity()
+        return f"SUCCESS: Created repository '{new_repo.full_name}' (URL: {new_repo.html_url})."
+    except Exception as e:
+        record_activity()
+        return f"GitHub repo creation error: {str(e)}"
+
+# ----------------- PHASE 2: TELEGRAM MEDIA DELIVERY TOOLS -----------------
 
 def send_telegram_photo(file_path: str, caption: str = "") -> str:
-    """Sends a local image (PNG, JPG, WEBP) directly to the Telegram user chat."""
+    """Sends a local image (PNG, JPG, WEBP) directly to the Telegram chat."""
     record_activity()
     if not os.path.exists(file_path):
         return f"ERROR: File '{file_path}' does not exist on disk."
@@ -90,7 +159,7 @@ def send_telegram_document(file_path: str, caption: str = "") -> str:
         record_activity()
         return f"Failed to send document: {str(e)}"
 
-# ----------------- LONG-TERM MEMORY TOOLS -----------------
+# ----------------- PHASE 1: LONG-TERM MEMORY TOOLS -----------------
 
 def remember_information(key: str, value: str, category: str = "general") -> str:
     """Stores or updates persistent knowledge, project notes, user preferences, or snippets in Supabase."""
@@ -103,7 +172,7 @@ def remember_information(key: str, value: str, category: str = "general") -> str
             "value": value.strip(),
             "category": category.strip().lower()
         }
-        res = supabase.table("chintu_memory").upsert(data, on_conflict="key").execute()
+        supabase.table("chintu_memory").upsert(data, on_conflict="key").execute()
         record_activity()
         return f"SUCCESS: Remembered '{key}' under category '{category}'."
     except Exception as e:
@@ -291,8 +360,11 @@ def consult_llama_specialist(task_description: str, code_or_context: str) -> str
         record_activity()
         return f"Llama consultation error: {str(e)}"
 
-# Agent Tools
+# Full Toolbelt for Gemini Orchestrator
 agent_tools = [
+    github_read_file,
+    github_commit_file,
+    github_create_repository,
     send_telegram_photo,
     send_telegram_document,
     remember_information,
@@ -309,9 +381,14 @@ agent_tools = [
 
 SYSTEM_PROMPT = (
     "You are Chintu, an Autonomous Full-Stack AI Engineer and Team Coordinator.\n\n"
+    "GITHUB & SELF-IMPROVEMENT PROTOCOL:\n"
+    "- You have direct access to your repository and GitHub via `github_read_file` and `github_commit_file`.\n"
+    "- If asked to update or self-improve your codebase, inspect the file first with `github_read_file`, craft the clean upgrade, and commit it using `github_commit_file`.\n"
+    "- Commits to the main branch automatically trigger a new Render deployment.\n"
+    "- You can also create brand-new GitHub repositories for new user projects using `github_create_repository`.\n\n"
     "MEDIA DELIVERY PROTOCOL:\n"
-    "- If you generate an image, chart, or graph, save it locally and call `send_telegram_photo` to push it to the user.\n"
-    "- If you create or generate a code project, report, zip archive, or data file, call `send_telegram_document` to send it.\n\n"
+    "- Use `send_telegram_photo` for generated graphs, diagrams, and images.\n"
+    "- Use `send_telegram_document` for reports, data sheets, zip files, and code files.\n\n"
     "CO-WORK & MEMORY PROTOCOL:\n"
     "1. LONG-TERM MEMORY: Permanent cloud recall via Supabase. Call `recall_information` to load saved context; call `remember_information` to retain new facts.\n"
     "2. ROUTER & SCOUT: Use Gemini for high-level tasks, web reading, file manipulation, and coordination.\n"
@@ -342,7 +419,7 @@ def run_autonomous_agent(prompt: str, chat_id: int) -> str:
         follow_up = chat.send_message("Synthesize and summarize the work done.")
         if follow_up.text and follow_up.text.strip():
             return follow_up.text
-        return "Task completed."
+        return "Task completed across agent team."
         
     return response.text
 
@@ -405,17 +482,4 @@ async def run_telegram_worker():
             while True:
                 await asyncio.sleep(3600)
         except Exception as e:
-            print(f"Poller restarted: {e}", flush=True)
-            await asyncio.sleep(5)
-
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    task = asyncio.create_task(run_telegram_worker())
-    yield
-    task.cancel()
-
-api = FastAPI(lifespan=lifespan)
-
-@api.get("/")
-def home():
-    return {"status": "Agent Team Online", "models": [GEMINI_MODEL, LLAMA_MODEL], "memory": "Supabase Enabled", "media": "Telegram Delivery Enabled"}
+            print(f"Poller restarted: 
