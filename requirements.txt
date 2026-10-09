@@ -4,3 +4,4 @@ fastapi
 uvicorn
 requests
 pillow
+duckduckgo-search
