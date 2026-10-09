@@ -15,17 +15,21 @@ from google.genai import types
 from groq import Groq
 from duckduckgo_search import DDGS
 from e2b_code_interpreter import Sandbox
+from supabase import create_client, Client
 
-# API Keys & Auth
+# Environment Variables & Auth
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 ALLOWED_USER_ID = int(os.getenv("TELEGRAM_ADMIN_ID", "8513926902"))
 E2B_API_KEY = os.getenv("E2B_API_KEY")
+SUPABASE_URL = os.getenv("SUPABASE_URL")
+SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 
 # Clients
 gemini_client = genai.Client(api_key=GEMINI_API_KEY)
 groq_client = Groq(api_key=GROQ_API_KEY) if GROQ_API_KEY else None
+supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY) if (SUPABASE_URL and SUPABASE_KEY) else None
 
 GEMINI_MODEL = "gemini-3.5-flash-lite"
 LLAMA_MODEL = "llama-3.3-70b-versatile"
@@ -35,6 +39,59 @@ last_progress_time = time.time()
 def record_activity():
     global last_progress_time
     last_progress_time = time.time()
+
+# ----------------- LONG-TERM MEMORY TOOLS -----------------
+
+def remember_information(key: str, value: str, category: str = "general") -> str:
+    """Stores or updates persistent knowledge, project notes, user preferences, or snippets in Supabase."""
+    record_activity()
+    if not supabase:
+        return "ERROR: Supabase is not configured on Render."
+    try:
+        data = {
+            "key": key.strip().lower(),
+            "value": value.strip(),
+            "category": category.strip().lower()
+        }
+        res = supabase.table("chintu_memory").upsert(data, on_conflict="key").execute()
+        record_activity()
+        return f"SUCCESS: Remembered '{key}' under category '{category}'."
+    except Exception as e:
+        record_activity()
+        return f"Memory save error: {str(e)}"
+
+def recall_information(query_key: str = "") -> str:
+    """Searches and retrieves stored persistent knowledge or facts from Supabase."""
+    record_activity()
+    if not supabase:
+        return "ERROR: Supabase is not configured on Render."
+    try:
+        if query_key.strip():
+            res = (
+                supabase.table("chintu_memory")
+                .select("key, value, category, updated_at")
+                .ilike("key", f"%{query_key.strip()}%")
+                .limit(5)
+                .execute()
+            )
+        else:
+            res = (
+                supabase.table("chintu_memory")
+                .select("key, value, category, updated_at")
+                .order("updated_at", desc=True)
+                .limit(10)
+                .execute()
+            )
+        
+        record_activity()
+        if not res.data:
+            return f"No memories found matching '{query_key}'."
+            
+        memories = [f"[{m.get('category', 'general')}] {m.get('key')}: {m.get('value')}" for m in res.data]
+        return "Stored Memories:\n" + "\n---\n".join(memories)
+    except Exception as e:
+        record_activity()
+        return f"Memory recall error: {str(e)}"
 
 # ----------------- BASE TOOLS -----------------
 
@@ -154,7 +211,7 @@ def patch_file(file_path: str, target_block: str, replacement_block: str) -> str
         record_activity()
         return f"ERROR: {str(e)}"
 
-# ----------------- LLAMA 3.3 70B SPECIALIST TOOL -----------------
+# ----------------- LLAMA SPECIALIST TOOL -----------------
 
 def consult_llama_specialist(task_description: str, code_or_context: str) -> str:
     """Delegates deep reasoning, complex algorithmic work, architecture design, or difficult debugging to Llama 3.3 70B."""
@@ -168,9 +225,7 @@ def consult_llama_specialist(task_description: str, code_or_context: str) -> str
             "You receive complex sub-tasks, code architecture problems, and deep logic queries from Gemini. "
             "Analyze the problem rigorously, fix bugs, optimize algorithms, and provide clean, production-ready solutions."
         )
-        
         user_prompt = f"TASK:\n{task_description}\n\nCONTEXT/CODE:\n{code_or_context}"
-        
         response = groq_client.chat.completions.create(
             model=LLAMA_MODEL,
             messages=[
@@ -188,6 +243,8 @@ def consult_llama_specialist(task_description: str, code_or_context: str) -> str
 
 # Tools assigned to Gemini
 agent_tools = [
+    remember_information,
+    recall_information,
     consult_llama_specialist,
     execute_in_cloud_microvm,
     web_search,
@@ -200,11 +257,12 @@ agent_tools = [
 
 SYSTEM_PROMPT = (
     "You are Chintu, an Autonomous Full-Stack AI Engineer and Team Coordinator.\n\n"
-    "TEAM CO-WORK PROTOCOL:\n"
-    "1. ROUTER & SCOUT: You handle conversational flow, web searches, webpage reading, and file inspections. You have high token allowances, so do the heavy reading and information gathering yourself.\n"
-    "2. SPECIALIST ESCALATION: Whenever a task involves DEEP REASONING, complex algorithm design, difficult debugging, or multi-step logic architecture, call `consult_llama_specialist`. Provide it with a clear summary of the problem and the relevant context or code.\n"
-    "3. MICROVM EXECUTION: You can run Python scripts or tests inside `execute_in_cloud_microvm` directly, or let Llama design the code first before testing it.\n"
-    "4. FINAL SYNTHESIS: Combine your research and Llama's analysis into a clean, well-structured response for the user."
+    "CO-WORK & MEMORY PROTOCOL:\n"
+    "1. LONG-TERM MEMORY: You have permanent cloud recall. Use `recall_information` to retrieve user instructions, preferences, past project details, or code. Use `remember_information` whenever you learn important persistent facts or when the user tells you to remember something.\n"
+    "2. ROUTER & SCOUT: You handle conversational flow, web searches, webpage reading, and file inspections. You have high token allowances, so do the heavy reading and information gathering yourself.\n"
+    "3. SPECIALIST ESCALATION: Whenever a task involves DEEP REASONING, complex algorithm design, difficult debugging, or multi-step logic architecture, call `consult_llama_specialist`.\n"
+    "4. MICROVM EXECUTION: You can run Python scripts or tests inside `execute_in_cloud_microvm` directly.\n"
+    "5. FINAL SYNTHESIS: Combine your work into a crisp, direct summary."
 )
 
 def run_autonomous_agent(prompt: str) -> str:
@@ -225,7 +283,7 @@ def run_autonomous_agent(prompt: str) -> str:
     
     if not (response.text and response.text.strip()):
         record_activity()
-        follow_up = chat.send_message("Synthesize and summarize the work done, incorporating any specialist insights.")
+        follow_up = chat.send_message("Synthesize and summarize the work done.")
         if follow_up.text and follow_up.text.strip():
             return follow_up.text
         return "Task completed across agent team."
@@ -241,7 +299,7 @@ async def handle_msg(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         task = update.message.text
-        status = await update.message.reply_text(f"Task Received:\n'{task[:60]}...'\nCoordinating Gemini & Llama 70B...")
+        status = await update.message.reply_text(f"Task Received:\n'{task[:60]}...'\nProcessing...")
         loop = asyncio.get_running_loop()
         
         record_activity()
@@ -257,7 +315,7 @@ async def handle_msg(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         if stuck:
             agent_future.cancel()
-            await status.edit_text("Halt: Agent team was idle for > 2 minutes.")
+            await status.edit_text("Halt: Agent was idle for > 2 minutes.")
             return
 
         result = await agent_future
@@ -300,4 +358,4 @@ api = FastAPI(lifespan=lifespan)
 
 @api.get("/")
 def home():
-    return {"status": "Agent Team Online", "models": [GEMINI_MODEL, LLAMA_MODEL]}
+    return {"status": "Agent Team Online", "models": [GEMINI_MODEL, LLAMA_MODEL], "memory": "Supabase Enabled"}
