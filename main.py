@@ -7,12 +7,11 @@ import ssl
 import re
 from contextlib import asynccontextmanager
 from fastapi import FastAPI
-from fastapi.responses import FileResponse
-from fastapi.staticfiles import StaticFiles
 from telegram import Update
 from telegram.ext import ApplicationBuilder, MessageHandler, filters, ContextTypes
 from google import genai
 from google.genai import types
+from duckduckgo_search import DDGS
 
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
@@ -27,36 +26,27 @@ def record_activity():
     global last_progress_time
     last_progress_time = time.time()
 
-def run_terminal_command(command: str) -> str:
-    """Executes a bash shell command with output truncation and timeouts."""
-    record_activity()
-    try:
-        res = subprocess.run(command, shell=True, capture_output=True, text=True, timeout=60)
-        record_activity()
-        out = res.stdout if res.stdout else res.stderr
-        return out[:3000] if out else "Command executed successfully with no stdout/stderr."
-    except subprocess.TimeoutExpired:
-        record_activity()
-        return "ERROR: Command timed out after 60 seconds."
-    except Exception as e:
-        record_activity()
-        return f"ERROR: Execution failed: {str(e)}"
+# ----------------- CLAUDE-EQUIVALENT CORE TOOLS -----------------
 
-def write_project_file(file_path: str, content: str) -> str:
-    """Writes files cleanly to disk, creating parent directories automatically."""
+def web_search(query: str) -> str:
+    """Performs live web searches to find documentation, code libraries, and answers."""
     record_activity()
     try:
-        os.makedirs(os.path.dirname(file_path) if os.path.dirname(file_path) else ".", exist_ok=True)
-        with open(file_path, "w", encoding="utf-8") as f:
-            f.write(content)
-        record_activity()
-        return f"SUCCESS: File '{file_path}' written ({len(content)} bytes)."
+        with DDGS() as ddgs:
+            results = list(ddgs.text(query, max_results=4))
+        if not results:
+            return "No web results found."
+        
+        output = []
+        for r in results:
+            output.append(f"Title: {r.get('title')}\nURL: {r.get('href')}\nSnippet: {r.get('body')}\n")
+        return "\n---\n".join(output)
     except Exception as e:
         record_activity()
-        return f"ERROR: Could not write file: {str(e)}"
+        return f"Search error: {str(e)}"
 
 def fetch_webpage(url: str) -> str:
-    """Fetches web text cleanly without scripts/styles."""
+    """Fetches and extracts clean, readable text from any web URL."""
     record_activity()
     try:
         req = urllib.request.Request(
@@ -73,24 +63,96 @@ def fetch_webpage(url: str) -> str:
             cleaned = re.sub(r"<(script|style).*?</\1>", "", html, flags=re.DOTALL | re.IGNORECASE)
             text = re.sub(r"<[^>]+>", " ", cleaned)
             text = " ".join(text.split())
-            return f"Status {response.getcode()}: {text[:2500]}"
+            return f"Status {response.getcode()}:\n{text[:3000]}"
     except Exception as e:
         record_activity()
         return f"Fetch error: {str(e)}"
 
-agent_tools = [run_terminal_command, write_project_file, fetch_webpage]
+def run_terminal_command(command: str) -> str:
+    """Executes a shell command in the workspace directory with output capture."""
+    record_activity()
+    try:
+        res = subprocess.run(command, shell=True, capture_output=True, text=True, timeout=60)
+        record_activity()
+        out = res.stdout if res.stdout else res.stderr
+        return out[:3000] if out else "Command executed successfully with no output."
+    except subprocess.TimeoutExpired:
+        record_activity()
+        return "ERROR: Command timed out after 60 seconds."
+    except Exception as e:
+        record_activity()
+        return f"ERROR: Execution failed: {str(e)}"
+
+def write_project_file(file_path: str, content: str) -> str:
+    """Creates or completely overwrites a file on disk."""
+    record_activity()
+    try:
+        os.makedirs(os.path.dirname(file_path) if os.path.dirname(file_path) else ".", exist_ok=True)
+        with open(file_path, "w", encoding="utf-8") as f:
+            f.write(content)
+        record_activity()
+        return f"SUCCESS: File '{file_path}' written ({len(content)} bytes)."
+    except Exception as e:
+        record_activity()
+        return f"ERROR: Could not write file: {str(e)}"
+
+def read_file(file_path: str, start_line: int = 1, line_count: int = 100) -> str:
+    """Reads specific lines of a file to inspect code without loading huge files."""
+    record_activity()
+    try:
+        if not os.path.exists(file_path):
+            return f"ERROR: File '{file_path}' does not exist."
+        with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
+            lines = f.readlines()
+        
+        start = max(1, start_line) - 1
+        end = start + line_count
+        chunk = "".join(lines[start:end])
+        return f"Lines {start+1}-{min(len(lines), end)} of '{file_path}':\n{chunk}" if chunk else "Empty range."
+    except Exception as e:
+        record_activity()
+        return f"ERROR: Could not read file: {str(e)}"
+
+def patch_file(file_path: str, target_block: str, replacement_block: str) -> str:
+    """Surgically replaces a snippet of text inside a file without rewriting the entire file."""
+    record_activity()
+    try:
+        if not os.path.exists(file_path):
+            return f"ERROR: File '{file_path}' not found."
+        with open(file_path, "r", encoding="utf-8") as f:
+            content = f.read()
+        
+        if target_block not in content:
+            return f"ERROR: Target block not found in '{file_path}'. Verify lines using read_file first."
+        
+        updated = content.replace(target_block, replacement_block, 1)
+        with open(file_path, "w", encoding="utf-8") as f:
+            f.write(updated)
+        record_activity()
+        return f"SUCCESS: Patched '{file_path}' successfully."
+    except Exception as e:
+        record_activity()
+        return f"ERROR: Patch failed: {str(e)}"
+
+agent_tools = [
+    web_search, 
+    fetch_webpage, 
+    run_terminal_command, 
+    write_project_file, 
+    read_file, 
+    patch_file
+]
 
 SYSTEM_PROMPT = (
-    "You are an Elite Full-Stack Systems Architect and DevOps Engineer running directly on an Ubuntu server container.\n\n"
-    "OPERATIONAL PROTOCOL:\n"
-    "1. PLAN BEFORE ACTING: Always formulate a 2-sentence logical plan before calling any tools.\n"
-    "2. AUTONOMOUS RECOVERY: If a bash command or tool returns an ERROR, do NOT give up or stop. Analyze the error output, determine the root cause, and attempt up to 2 alternate approaches.\n"
-    "3. COMPLETE CODE: Never output placeholders, ellipses ('// TODO'), or partial snippets. Always write clean, production-ready code.\n"
-    "4. MANDATORY TEXT SUMMARY: After calling tools, you MUST provide a final concise markdown report detailing what was accomplished and direct next steps."
+    "You are an Elite Autonomous Full-Stack AI Engineer running on an Ubuntu container.\n\n"
+    "TOOL USAGE PROTOCOLS:\n"
+    "1. RESEARCH: Use `web_search` and `fetch_webpage` whenever you need current docs, solutions, or API specifications.\n"
+    "2. SAFE CODE EDITS: Use `read_file` to inspect code and `patch_file` for modifications. Do not rewrite large files if you can patch them.\n"
+    "3. TERMINAL RESILIENCE: Run terminal commands to test and verify your work. If a command fails, read the stderr, fix the problem, and retry.\n"
+    "4. MANDATORY REPORT: Always finish with a clear text summary detailing the actions you took and the outcome."
 )
 
 def run_autonomous_agent(prompt: str) -> str:
-    """Executes a multi-turn chat session with automatic recovery loops."""
     global last_progress_time
     record_activity()
     
@@ -99,23 +161,19 @@ def run_autonomous_agent(prompt: str) -> str:
         config=types.GenerateContentConfig(
             system_instruction=SYSTEM_PROMPT,
             tools=agent_tools,
-            temperature=0.2  # Low temperature dramatically reduces coding hallucinations
+            temperature=0.2
         )
     )
     
-    # Send user prompt
     response = chat.send_message(prompt)
     record_activity()
     
-    # If the model called tools but didn't output text, prompt it for the final report
     if not (response.text and response.text.strip()):
         record_activity()
-        follow_up = chat.send_message(
-            "Synthesize your actions: Summarize the changes you made, list created files, and outline the exact results."
-        )
+        follow_up = chat.send_message("Synthesize and summarize what you did and the exact results achieved.")
         if follow_up.text and follow_up.text.strip():
             return follow_up.text
-        return "All tools and tasks executed successfully."
+        return "All tools executed successfully."
         
     return response.text
 
@@ -128,13 +186,13 @@ async def handle_msg(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         task = update.message.text
-        status = await update.message.reply_text(f"Task Queued:\n'{task[:60]}...'\nProcessing with peak reasoning...")
+        status = await update.message.reply_text(f"Task Received:\n'{task[:60]}...'\nExecuting...")
         loop = asyncio.get_running_loop()
         
         record_activity()
         agent_future = loop.run_in_executor(None, run_autonomous_agent, task)
         
-        # Idle watchdog: 120s max between tool steps
+        # 120s watchdog between tool operations
         max_idle_seconds = 120.0
         stuck = False
         while not agent_future.done():
@@ -145,7 +203,7 @@ async def handle_msg(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         if stuck:
             agent_future.cancel()
-            await status.edit_text("Halt: Agent exceeded idle timeout (no active progress for > 2 minutes).")
+            await status.edit_text("Halt: Agent was idle for > 2 minutes with no progress.")
             return
 
         result = await agent_future
@@ -186,16 +244,6 @@ async def lifespan(app: FastAPI):
 
 api = FastAPI(lifespan=lifespan)
 
-# Static file serving & health route
-if os.path.exists("public"):
-    api.mount("/static", StaticFiles(directory="public"), name="static")
-
 @api.get("/")
 def home():
     return {"status": "Agent Online", "model": MODEL_NAME}
-
-@api.get("/watermark")
-def serve_watermark():
-    if os.path.exists("public/index.html"):
-        return FileResponse("public/index.html")
-    return {"error": "Frontend UI file not found in public/index.html"}
