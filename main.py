@@ -5,22 +5,30 @@ import time
 import urllib.request
 import ssl
 import re
+import json
 from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from telegram import Update
 from telegram.ext import ApplicationBuilder, MessageHandler, filters, ContextTypes
 from google import genai
 from google.genai import types
+from groq import Groq
 from duckduckgo_search import DDGS
 from e2b_code_interpreter import Sandbox
 
+# API Keys & Auth
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 ALLOWED_USER_ID = int(os.getenv("TELEGRAM_ADMIN_ID", "8513926902"))
 E2B_API_KEY = os.getenv("E2B_API_KEY")
 
-client = genai.Client(api_key=GEMINI_API_KEY)
-MODEL_NAME = "gemini-3.5-flash-lite"
+# Clients
+gemini_client = genai.Client(api_key=GEMINI_API_KEY)
+groq_client = Groq(api_key=GROQ_API_KEY) if GROQ_API_KEY else None
+
+GEMINI_MODEL = "gemini-3.5-flash-lite"
+LLAMA_MODEL = "llama-3.3-70b-versatile"
 
 last_progress_time = time.time()
 
@@ -28,19 +36,17 @@ def record_activity():
     global last_progress_time
     last_progress_time = time.time()
 
-# ----------------- ISOLATED CLOUD MICROVM (E2B) -----------------
+# ----------------- BASE TOOLS -----------------
 
 def execute_in_cloud_microvm(code: str) -> str:
-    """Spins up an isolated, dedicated Linux MicroVM sandbox in the cloud and executes Python code safely."""
+    """Spins up an isolated Linux MicroVM sandbox in the cloud and executes Python code safely."""
     record_activity()
     if not E2B_API_KEY:
         return "ERROR: E2B_API_KEY environment variable is missing on Render."
-    
     try:
         with Sandbox.create(api_key=E2B_API_KEY) as sandbox:
             execution = sandbox.run_code(code)
             record_activity()
-            
             output = []
             if execution.text:
                 output.append(f"Result:\n{execution.text}")
@@ -49,34 +55,28 @@ def execute_in_cloud_microvm(code: str) -> str:
             if execution.logs.stderr:
                 output.append("Stderr:\n" + "".join(execution.logs.stderr))
             if execution.error:
-                output.append(f"Execution Error: {execution.error.name}: {execution.error.value}\n{execution.error.traceback}")
-                
-            return "\n---\n".join(output) if output else "Code executed successfully in cloud MicroVM with no output."
+                output.append(f"Execution Error: {execution.error.name}: {execution.error.value}")
+            return "\n---\n".join(output) if output else "Executed successfully in MicroVM with no output."
     except Exception as e:
         record_activity()
         return f"MicroVM error: {str(e)}"
 
-# ----------------- CLAUDE-EQUIVALENT CORE TOOLS -----------------
-
 def web_search(query: str) -> str:
-    """Performs live web searches to find documentation, code libraries, or real-time facts."""
+    """Performs live web searches using DuckDuckGo."""
     record_activity()
     try:
         with DDGS() as ddgs:
             results = list(ddgs.text(query, max_results=4))
         if not results:
             return "No web results found."
-        
-        output = []
-        for r in results:
-            output.append(f"Title: {r.get('title')}\nURL: {r.get('href')}\nSnippet: {r.get('body')}\n")
+        output = [f"Title: {r.get('title')}\nURL: {r.get('href')}\nSnippet: {r.get('body')}" for r in results]
         return "\n---\n".join(output)
     except Exception as e:
         record_activity()
         return f"Search error: {str(e)}"
 
 def fetch_webpage(url: str) -> str:
-    """Fetches and extracts clean, readable text from any web URL."""
+    """Fetches clean text content from a web URL."""
     record_activity()
     try:
         req = urllib.request.Request(
@@ -86,13 +86,11 @@ def fetch_webpage(url: str) -> str:
         ctx = ssl.create_default_context()
         ctx.check_hostname = False
         ctx.verify_mode = ssl.CERT_NONE
-        
         with urllib.request.urlopen(req, timeout=15, context=ctx) as response:
             record_activity()
             html = response.read().decode("utf-8", errors="ignore")
             cleaned = re.sub(r"<(script|style).*?</\1>", "", html, flags=re.DOTALL | re.IGNORECASE)
-            text = re.sub(r"<[^>]+>", " ", cleaned)
-            text = " ".join(text.split())
+            text = " ".join(re.sub(r"<[^>]+>", " ", cleaned).split())
             return f"Status {response.getcode()}:\n{text[:3000]}"
     except Exception as e:
         record_activity()
@@ -105,91 +103,116 @@ def run_terminal_command(command: str) -> str:
         res = subprocess.run(command, shell=True, capture_output=True, text=True, timeout=60)
         record_activity()
         out = res.stdout if res.stdout else res.stderr
-        return out[:3000] if out else "Command executed successfully with no output."
-    except subprocess.TimeoutExpired:
-        record_activity()
-        return "ERROR: Command timed out after 60 seconds."
+        return out[:3000] if out else "Success (no output)."
     except Exception as e:
         record_activity()
-        return f"ERROR: Execution failed: {str(e)}"
+        return f"Execution failed: {str(e)}"
 
 def write_project_file(file_path: str, content: str) -> str:
-    """Writes files cleanly to local workspace disk."""
+    """Writes content cleanly to a workspace file."""
     record_activity()
     try:
         os.makedirs(os.path.dirname(file_path) if os.path.dirname(file_path) else ".", exist_ok=True)
         with open(file_path, "w", encoding="utf-8") as f:
             f.write(content)
         record_activity()
-        return f"SUCCESS: File '{file_path}' written ({len(content)} bytes)."
+        return f"SUCCESS: File '{file_path}' written."
     except Exception as e:
         record_activity()
-        return f"ERROR: Could not write file: {str(e)}"
+        return f"ERROR: {str(e)}"
 
 def read_file(file_path: str, start_line: int = 1, line_count: int = 100) -> str:
-    """Reads specific lines of a file without loading massive context."""
+    """Reads specific lines from a workspace file."""
     record_activity()
     try:
         if not os.path.exists(file_path):
             return f"ERROR: File '{file_path}' does not exist."
         with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
             lines = f.readlines()
-        
         start = max(1, start_line) - 1
         end = start + line_count
-        chunk = "".join(lines[start:end])
-        return f"Lines {start+1}-{min(len(lines), end)} of '{file_path}':\n{chunk}" if chunk else "Empty range."
+        return f"Lines {start+1}-{min(len(lines), end)}:\n{''.join(lines[start:end])}"
     except Exception as e:
         record_activity()
-        return f"ERROR: Could not read file: {str(e)}"
+        return f"ERROR: {str(e)}"
 
 def patch_file(file_path: str, target_block: str, replacement_block: str) -> str:
-    """Surgically replaces a snippet of text inside a file without rewriting the whole file."""
+    """Surgically replaces a snippet of text inside a file."""
     record_activity()
     try:
         if not os.path.exists(file_path):
             return f"ERROR: File '{file_path}' not found."
         with open(file_path, "r", encoding="utf-8") as f:
             content = f.read()
-        
         if target_block not in content:
-            return f"ERROR: Target block not found in '{file_path}'. Verify lines using read_file first."
-        
-        updated = content.replace(target_block, replacement_block, 1)
+            return f"ERROR: Target block not found in '{file_path}'."
         with open(file_path, "w", encoding="utf-8") as f:
-            f.write(updated)
+            f.write(content.replace(target_block, replacement_block, 1))
         record_activity()
-        return f"SUCCESS: Patched '{file_path}' successfully."
+        return f"SUCCESS: Patched '{file_path}'."
     except Exception as e:
         record_activity()
-        return f"ERROR: Patch failed: {str(e)}"
+        return f"ERROR: {str(e)}"
 
+# ----------------- LLAMA 3.3 70B SPECIALIST TOOL -----------------
+
+def consult_llama_specialist(task_description: str, code_or_context: str) -> str:
+    """Delegates deep reasoning, complex algorithmic work, architecture design, or difficult debugging to Llama 3.3 70B."""
+    record_activity()
+    if not groq_client:
+        return "ERROR: GROQ_API_KEY is not configured on Render. Unable to consult Llama."
+
+    try:
+        system_msg = (
+            "You are the Lead Reasoning Specialist (Llama 3.3 70B). "
+            "You receive complex sub-tasks, code architecture problems, and deep logic queries from Gemini. "
+            "Analyze the problem rigorously, fix bugs, optimize algorithms, and provide clean, production-ready solutions."
+        )
+        
+        user_prompt = f"TASK:\n{task_description}\n\nCONTEXT/CODE:\n{code_or_context}"
+        
+        response = groq_client.chat.completions.create(
+            model=LLAMA_MODEL,
+            messages=[
+                {"role": "system", "content": system_msg},
+                {"role": "user", "content": user_prompt}
+            ],
+            temperature=0.2,
+            max_tokens=2048
+        )
+        record_activity()
+        return f"[Llama 3.3 70B Specialist Analysis]:\n{response.choices[0].message.content}"
+    except Exception as e:
+        record_activity()
+        return f"Llama consultation error: {str(e)}"
+
+# Tools assigned to Gemini
 agent_tools = [
+    consult_llama_specialist,
     execute_in_cloud_microvm,
-    web_search, 
-    fetch_webpage, 
-    run_terminal_command, 
-    write_project_file, 
-    read_file, 
+    web_search,
+    fetch_webpage,
+    run_terminal_command,
+    write_project_file,
+    read_file,
     patch_file
 ]
 
 SYSTEM_PROMPT = (
-    "You are an Elite Autonomous Full-Stack AI Engineer and Systems Architect.\n\n"
-    "OPERATIONAL CAPABILITIES:\n"
-    "1. CLOUD MICROVM EXECUTION: Whenever testing custom logic, running data pipelines, or trying complex code that could crash the host, run it inside `execute_in_cloud_microvm`.\n"
-    "2. INTERNET RESEARCH: Use `web_search` and `fetch_webpage` to retrieve live documentation, package details, or troubleshoot errors.\n"
-    "3. SAFE CODE EDITS: Use `read_file` to inspect code and `patch_file` for targeted changes.\n"
-    "4. TERMINAL RESILIENCE: Run terminal commands to test and verify workspace state. If a command fails, inspect stderr, adapt, and retry.\n"
-    "5. MANDATORY REPORT: Always finish with a clear text summary detailing the actions you took and the outcome."
+    "You are Chintu, an Autonomous Full-Stack AI Engineer and Team Coordinator.\n\n"
+    "TEAM CO-WORK PROTOCOL:\n"
+    "1. ROUTER & SCOUT: You handle conversational flow, web searches, webpage reading, and file inspections. You have high token allowances, so do the heavy reading and information gathering yourself.\n"
+    "2. SPECIALIST ESCALATION: Whenever a task involves DEEP REASONING, complex algorithm design, difficult debugging, or multi-step logic architecture, call `consult_llama_specialist`. Provide it with a clear summary of the problem and the relevant context or code.\n"
+    "3. MICROVM EXECUTION: You can run Python scripts or tests inside `execute_in_cloud_microvm` directly, or let Llama design the code first before testing it.\n"
+    "4. FINAL SYNTHESIS: Combine your research and Llama's analysis into a clean, well-structured response for the user."
 )
 
 def run_autonomous_agent(prompt: str) -> str:
     global last_progress_time
     record_activity()
     
-    chat = client.chats.create(
-        model=MODEL_NAME,
+    chat = gemini_client.chats.create(
+        model=GEMINI_MODEL,
         config=types.GenerateContentConfig(
             system_instruction=SYSTEM_PROMPT,
             tools=agent_tools,
@@ -202,10 +225,10 @@ def run_autonomous_agent(prompt: str) -> str:
     
     if not (response.text and response.text.strip()):
         record_activity()
-        follow_up = chat.send_message("Synthesize and summarize what you did and the exact results achieved.")
+        follow_up = chat.send_message("Synthesize and summarize the work done, incorporating any specialist insights.")
         if follow_up.text and follow_up.text.strip():
             return follow_up.text
-        return "All tools executed successfully."
+        return "Task completed across agent team."
         
     return response.text
 
@@ -218,7 +241,7 @@ async def handle_msg(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         task = update.message.text
-        status = await update.message.reply_text(f"Task Received:\n'{task[:60]}...'\nExecuting across cloud toolchain...")
+        status = await update.message.reply_text(f"Task Received:\n'{task[:60]}...'\nCoordinating Gemini & Llama 70B...")
         loop = asyncio.get_running_loop()
         
         record_activity()
@@ -234,7 +257,7 @@ async def handle_msg(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         if stuck:
             agent_future.cancel()
-            await status.edit_text("Halt: Agent was idle for > 2 minutes with no progress.")
+            await status.edit_text("Halt: Agent team was idle for > 2 minutes.")
             return
 
         result = await agent_future
@@ -277,4 +300,4 @@ api = FastAPI(lifespan=lifespan)
 
 @api.get("/")
 def home():
-    return {"status": "Agent Online", "model": MODEL_NAME}
+    return {"status": "Agent Team Online", "models": [GEMINI_MODEL, LLAMA_MODEL]}
