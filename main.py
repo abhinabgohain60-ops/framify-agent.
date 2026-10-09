@@ -50,10 +50,10 @@ def record_activity():
     global last_progress_time
     last_progress_time = time.time()
 
-# ----------------- PHASE 3: GITHUB REPO & SELF-IMPROVEMENT TOOLS -----------------
+# ----------------- GITHUB & SELF-IMPROVEMENT TOOLS -----------------
 
 def github_read_file(file_path: str, repo_name: str = "", branch: str = "main") -> str:
-    """Reads the raw contents of a file directly from a GitHub repository."""
+    """Reads raw text content from any file in a GitHub repository."""
     record_activity()
     if not github_client:
         return "ERROR: GITHUB_TOKEN is not configured on Render."
@@ -68,7 +68,7 @@ def github_read_file(file_path: str, repo_name: str = "", branch: str = "main") 
         return f"GitHub read error: {str(e)}"
 
 def github_commit_file(file_path: str, content: str, commit_message: str, repo_name: str = "", branch: str = "main") -> str:
-    """Creates or updates a file directly in a GitHub repository and commits the change. Triggers auto-deployment on Render if committed to main."""
+    """Creates or updates a file directly in GitHub and commits it, triggering auto-deploy on Render."""
     record_activity()
     if not github_client:
         return "ERROR: GITHUB_TOKEN is not configured on Render."
@@ -85,7 +85,7 @@ def github_commit_file(file_path: str, content: str, commit_message: str, repo_n
                 branch=branch
             )
             record_activity()
-            return f"SUCCESS: Updated '{file_path}' in '{target_repo}' ({branch}) with message: '{commit_message}'."
+            return f"SUCCESS: Updated '{file_path}' in '{target_repo}' ({branch})."
         except GithubException as ge:
             if ge.status == 404:
                 repo.create_file(
@@ -95,14 +95,14 @@ def github_commit_file(file_path: str, content: str, commit_message: str, repo_n
                     branch=branch
                 )
                 record_activity()
-                return f"SUCCESS: Created new file '{file_path}' in '{target_repo}' ({branch}) with message: '{commit_message}'."
+                return f"SUCCESS: Created '{file_path}' in '{target_repo}' ({branch})."
             raise ge
     except Exception as e:
         record_activity()
         return f"GitHub commit error: {str(e)}"
 
 def github_create_repository(repo_name: str, description: str = "", private: bool = False) -> str:
-    """Creates a new GitHub repository under the authenticated user's account."""
+    """Creates a new GitHub repository under your authenticated GitHub account."""
     record_activity()
     if not github_client:
         return "ERROR: GITHUB_TOKEN is not configured on Render."
@@ -110,21 +110,21 @@ def github_create_repository(repo_name: str, description: str = "", private: boo
         user = github_client.get_user()
         new_repo = user.create_repo(name=repo_name, description=description, private=private, auto_init=True)
         record_activity()
-        return f"SUCCESS: Created repository '{new_repo.full_name}' (URL: {new_repo.html_url})."
+        return f"SUCCESS: Created repository '{new_repo.full_name}'."
     except Exception as e:
         record_activity()
         return f"GitHub repo creation error: {str(e)}"
 
-# ----------------- PHASE 2: TELEGRAM MEDIA DELIVERY TOOLS -----------------
+# ----------------- TELEGRAM MEDIA DELIVERY TOOLS -----------------
 
 def send_telegram_photo(file_path: str, caption: str = "") -> str:
-    """Sends a local image (PNG, JPG, WEBP) directly to the Telegram chat."""
+    """Sends an image file (PNG, JPG, WEBP) directly to the Telegram user chat."""
     record_activity()
     if not os.path.exists(file_path):
         return f"ERROR: File '{file_path}' does not exist on disk."
     chat_id = active_chat_id.get()
     if not chat_id or not bot_instance or not main_loop:
-        return "ERROR: Telegram bot dispatch instance or chat_id is unavailable."
+        return "ERROR: Telegram dispatch bot or chat_id is unavailable."
 
     try:
         async def _send():
@@ -139,13 +139,13 @@ def send_telegram_photo(file_path: str, caption: str = "") -> str:
         return f"Failed to send photo: {str(e)}"
 
 def send_telegram_document(file_path: str, caption: str = "") -> str:
-    """Sends any local file (PDF, CSV, ZIP, TXT, code file) directly as a downloadable Telegram document."""
+    """Sends any file (PDF, CSV, ZIP, TXT, code file) as a downloadable document to Telegram."""
     record_activity()
     if not os.path.exists(file_path):
         return f"ERROR: File '{file_path}' does not exist on disk."
     chat_id = active_chat_id.get()
     if not chat_id or not bot_instance or not main_loop:
-        return "ERROR: Telegram bot dispatch instance or chat_id is unavailable."
+        return "ERROR: Telegram dispatch bot or chat_id is unavailable."
 
     try:
         async def _send():
@@ -159,10 +159,10 @@ def send_telegram_document(file_path: str, caption: str = "") -> str:
         record_activity()
         return f"Failed to send document: {str(e)}"
 
-# ----------------- PHASE 1: LONG-TERM MEMORY TOOLS -----------------
+# ----------------- LONG-TERM MEMORY TOOLS -----------------
 
 def remember_information(key: str, value: str, category: str = "general") -> str:
-    """Stores or updates persistent knowledge, project notes, user preferences, or snippets in Supabase."""
+    """Stores or updates persistent knowledge, project notes, or facts in Supabase."""
     record_activity()
     if not supabase:
         return "ERROR: Supabase is not configured on Render."
@@ -360,7 +360,6 @@ def consult_llama_specialist(task_description: str, code_or_context: str) -> str
         record_activity()
         return f"Llama consultation error: {str(e)}"
 
-# Full Toolbelt for Gemini Orchestrator
 agent_tools = [
     github_read_file,
     github_commit_file,
@@ -382,18 +381,18 @@ agent_tools = [
 SYSTEM_PROMPT = (
     "You are Chintu, an Autonomous Full-Stack AI Engineer and Team Coordinator.\n\n"
     "GITHUB & SELF-IMPROVEMENT PROTOCOL:\n"
-    "- You have direct access to your repository and GitHub via `github_read_file` and `github_commit_file`.\n"
-    "- If asked to update or self-improve your codebase, inspect the file first with `github_read_file`, craft the clean upgrade, and commit it using `github_commit_file`.\n"
-    "- Commits to the main branch automatically trigger a new Render deployment.\n"
-    "- You can also create brand-new GitHub repositories for new user projects using `github_create_repository`.\n\n"
+    "- When requested to commit or update code on GitHub, you MUST execute `github_commit_file` directly. Do not simulate file creation.\n"
+    "- You can inspect existing repository code using `github_read_file`.\n"
+    "- Commits to the main branch trigger auto-deployments on Render.\n"
+    "- Use `github_create_repository` when asked to scaffold fresh repositories.\n\n"
     "MEDIA DELIVERY PROTOCOL:\n"
-    "- Use `send_telegram_photo` for generated graphs, diagrams, and images.\n"
-    "- Use `send_telegram_document` for reports, data sheets, zip files, and code files.\n\n"
+    "- Use `send_telegram_photo` for generated graphs, diagrams, and plots.\n"
+    "- Use `send_telegram_document` for files, reports, logs, and zip archives.\n\n"
     "CO-WORK & MEMORY PROTOCOL:\n"
-    "1. LONG-TERM MEMORY: Permanent cloud recall via Supabase. Call `recall_information` to load saved context; call `remember_information` to retain new facts.\n"
-    "2. ROUTER & SCOUT: Use Gemini for high-level tasks, web reading, file manipulation, and coordination.\n"
-    "3. SPECIALIST ESCALATION: Call `consult_llama_specialist` for deep algorithmic, mathematical, or architectural reasoning.\n"
-    "4. EXECUTION: Use `execute_in_cloud_microvm` to run Python code safely or `run_terminal_command` for local server commands.\n"
+    "1. LONG-TERM MEMORY: Permanent cloud recall via Supabase. Call `recall_information` to load context; call `remember_information` to save facts.\n"
+    "2. ROUTER & SCOUT: Coordinate tasks, inspect files, and run web searches.\n"
+    "3. SPECIALIST ESCALATION: Call `consult_llama_specialist` for deep algorithmic or mathematical problems.\n"
+    "4. EXECUTION: Use `execute_in_cloud_microvm` for safe code testing or `run_terminal_command` for local server commands.\n"
     "5. Provide crisp, direct summaries."
 )
 
@@ -482,4 +481,22 @@ async def run_telegram_worker():
             while True:
                 await asyncio.sleep(3600)
         except Exception as e:
-            print(f"Poller restarted: 
+            print(f"Poller restarted: {e}", flush=True)
+            await asyncio.sleep(5)
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    task = asyncio.create_task(run_telegram_worker())
+    yield
+    task.cancel()
+
+api = FastAPI(lifespan=lifespan)
+
+@api.get("/")
+def home():
+    return {
+        "status": "Agent Team Online",
+        "models": [GEMINI_MODEL, LLAMA_MODEL],
+        "memory": "Supabase Enabled",
+        "media": "Telegram Delivery Enabled",
+        "github": "
