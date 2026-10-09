@@ -1,4 +1,5 @@
 google-genai
+groq
 python-telegram-bot
 fastapi
 uvicorn
