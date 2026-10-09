@@ -2,6 +2,5 @@ google-genai
 python-telegram-bot
 fastapi
 uvicorn
-requests
-pillow
 duckduckgo-search
+e2b-code-interpreter
