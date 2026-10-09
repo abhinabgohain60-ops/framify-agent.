@@ -17,8 +17,7 @@ TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 ALLOWED_USER_ID = int(os.getenv("TELEGRAM_ADMIN_ID", "8513926902"))
 
 client = genai.Client(api_key=GEMINI_API_KEY)
-# Switched to gemini-2.5-flash for 250-1500 RPD free quota limit
-MODEL_NAME = "gemini-2.5-flash"
+MODEL_NAME = "gemini-3.5-flash-lite"
 
 def run_terminal_command(command: str) -> str:
     """Executes a bash shell command with a safety timeout."""
@@ -105,7 +104,7 @@ async def handle_msg(update: Update, context: ContextTypes.DEFAULT_TYPE):
     loop = asyncio.get_running_loop()
     
     try:
-        # Safety cutoff to ensure tasks never hang Telegram polling indefinitely
+        # Safety cutoff prevents tasks from locking Telegram polling
         result = await asyncio.wait_for(
             loop.run_in_executor(None, run_agent, task),
             timeout=90.0
