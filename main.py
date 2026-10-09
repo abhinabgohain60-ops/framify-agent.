@@ -32,7 +32,7 @@ tools = [run_terminal_command, write_project_file]
 
 def run_agent(prompt: str) -> str:
     chat = client.chats.create(
-        model="gemini-2.5-flash",
+        model="gemini-2.0-flash",
         config=types.GenerateContentConfig(
             system_instruction=(
                 "You are an autonomous engineering agent with full bash terminal execution and file writing tools. "
@@ -76,7 +76,6 @@ async def run_telegram_worker():
             await bot_app.start()
             await bot_app.updater.start_polling(drop_pending_updates=True)
             
-            # Keep worker alive
             while True:
                 await asyncio.sleep(3600)
         except Exception as e:
@@ -85,7 +84,6 @@ async def run_telegram_worker():
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Launch telegram background loop as a task so it doesn't block FastAPI startup
     task = asyncio.create_task(run_telegram_worker())
     yield
     task.cancel()
