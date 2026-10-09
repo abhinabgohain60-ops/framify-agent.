@@ -31,19 +31,22 @@ def write_project_file(file_path: str, content: str) -> str:
 tools = [run_terminal_command, write_project_file]
 
 def run_agent(prompt: str) -> str:
-    chat = client.chats.create(
-        model="gemini-3.0-flash",
-        config=types.GenerateContentConfig(
-            system_instruction=(
-                "You are an autonomous engineering agent with full bash terminal execution and file writing tools. "
-                "You have complete freedom to write custom scripts, install dependencies with pip, run code, "
-                "and build your own tools to accomplish user objectives. Return clean results."
-            ),
-            tools=tools,
-            temperature=0.2
+    try:
+        chat = client.chats.create(
+            model="gemini-1.5-flash",
+            config=types.GenerateContentConfig(
+                system_instruction=(
+                    "You are an autonomous engineering agent with full bash terminal execution and file writing tools. "
+                    "You have complete freedom to write custom scripts, install dependencies with pip, run code, "
+                    "and build your own tools to accomplish user objectives. Return clean results."
+                ),
+                tools=tools,
+                temperature=0.2
+            )
         )
-    )
-    return chat.send_message(prompt).text
+        return chat.send_message(prompt).text
+    except Exception as e:
+        return f"Agent error: {str(e)}"
 
 async def handle_msg(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message or not update.message.text:
@@ -59,7 +62,6 @@ async def handle_msg(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await status.edit_text(result[:4000])
 
 async def run_telegram_worker():
-    """Runs polling in an isolated background loop with retry tolerance."""
     while True:
         try:
             bot_app = (
@@ -93,3 +95,11 @@ api = FastAPI(lifespan=lifespan)
 @api.get("/")
 def home():
     return {"status": "Agent Online"}
+
+@api.get("/models")
+def list_models():
+    try:
+        available = [m.name for m in client.models.list()]
+        return {"models": available}
+    except Exception as e:
+        return {"error": str(e)}
