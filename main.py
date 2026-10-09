@@ -6,6 +6,7 @@ import urllib.request
 import ssl
 import re
 import json
+import contextvars
 from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from telegram import Update
@@ -17,7 +18,7 @@ from duckduckgo_search import DDGS
 from e2b_code_interpreter import Sandbox
 from supabase import create_client, Client
 
-# Environment Variables & Auth (Sanitized against whitespaces & newlines)
+# Environment Variables & Auth (Sanitized)
 GEMINI_API_KEY = (os.getenv("GEMINI_API_KEY") or "").strip()
 GROQ_API_KEY = (os.getenv("GROQ_API_KEY") or "").strip()
 TELEGRAM_TOKEN = (os.getenv("TELEGRAM_BOT_TOKEN") or "").strip()
@@ -34,11 +35,60 @@ supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY) if (SUPABASE_URL an
 GEMINI_MODEL = "gemini-3.5-flash-lite"
 LLAMA_MODEL = "llama-3.3-70b-versatile"
 
+# Context tracking for Telegram file sending
+active_chat_id: contextvars.ContextVar[int] = contextvars.ContextVar("active_chat_id", default=0)
+bot_instance = None
+main_loop = None
+
 last_progress_time = time.time()
 
 def record_activity():
     global last_progress_time
     last_progress_time = time.time()
+
+# ----------------- TELEGRAM MEDIA DELIVERY TOOLS -----------------
+
+def send_telegram_photo(file_path: str, caption: str = "") -> str:
+    """Sends a local image (PNG, JPG, WEBP) directly to the Telegram user chat."""
+    record_activity()
+    if not os.path.exists(file_path):
+        return f"ERROR: File '{file_path}' does not exist on disk."
+    chat_id = active_chat_id.get()
+    if not chat_id or not bot_instance or not main_loop:
+        return "ERROR: Telegram bot dispatch instance or chat_id is unavailable."
+
+    try:
+        async def _send():
+            with open(file_path, "rb") as f:
+                await bot_instance.send_photo(chat_id=chat_id, photo=f, caption=caption[:1024])
+
+        asyncio.run_coroutine_threadsafe(_send(), main_loop).result(timeout=30)
+        record_activity()
+        return f"SUCCESS: Sent photo '{file_path}' to Telegram."
+    except Exception as e:
+        record_activity()
+        return f"Failed to send photo: {str(e)}"
+
+def send_telegram_document(file_path: str, caption: str = "") -> str:
+    """Sends any local file (PDF, CSV, ZIP, TXT, code file) directly as a downloadable Telegram document."""
+    record_activity()
+    if not os.path.exists(file_path):
+        return f"ERROR: File '{file_path}' does not exist on disk."
+    chat_id = active_chat_id.get()
+    if not chat_id or not bot_instance or not main_loop:
+        return "ERROR: Telegram bot dispatch instance or chat_id is unavailable."
+
+    try:
+        async def _send():
+            with open(file_path, "rb") as f:
+                await bot_instance.send_document(chat_id=chat_id, document=f, caption=caption[:1024])
+
+        asyncio.run_coroutine_threadsafe(_send(), main_loop).result(timeout=30)
+        record_activity()
+        return f"SUCCESS: Sent document '{file_path}' to Telegram."
+    except Exception as e:
+        record_activity()
+        return f"Failed to send document: {str(e)}"
 
 # ----------------- LONG-TERM MEMORY TOOLS -----------------
 
@@ -241,8 +291,10 @@ def consult_llama_specialist(task_description: str, code_or_context: str) -> str
         record_activity()
         return f"Llama consultation error: {str(e)}"
 
-# Tools assigned to Gemini
+# Agent Tools
 agent_tools = [
+    send_telegram_photo,
+    send_telegram_document,
     remember_information,
     recall_information,
     consult_llama_specialist,
@@ -257,17 +309,21 @@ agent_tools = [
 
 SYSTEM_PROMPT = (
     "You are Chintu, an Autonomous Full-Stack AI Engineer and Team Coordinator.\n\n"
+    "MEDIA DELIVERY PROTOCOL:\n"
+    "- If you generate an image, chart, or graph, save it locally and call `send_telegram_photo` to push it to the user.\n"
+    "- If you create or generate a code project, report, zip archive, or data file, call `send_telegram_document` to send it.\n\n"
     "CO-WORK & MEMORY PROTOCOL:\n"
-    "1. LONG-TERM MEMORY: You have permanent cloud recall. Use `recall_information` to retrieve user instructions, preferences, past project details, or code. Use `remember_information` whenever you learn important persistent facts or when the user tells you to remember something.\n"
-    "2. ROUTER & SCOUT: You handle conversational flow, web searches, webpage reading, and file inspections. You have high token allowances, so do the heavy reading and information gathering yourself.\n"
-    "3. SPECIALIST ESCALATION: Whenever a task involves DEEP REASONING, complex algorithm design, difficult debugging, or multi-step logic architecture, call `consult_llama_specialist`.\n"
-    "4. MICROVM EXECUTION: You can run Python scripts or tests inside `execute_in_cloud_microvm` directly.\n"
-    "5. FINAL SYNTHESIS: Combine your work into a crisp, direct summary."
+    "1. LONG-TERM MEMORY: Permanent cloud recall via Supabase. Call `recall_information` to load saved context; call `remember_information` to retain new facts.\n"
+    "2. ROUTER & SCOUT: Use Gemini for high-level tasks, web reading, file manipulation, and coordination.\n"
+    "3. SPECIALIST ESCALATION: Call `consult_llama_specialist` for deep algorithmic, mathematical, or architectural reasoning.\n"
+    "4. EXECUTION: Use `execute_in_cloud_microvm` to run Python code safely or `run_terminal_command` for local server commands.\n"
+    "5. Provide crisp, direct summaries."
 )
 
-def run_autonomous_agent(prompt: str) -> str:
+def run_autonomous_agent(prompt: str, chat_id: int) -> str:
     global last_progress_time
     record_activity()
+    active_chat_id.set(chat_id)
     
     chat = gemini_client.chats.create(
         model=GEMINI_MODEL,
@@ -286,7 +342,7 @@ def run_autonomous_agent(prompt: str) -> str:
         follow_up = chat.send_message("Synthesize and summarize the work done.")
         if follow_up.text and follow_up.text.strip():
             return follow_up.text
-        return "Task completed across agent team."
+        return "Task completed."
         
     return response.text
 
@@ -301,9 +357,10 @@ async def handle_msg(update: Update, context: ContextTypes.DEFAULT_TYPE):
         task = update.message.text
         status = await update.message.reply_text(f"Task Received:\n'{task[:60]}...'\nProcessing...")
         loop = asyncio.get_running_loop()
+        chat_id = update.effective_chat.id
         
         record_activity()
-        agent_future = loop.run_in_executor(None, run_autonomous_agent, task)
+        agent_future = loop.run_in_executor(None, run_autonomous_agent, task, chat_id)
         
         max_idle_seconds = 120.0
         stuck = False
@@ -324,6 +381,8 @@ async def handle_msg(update: Update, context: ContextTypes.DEFAULT_TYPE):
         print(f"Update handler error: {e}", flush=True)
 
 async def run_telegram_worker():
+    global bot_instance, main_loop
+    main_loop = asyncio.get_running_loop()
     await asyncio.sleep(3)
     while True:
         try:
@@ -335,6 +394,7 @@ async def run_telegram_worker():
                 .write_timeout(30.0)
                 .build()
             )
+            bot_instance = bot_app.bot
             bot_app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_msg))
             
             await bot_app.initialize()
@@ -358,4 +418,4 @@ api = FastAPI(lifespan=lifespan)
 
 @api.get("/")
 def home():
-    return {"status": "Agent Team Online", "models": [GEMINI_MODEL, LLAMA_MODEL], "memory": "Supabase Enabled"}
+    return {"status": "Agent Team Online", "models": [GEMINI_MODEL, LLAMA_MODEL], "memory": "Supabase Enabled", "media": "Telegram Delivery Enabled"}
