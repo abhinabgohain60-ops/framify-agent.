@@ -501,6 +501,28 @@ def execute_composio_action(action_name: str, arguments: dict = None) -> str:
         record_activity()
         return f"Composio execution note: {str(e)}"
 
+# --- DYNAMIC AGENT TOOLS ---
+
+def register_new_tool(tool_name: str, python_code: str) -> str:
+    """Appends and registers a new Python tool function to main.py after validating syntax."""
+    record_activity()
+    try:
+        compile(python_code, "<string>", "exec")
+        content = github_read_file("main.py")
+        if tool_name in content:
+            return f"Tool {tool_name} is already registered."
+        marker = "# --- DYNAMIC AGENT TOOLS ---"
+        if marker in content:
+            updated = content.replace(marker, f"{marker}\n\n{python_code}\n")
+        else:
+            updated = content + f"\n\n# Dynamic Tool: {tool_name}\n{python_code}\n"
+        github_commit_file("main.py", f"feat(tools): dynamically register {tool_name}", updated)
+        return f"Successfully registered and committed new tool: {tool_name}. System will reload."
+    except SyntaxError as se:
+        return f"Syntax error in tool code: {str(se)}"
+    except Exception as e:
+        return f"Failed to register tool: {str(e)}"
+
 agent_tools = [
     generate_ai_image,
     consult_hf_specialist,
@@ -525,7 +547,8 @@ agent_tools = [
     write_project_file,
     read_file,
     patch_file,
-    execute_composio_action
+    execute_composio_action,
+    register_new_tool
 ]
 
 available_tools = {t.__name__: t for t in agent_tools}
@@ -550,7 +573,13 @@ SYSTEM_PROMPT = (
     "- COMPOSIO UNIFIED ACTIONS: Use `execute_composio_action` to execute tools and actions across 1000+ apps (Gmail, Notion, GitHub, Twitter, Slack, etc.).\n"
     "- MEDIA: Use `send_telegram_photo` for charts and `send_telegram_document` for files.\n"
     "- MEMORY: Use `remember_information` and `recall_information` with Supabase.\n"
-    "- REASONING: Use `consult_llama_specialist` for complex logic or coding tasks."
+    "- REASONING: Use `consult_llama_specialist` for complex logic or coding tasks.\n\n"
+    "### STEP 1: CAPABILITY & TOOL AUDIT\n"
+    "When receiving a task, analyze whether existing tools can fulfill the objective. If a required capability or API integration is missing, do NOT hallucinate completion. Draft the required tool, test it via execute_in_cloud_microvm (E2B), and append it to main.py before attempting the user request.\n\n"
+    "### STEP 2: SEQUENTIAL STEP-BY-STEP EXECUTION\n"
+    "Decompose the primary objective into small, atomic tasks. Never execute everything in one monolithic prompt. Send a progress update to Telegram after each sub-task completes.\n\n"
+    "### STEP 3: RESILIENCY & AUDIT GATE\n"
+    "When generating code, pass all payloads through delegate_subtask with role='Auditor' (Llama 3.3 via Groq) before writing or deploying. Validate runtime code in the E2B sandbox. If an error occurs, analyze the error log, apply fixes, and re-test."
 )
 
 def run_autonomous_agent(prompt: str, chat_id: int) -> str:
