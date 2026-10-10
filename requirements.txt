@@ -11,3 +11,4 @@ matplotlib
 PyGithub
 apscheduler
 praw
+huggingface_hub
