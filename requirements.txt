@@ -10,3 +10,4 @@ pillow
 matplotlib
 PyGithub
 apscheduler
+praw
