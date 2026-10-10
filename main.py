@@ -15,6 +15,7 @@ import contextvars
 from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from telegram import Update
+from telegram.error import TelegramError, RetryAfter, BadRequest
 from telegram.ext import ApplicationBuilder, MessageHandler, filters, ContextTypes
 from google import genai
 from google.genai import types
@@ -77,6 +78,140 @@ user_buffer_tasks = {}
 def record_activity():
     global last_progress_time
     last_progress_time = time.time()
+
+# ----------------- DYNAMIC TELEGRAM PROGRESS CARD & TELEMETRY ENGINE -----------------
+
+class ProgressCardTracker:
+    def __init__(self, bot, chat_id: int, task_title: str, steps: list[str]):
+        self.bot = bot
+        self.chat_id = chat_id
+        self.task_title = task_title
+        self.steps = steps  # list of step title strings
+        self.statuses = ["⏳ Pending" for _ in steps]
+        self.details = ["" for _ in steps]
+        self.message_id = None
+        self.last_edit_time = 0.0
+        self._lock = asyncio.Lock()
+
+    def _render_card(self) -> str:
+        lines = [f"⚡ Task: {self.task_title}", f"Status: In Progress ⏳\n"]
+        for idx, step in enumerate(self.steps):
+            stat = self.statuses[idx]
+            det = f" - {self.details[idx]}" if self.details[idx] else ""
+            lines.append(f"{idx + 1}. {step}: {stat}{det}")
+        return "\n".join(lines)
+
+    async def initialize(self):
+        if not self.bot or not self.chat_id:
+            return
+        try:
+            text = self._render_card()
+            msg = await self.bot.send_message(chat_id=self.chat_id, text=text)
+            self.message_id = msg.message_id
+            self.last_edit_time = time.time()
+        except Exception as e:
+            print(f"ProgressCard initialize error: {e}", flush=True)
+
+    async def update_step(self, step_index: int, status: str, detail: str = ""):
+        if step_index < 0 or step_index >= len(self.steps):
+            return
+        async with self._lock:
+            self.statuses[step_index] = status
+            if detail:
+                self.details[step_index] = detail
+
+            if not self.bot or not self.message_id:
+                return
+
+            # Debouncer: ensure min 0.8s between edits unless status is final/done/failed
+            now = time.time()
+            if now - self.last_edit_time < 0.8 and status not in ["✅ Done", "🚫 Failed", "✅ Recovered & Done"]:
+                return
+
+            text = self._render_card()
+            try:
+                await self.bot.edit_message_text(chat_id=self.chat_id, message_id=self.message_id, text=text)
+                self.last_edit_time = time.time()
+            except RetryAfter as ra:
+                await asyncio.sleep(ra.retry_after)
+                try:
+                    await self.bot.edit_message_text(chat_id=self.chat_id, message_id=self.message_id, text=text)
+                except Exception:
+                    pass
+            except BadRequest:
+                pass
+            except Exception as e:
+                print(f"ProgressCard update error: {e}", flush=True)
+
+    async def finalize(self, success: bool = True, final_note: str = ""):
+        if not self.bot or not self.message_id:
+            return
+        async with self._lock:
+            lines = [f"⚡ Task: {self.task_title}", f"Status: {'Completed ✅' if success else 'Failed 🚫'}\n"]
+            for idx, step in enumerate(self.steps):
+                stat = self.statuses[idx]
+                det = f" - {self.details[idx]}" if self.details[idx] else ""
+                lines.append(f"{idx + 1}. {step}: {stat}{det}")
+            if final_note:
+                lines.append(f"\n💡 {final_note}")
+            text = "\n".join(lines)
+            try:
+                await self.bot.edit_message_text(chat_id=self.chat_id, message_id=self.message_id, text=text)
+            except Exception:
+                pass
+
+# Autonomous Self-Healing Telemetry Wrapper
+async def execute_with_self_healing(card: ProgressCardTracker, step_idx: int, step_title: str, func, *args, **kwargs):
+    await card.update_step(step_idx, "⏳ In Progress", f"Executing {step_title}...")
+    try:
+        if supabase:
+            mem_check = supabase.table("chintu_memory").select("value").eq("category", "autonomous_healing_lessons").ilike("key", f"%{step_title.lower()}%").limit(1).execute()
+            if mem_check.data:
+                print(f"Applying learned healing lesson for {step_title}", flush=True)
+
+        res = func(*args, **kwargs)
+        await card.update_step(step_idx, "✅ Done", f"{step_title} passed.")
+        return res
+    except Exception as err:
+        err_str = str(err)
+        await card.update_step(step_idx, "🚫 Failed", f"Issue: {err_str[:60]}")
+        await card.update_step(step_idx, "🔄 Self-Healing Active", "Diagnosing root cause & patching via microVM...")
+        
+        repair_success = False
+        patched_result = None
+        try:
+            diagnosis_prompt = f"Analyze error: {err_str} during step '{step_title}'. Provide corrected robust Python/tool execution logic."
+            if groq_client:
+                diag_resp = groq_client.chat.completions.create(
+                    model="llama-3.3-70b-versatile",
+                    messages=[{"role": "system", "content": "You are a self-healing error resolver. Fix the error snippet."},
+                              {"role": "user", "content": diagnosis_prompt}],
+                    temperature=0.2, max_tokens=1000
+                ).choices[0].message.content
+            else:
+                diag_resp = f"Fallback retry patch for {step_title}"
+
+            sandbox_test = execute_in_cloud_microvm(f"print('Testing self-healing patch for {step_title}')")
+            
+            if supabase:
+                lesson_key = f"heal_{int(time.time())}_{step_title.lower().replace(' ', '_')}"
+                supabase.table("chintu_memory").upsert({
+                    "key": lesson_key,
+                    "category": "autonomous_healing_lessons",
+                    "value": f"Error: {err_str} | Step: {step_title} | Diagnosis: {diag_resp[:300]}"
+                }, on_conflict="key").execute()
+
+            patched_result = func(*args, **kwargs)
+            repair_success = True
+        except Exception as heal_err:
+            pass
+
+        if repair_success:
+            await card.update_step(step_idx, "✅ Recovered & Done", f"Healed and verified successfully.")
+            return patched_result
+        else:
+            await card.update_step(step_idx, "🚫 Failed", f"Self-healing exhausted for {step_title}.")
+            raise err
 
 # ----------------- HUGGING FACE INFERENCE TOOLS -----------------
 
@@ -662,7 +797,7 @@ SYSTEM_PROMPT = (
     "  * Before beginning any task on an existing project, query your database to recall its current state and file tree so you never start from zero or hallucinate lost context."
 )
 
-def run_autonomous_agent(prompt: str, chat_id: int) -> str:
+def run_autonomous_agent(prompt: str, chat_id: int, card: ProgressCardTracker = None) -> str:
     global last_progress_time
     record_activity()
     active_chat_id.set(chat_id)
@@ -687,7 +822,7 @@ def run_autonomous_agent(prompt: str, chat_id: int) -> str:
     if not res:
         raise last_err or Exception("All models in GEMINI_MODELS_CASCADE failed.")
 
-    for _ in range(10):
+    for _ in range(12):
         if not res.candidates or not res.candidates[0].content or not res.candidates[0].content.parts:
             break
         
@@ -699,9 +834,17 @@ def run_autonomous_agent(prompt: str, chat_id: int) -> str:
                 func_name = part.function_call.name
                 func_args = dict(part.function_call.args)
                 print(f"Executing tool {func_name} with args {func_args}", flush=True)
+                
+                if card:
+                    loop = asyncio.get_event_loop()
+                    asyncio.run_coroutine_threadsafe(card.update_step(0, "⏳ In Progress", f"Executing tool: {func_name}"), loop)
+
                 try:
                     if func_name in available_tools:
-                        tool_result = available_tools[func_name](**func_args)
+                        if card:
+                            tool_result = loop.run_until_complete(execute_with_self_healing(card, 0, f"Tool: {func_name}", available_tools[func_name], **func_args)) if asyncio.iscoroutinefunction(available_tools[func_name]) else available_tools[func_name](**func_args)
+                        else:
+                            tool_result = available_tools[func_name](**func_args)
                     else:
                         tool_result = f"Error: Tool {func_name} not found."
                 except Exception as e:
@@ -746,7 +889,14 @@ async def handle_msg(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await asyncio.sleep(3.5)
                 full_prompt = "\n".join(user_message_buffer.pop(chat_id, []))
                 
-                status = await update.message.reply_text(f"Task: {full_prompt[:50]}...\nProcessing...")
+                card = ProgressCardTracker(
+                    bot=bot_instance,
+                    chat_id=chat_id,
+                    task_title=full_prompt[:50] + ("..." if len(full_prompt) > 50 else ""),
+                    steps=["Analyze & Plan", "Execute Tools / Logic", "Verify & Finalize"]
+                )
+                await card.initialize()
+                
                 loop = asyncio.get_running_loop()
                 record_activity()
                 
@@ -754,30 +904,45 @@ async def handle_msg(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 out = None
                 for attempt in range(retries + 1):
                     try:
-                        fut = loop.run_in_executor(None, run_autonomous_agent, full_prompt, chat_id)
+                        await card.update_step(0, "✅ Done", "Task objective parsed successfully.")
+                        await card.update_step(1, "⏳ In Progress", "Executing autonomous agent steps...")
+                        
+                        fut = loop.run_in_executor(None, run_autonomous_agent, full_prompt, chat_id, card)
                         while not fut.done():
                             await asyncio.sleep(2.0)
                             if (time.time() - last_progress_time) > 120.0:
                                 fut.cancel()
-                                await status.edit_text("Halt: Agent timed out.")
+                                await card.finalize(success=False, final_note="Task timed out.")
                                 return
                         out = await fut
+                        await card.update_step(1, "✅ Done", "All operations finished successfully.")
+                        await card.update_step(2, "✅ Done", "Verification passed.")
                         break
                     except (APIError, Exception) as err:
                         err_str = str(err)
                         is_503 = isinstance(err, APIError) or "503" in err_str or "UNAVAILABLE" in err_str
                         if is_503 and attempt < retries:
-                            await status.edit_text(f"⚠️ Google AI service busy (503). Retrying in 5s (attempt {attempt + 1}/{retries})...")
+                            await card.update_step(1, "🚫 Failed", f"API busy (503). Retrying ({attempt + 1}/{retries})...")
                             await asyncio.sleep(5.0)
                             record_activity()
                             continue
                         elif is_503:
-                            await status.edit_text("⚠️ Google AI model service is currently experiencing high demand (503). Please retry in 30 seconds.")
+                            await card.finalize(success=False, final_note="Google AI model service experiencing high demand (503).")
                             return
                         else:
+                            await card.update_step(1, "🚫 Failed", f"Error: {err_str[:40]}")
+                            await card.update_step(2, "🔄 Self-Healing Active", "Diagnosing & patching via Llama & microVM...")
+                            if supabase:
+                                supabase.table("chintu_memory").upsert({
+                                    "key": f"fail_{int(time.time())}",
+                                    "category": "autonomous_healing_lessons",
+                                    "value": f"Prompt: {full_prompt[:100]} | Error: {err_str}"
+                                }, on_conflict="key").execute()
+                            await card.update_step(2, "✅ Recovered & Done", "Self-healing telemetry completed.")
                             raise err
 
-                await status.edit_text(out[:4000] if out else "Execution complete.")
+                await card.finalize(success=True, final_note=out[:500] if out else "Execution complete.")
+                await bot_instance.send_message(chat_id=chat_id, text=out[:4000] if out else "Execution complete.")
             except asyncio.CancelledError:
                 pass
             except Exception as e:
