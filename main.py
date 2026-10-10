@@ -53,7 +53,7 @@ groq_client = Groq(api_key=GROQ_API_KEY) if GROQ_API_KEY else None
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY) if (SUPABASE_URL and SUPABASE_KEY) else None
 github_client = Github(GITHUB_TOKEN) if GITHUB_TOKEN else None
 
-GEMINI_MODEL = "gemini-3.5-flash-lite"
+GEMINI_MODEL = "gemini-2.5-flash"
 LLAMA_MODEL = "llama-3.3-70b-versatile"
 
 active_chat_id: contextvars.ContextVar[int] = contextvars.ContextVar("active_chat_id", default=0)
@@ -82,7 +82,6 @@ def generate_ai_image(prompt: str, filename: str = "concept_visual.png") -> str:
         filepath = os.path.join(tempfile.gettempdir(), filename)
         image.save(filepath)
         
-        # Dispatch directly to Telegram chat
         if TELEGRAM_BOT_TOKEN and ADMIN_CHAT_ID:
             with open(filepath, "rb") as photo_file:
                 url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendPhoto"
@@ -402,7 +401,6 @@ def run_terminal_command(command: str) -> str:
     record_activity()
     stripped_cmd = command.strip().lower()
     
-    # ENFORCE E2B SANDBOX ISOLATION: Block python/pip executions on host and re-route to E2B microVM
     if stripped_cmd.startswith(("python", "python3", "pip", "pip3", "pytest", "poetry")):
         return f"BLOCKED HOST EXECUTION: Executing Python or package management commands directly on Render host is forbidden.\nRe-routing to execute_in_cloud_microvm (E2B Cloud Sandbox)...\n\n" + execute_in_cloud_microvm(command)
     
@@ -519,7 +517,6 @@ def dispatch_to_agent(agent_id: str, task_prompt: str, context_payload: str = ""
         return "ERROR: Supabase is required for agent registry and learning memory."
     
     try:
-        # 1. Fetch agent profile from Supabase
         agent_res = supabase.table("chintu_agent_registry").select("*").eq("agent_id", agent_id.strip().lower()).execute()
         if not agent_res.data:
             return f"ERROR: Worker agent '{agent_id}' not found in Supabase registry."
@@ -528,7 +525,6 @@ def dispatch_to_agent(agent_id: str, task_prompt: str, context_payload: str = ""
         engine_model = agent_profile.get("engine_model", "Qwen/Qwen2.5-Coder-32B-Instruct")
         system_instructions = agent_profile.get("system_instructions", "")
         
-        # 2. Query chintu_mistakes_ledger for reflection and error prevention
         mistakes_res = supabase.table("chintu_mistakes_ledger").select("error_signature, root_cause, remedy").limit(10).execute()
         reflection_guidelines = ""
         if mistakes_res.data:
@@ -537,7 +533,6 @@ def dispatch_to_agent(agent_id: str, task_prompt: str, context_payload: str = ""
             
         full_instructions = f"{system_instructions}\n{reflection_guidelines}\n\nContext Payload:\n{context_payload}"
         
-        # 3. Route execution based on engine endpoint
         worker_output = ""
         if "Qwen" in engine_model or "hf" in engine_model.lower() or "/" in engine_model:
             if not HF_TOKEN:
@@ -565,7 +560,6 @@ def dispatch_to_agent(agent_id: str, task_prompt: str, context_payload: str = ""
         else:
             worker_output = consult_hf_specialist(f"{full_instructions}\n\nTask: {task_prompt}")
             
-        # 4. Log interaction into agent's task history in Supabase
         history_list = agent_profile.get("task_history") or []
         history_list.append({"task": task_prompt[:200], "timestamp": time.time(), "status": "success"})
         supabase.table("chintu_agent_registry").update({"task_history": history_list}).eq("agent_id", agent_id.strip().lower()).execute()
@@ -574,7 +568,6 @@ def dispatch_to_agent(agent_id: str, task_prompt: str, context_payload: str = ""
         return worker_output
     except Exception as e:
         record_activity()
-        # Record failure into chintu_mistakes_ledger for autonomous learning
         try:
             if supabase:
                 supabase.table("chintu_mistakes_ledger").insert({
@@ -706,7 +699,6 @@ def run_autonomous_agent(prompt: str, chat_id: int) -> str:
     res = chat.send_message(prompt)
     record_activity()
 
-    # Loop to handle function calls and multi-turn tool execution
     for _ in range(10):
         if not res.candidates or not res.candidates[0].content or not res.candidates[0].content.parts:
             break
@@ -757,7 +749,6 @@ async def handle_msg(update: Update, context: ContextTypes.DEFAULT_TYPE):
         chat_id = update.effective_chat.id
         msg_text = update.message.text
 
-        # ASYNC TELEGRAM MESSAGE DEBOUNCER (3.5-second buffer)
         user_message_buffer.setdefault(chat_id, []).append(msg_text)
         if chat_id in user_buffer_tasks:
             user_buffer_tasks[chat_id].cancel()
@@ -771,7 +762,6 @@ async def handle_msg(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 loop = asyncio.get_running_loop()
                 record_activity()
                 
-                # Wrapped with 503 retry logic
                 retries = 2
                 out = None
                 for attempt in range(retries + 1):
