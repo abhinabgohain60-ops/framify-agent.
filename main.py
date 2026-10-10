@@ -53,8 +53,17 @@ groq_client = Groq(api_key=GROQ_API_KEY) if GROQ_API_KEY else None
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY) if (SUPABASE_URL and SUPABASE_KEY) else None
 github_client = Github(GITHUB_TOKEN) if GITHUB_TOKEN else None
 
-GEMINI_MODEL = "gemini-3.5-flash-lite"
-LLAMA_MODEL = "llama-3.1-70b-versatile"
+# Speed-to-Power Pure Gemini Free-Tier Cascade
+GEMINI_MODELS_CASCADE = [
+    "gemini-3.5-flash-lite",
+    "gemini-3.1-flash-lite",
+    "gemini-2.5-flash-lite",
+    "gemini-3.6-flash",
+    "gemini-3.5-flash",
+    "gemini-2.5-flash",
+    "gemini-3.7-flash",
+    "gemini-3.8-flash",
+]
 
 active_chat_id: contextvars.ContextVar[int] = contextvars.ContextVar("active_chat_id", default=0)
 bot_instance = None
@@ -348,7 +357,7 @@ def cancel_scheduled_task(task_id: str) -> str:
         record_activity()
         return f"Failed to cancel task '{clean_id}': {str(e)}"
 
-# ----------------- SYSTEM & SPECIALIST -----------------
+# ----------------- SYSTEM & LLAMA OFFLINE CODE REPAIR ROLE -----------------
 
 def execute_in_cloud_microvm(code: str) -> str:
     """Executes Python code in an E2B microVM sandbox."""
@@ -453,41 +462,28 @@ def patch_file(file_path: str, target_block: str, replacement_block: str) -> str
         return f"Patch error: {str(e)}"
 
 def consult_llama_specialist(task_description: str, code_or_context: str) -> str:
-    """Consults Llama specialist on Groq for deep reasoning."""
+    """Consults Llama specialist (Groq) strictly for offline code repair, auditing, syntax optimization, and bug fixing."""
     record_activity()
     if not groq_client: return "ERROR: GROQ_API_KEY missing."
     try:
         resp = groq_client.chat.completions.create(
-            model=LLAMA_MODEL,
+            model="llama-3.3-70b-versatile",
             messages=[
-                {"role": "system", "content": "You are Llama Specialist. Solve complex engineering tasks."},
-                {"role": "user", "content": f"TASK:\n{task_description}\n\nCONTEXT:\n{code_or_context}"}
+                {"role": "system", "content": "You are Llama Code Auditor & Optimizer. Strictly analyze syntax, resolve logical flaws, optimize memory efficiency, and return refactored code."},
+                {"role": "user", "content": f"TASK:\n{task_description}\n\nCODE/CONTEXT:\n{code_or_context}"}
             ],
             temperature=0.2,
-            max_tokens=2048
+            max_tokens=4096
         )
         record_activity()
-        return f"[Llama Specialist]: {resp.choices[0].message.content}"
+        return resp.choices[0].message.content
     except Exception as e:
         record_activity()
-        return f"Llama error: {str(e)}"
+        return f"Llama offline audit error: {str(e)}"
 
 def delegate_subtask(role: str, task_description: str, code_payload: str = "") -> str:
-    """Executes a worker subtask or audits artifacts using Llama 3.1 / Groq consensus."""
-    record_activity()
-    if not groq_client:
-        return "ERROR: GROQ_API_KEY missing for delegate_subtask."
-    try:
-        prompt = f"Role: {role}\nTask: {task_description}\nPayload:\n{code_payload}"
-        chat_completion = groq_client.chat.completions.create(
-            messages=[{"role": "user", "content": prompt}],
-            model="llama-3.1-70b-versatile",
-        )
-        record_activity()
-        return chat_completion.choices[0].message.content
-    except Exception as e:
-        record_activity()
-        return f"Delegation error: {str(e)}"
+    """Executes a worker subtask or code audit via Llama 3.3 offline code repair engine."""
+    return consult_llama_specialist(f"Role: {role}\n{task_description}", code_payload)
 
 def execute_composio_action(action_name: str, arguments: dict = None) -> str:
     """Executes actions across 1000+ apps (Gmail, Notion, GitHub, Twitter, Slack) via Composio."""
@@ -511,7 +507,7 @@ def execute_composio_action(action_name: str, arguments: dict = None) -> str:
 # ----------------- PERMANENT AGENT DISPATCHER & SELF-LEARNING ENGINE -----------------
 
 def dispatch_to_agent(agent_id: str, task_prompt: str, context_payload: str = "") -> str:
-    """Invokes a persistent worker agent from the Supabase registry using its specialized model and instructions, incorporating past mistake remedies and skill learnings."""
+    """Invokes a persistent worker agent from the Supabase registry using its specialized model and instructions."""
     record_activity()
     if not supabase:
         return "ERROR: Supabase is required for agent registry and learning memory."
@@ -544,19 +540,6 @@ def dispatch_to_agent(agent_id: str, task_prompt: str, context_payload: str = ""
             ]
             resp = client.chat.completions.create(model=engine_model, messages=messages, max_tokens=1500)
             worker_output = resp.choices[0].message.content
-        elif "llama" in engine_model.lower():
-            if not groq_client:
-                return "ERROR: GROQ_API_KEY required for Groq worker agents."
-            resp = groq_client.chat.completions.create(
-                model=engine_model,
-                messages=[
-                    {"role": "system", "content": full_instructions},
-                    {"role": "user", "content": task_prompt}
-                ],
-                temperature=0.2,
-                max_tokens=1500
-            )
-            worker_output = resp.choices[0].message.content
         else:
             worker_output = consult_hf_specialist(f"{full_instructions}\n\nTask: {task_prompt}")
             
@@ -568,15 +551,6 @@ def dispatch_to_agent(agent_id: str, task_prompt: str, context_payload: str = ""
         return worker_output
     except Exception as e:
         record_activity()
-        try:
-            if supabase:
-                supabase.table("chintu_mistakes_ledger").insert({
-                    "error_signature": f"Agent {agent_id} execution failure",
-                    "root_cause": str(e),
-                    "remedy": "Check model availability, prompt formatting, or payload size."
-                }).execute()
-        except Exception:
-            pass
         return f"Agent dispatch error for '{agent_id}': {str(e)}"
 
 # --- DYNAMIC AGENT TOOLS ---
@@ -638,7 +612,7 @@ SYSTEM_PROMPT = (
     "### PERMANENT WORKFLOW RULES:\n"
     "1. DUAL-STAGE CODE AUDIT PIPELINE (MANDATORY FOR ALL CODE):\n"
     "   Every single piece of code generated—whether authored by you directly or returned by specialized worker agents—must pass through this two-stage audit before execution or commit:\n"
-    "   - STAGE 1 (Llama 3.1 via Groq): Deep inspection to fix syntax bugs, optimize runtime efficiency, resolve logic errors, and ensure strict mobile/viewport responsiveness.\n"
+    "   - STAGE 1 (Llama 3.3 via Groq Offline Code Repair): Deep inspection to fix syntax bugs, optimize runtime efficiency, resolve logic errors, and ensure strict mobile/viewport responsiveness.\n"
     "   - STAGE 2 (Gemini Flash Review & Approval): Final architectural sanity check. Gemini Flash inspects Llama's refined output, confirms complete alignment with the prompt, and issues the final APPROVE or REVISE verdict.\n"
     "   No code is permitted to be written, sandboxed, or committed without passing both stages.\n\n"
     "2. ADAPTIVE EXECUTION TRIAGE (STEP-BY-STEP VS. DIRECT FAST PATH):\n"
@@ -661,7 +635,7 @@ SYSTEM_PROMPT = (
     "- COMPOSIO UNIFIED ACTIONS: Use `execute_composio_action` to execute tools and actions across 1000+ apps (Gmail, Notion, GitHub, Twitter, Slack, etc.).\n"
     "- MEDIA: Use `send_telegram_photo` for charts and `send_telegram_document` for files.\n"
     "- MEMORY: Use `remember_information` and `recall_information` with Supabase.\n"
-    "- REASONING: Use `consult_llama_specialist` for complex logic or coding tasks.\n\n"
+    "- REASONING: Use `consult_llama_specialist` for offline code repair and deep reasoning.\n\n"
     "### 1. BOUNDARY & REPOSITORY ISOLATION DIRECTIVE:\n"
     "- YOUR CORE ENGINE REPO: You belong to your primary host repository (\"framify-agent\"). You are strictly authorized to inspect, refactor, upgrade, and self-heal your own codebase (\"main.py\", requirements, tool registries, and supporting scripts) ONLY to fix your bugs, improve your tools, patch function dispatchers, and evolve your internal engine.\n"
     "- SEPARATE REPOSITORIES FOR NEW PROJECTS:\n"
@@ -692,12 +666,26 @@ def run_autonomous_agent(prompt: str, chat_id: int) -> str:
     global last_progress_time
     record_activity()
     active_chat_id.set(chat_id)
-    chat = gemini_client.chats.create(
-        model=GEMINI_MODEL,
-        config=types.GenerateContentConfig(system_instruction=SYSTEM_PROMPT, tools=agent_tools, temperature=0.2)
-    )
-    res = chat.send_message(prompt)
-    record_activity()
+    
+    last_err = None
+    chat = None
+    res = None
+    
+    for model_name in GEMINI_MODELS_CASCADE:
+        try:
+            chat = gemini_client.chats.create(
+                model=model_name,
+                config=types.GenerateContentConfig(system_instruction=SYSTEM_PROMPT, tools=agent_tools, temperature=0.2)
+            )
+            res = chat.send_message(prompt)
+            record_activity()
+            break
+        except Exception as e:
+            last_err = e
+            continue
+            
+    if not res:
+        raise last_err or Exception("All models in GEMINI_MODELS_CASCADE failed.")
 
     for _ in range(10):
         if not res.candidates or not res.candidates[0].content or not res.candidates[0].content.parts:
