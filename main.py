@@ -84,6 +84,44 @@ def send_client_email(to_email: str, subject: str, message_body: str) -> str:
         record_activity()
         return f"Email sending error: {str(e)}"
 
+# ----------------- MULTI-PLATFORM CLIENT HUNTER -----------------
+
+def hunt_client_leads(service_niche: str = "video editor", platform: str = "all", time_range: str = "w") -> str:
+    """
+    Searches the live web across public platforms for fresh hiring and gig leads.
+    service_niche: e.g. 'video editor', 'thumbnail designer', 'motion graphics'
+    platform: 'reddit', 'x', 'creator_boards', or 'all'
+    time_range: 'd' (past 24h), 'w' (past week), or 'm' (past month)
+    """
+    record_activity()
+    queries = []
+    
+    if platform in ("reddit", "all"):
+        queries.append(f'site:reddit.com (inurl:CreatorServices OR inurl:forhire OR inurl:videography) "hiring" "{service_niche}"')
+    if platform in ("x", "all"):
+        queries.append(f'site:x.com ("looking for a {service_niche}" OR "hiring {service_niche}")')
+    if platform in ("creator_boards", "all"):
+        queries.append(f'"{service_niche} needed" ("portfolio" OR "budget" OR "contact")')
+
+    aggregated_leads = []
+    try:
+        with DDGS() as ddgs:
+            for q in queries:
+                raw_results = list(ddgs.text(q, timelimit=time_range, max_results=4))
+                for r in raw_results:
+                    title = r.get("title", "No Title")
+                    href = r.get("href", "")
+                    body = r.get("body", "")[:280].replace("\n", " ")
+                    aggregated_leads.append(f"• [{title}]({href})\n  Snippet: {body}\n")
+                    
+        record_activity()
+        if not aggregated_leads:
+            return f"No recent leads found for niche '{service_niche}' within time limit '{time_range}'."
+        return "\n".join(aggregated_leads)
+    except Exception as e:
+        record_activity()
+        return f"Lead hunting error: {str(e)}"
+
 # ----------------- GITHUB TOOLS -----------------
 
 def github_read_file(file_path: str, repo_name: str = "", branch: str = "main") -> str:
@@ -381,6 +419,7 @@ def consult_llama_specialist(task_description: str, code_or_context: str) -> str
 
 agent_tools = [
     send_client_email,
+    hunt_client_leads,
     schedule_recurring_task,
     list_scheduled_tasks,
     cancel_scheduled_task,
@@ -403,7 +442,7 @@ agent_tools = [
 
 SYSTEM_PROMPT = (
     "You are Chintu, an Autonomous Full-Stack AI Engineer.\n"
-    "- CLIENT OUTREACH: Use `send_client_email` to contact clients, deliver proposals, or send notifications directly.\n"
+    "- CLIENT ACQUISITION & LEAD HUNTING: Use `hunt_client_leads` to autonomously find fresh hiring and gig leads across Reddit, X, and creator boards using DuckDuckGo, and `send_client_email` to contact clients and deliver proposals.\n"
     "- AUTONOMOUS SCHEDULING: Use `schedule_recurring_task`, `list_scheduled_tasks`, and `cancel_scheduled_task` to manage background jobs.\n"
     "- GITHUB: Use `github_commit_file` to commit changes directly, `github_read_file` to read repo code, and `github_create_repository` for new repos.\n"
     "- MEDIA: Use `send_telegram_photo` for charts and `send_telegram_document` for files.\n"
