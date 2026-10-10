@@ -40,7 +40,7 @@ E2B_API_KEY = (os.getenv("E2B_API_KEY") or "").strip()
 SUPABASE_URL = (os.getenv("SUPABASE_URL") or "").strip().rstrip("/")
 SUPABASE_KEY = (os.getenv("SUPABASE_KEY") or "").strip()
 GITHUB_TOKEN = (os.getenv("GITHUB_TOKEN") or "").strip()
-DEFAULT_REPO = (os.getenv("GITHUB_REPO") or "abhinabgohain60-ops/framify-agent.").strip()
+DEFAULT_REPO = (os.getenv("GITHUB_REPO") or "abhinabgohain60-ops/framify-agent").strip()
 COMPOSIO_API_KEY = (os.getenv("COMPOSIO_API_KEY") or "").strip()
 
 # Email Configuration
@@ -53,8 +53,8 @@ groq_client = Groq(api_key=GROQ_API_KEY) if GROQ_API_KEY else None
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY) if (SUPABASE_URL and SUPABASE_KEY) else None
 github_client = Github(GITHUB_TOKEN) if GITHUB_TOKEN else None
 
-GEMINI_MODEL = "gemini-3.5-flash-lite"
-LLAMA_MODEL = "llama-3.3-70b-versatile"
+GEMINI_MODEL = "gemini-2.5-flash"
+LLAMA_MODEL = "llama-3.1-70b-versatile"
 
 active_chat_id: contextvars.ContextVar[int] = contextvars.ContextVar("active_chat_id", default=0)
 bot_instance = None
@@ -473,7 +473,7 @@ def consult_llama_specialist(task_description: str, code_or_context: str) -> str
         return f"Llama error: {str(e)}"
 
 def delegate_subtask(role: str, task_description: str, code_payload: str = "") -> str:
-    """Executes a worker subtask or audits artifacts using Llama 3.3 / Groq consensus."""
+    """Executes a worker subtask or audits artifacts using Llama 3.1 / Groq consensus."""
     record_activity()
     if not groq_client:
         return "ERROR: GROQ_API_KEY missing for delegate_subtask."
@@ -481,7 +481,7 @@ def delegate_subtask(role: str, task_description: str, code_payload: str = "") -
         prompt = f"Role: {role}\nTask: {task_description}\nPayload:\n{code_payload}"
         chat_completion = groq_client.chat.completions.create(
             messages=[{"role": "user", "content": prompt}],
-            model="llama-3.3-70b-versatile",
+            model="llama-3.1-70b-versatile",
         )
         record_activity()
         return chat_completion.choices[0].message.content
@@ -638,7 +638,7 @@ SYSTEM_PROMPT = (
     "### PERMANENT WORKFLOW RULES:\n"
     "1. DUAL-STAGE CODE AUDIT PIPELINE (MANDATORY FOR ALL CODE):\n"
     "   Every single piece of code generated—whether authored by you directly or returned by specialized worker agents—must pass through this two-stage audit before execution or commit:\n"
-    "   - STAGE 1 (Llama 3.3 via Groq): Deep inspection to fix syntax bugs, optimize runtime efficiency, resolve logic errors, and ensure strict mobile/viewport responsiveness.\n"
+    "   - STAGE 1 (Llama 3.1 via Groq): Deep inspection to fix syntax bugs, optimize runtime efficiency, resolve logic errors, and ensure strict mobile/viewport responsiveness.\n"
     "   - STAGE 2 (Gemini Flash Review & Approval): Final architectural sanity check. Gemini Flash inspects Llama's refined output, confirms complete alignment with the prompt, and issues the final APPROVE or REVISE verdict.\n"
     "   No code is permitted to be written, sandboxed, or committed without passing both stages.\n\n"
     "2. ADAPTIVE EXECUTION TRIAGE (STEP-BY-STEP VS. DIRECT FAST PATH):\n"
