@@ -528,6 +528,8 @@ agent_tools = [
     execute_composio_action
 ]
 
+available_tools = {t.__name__: t for t in agent_tools}
+
 SYSTEM_PROMPT = (
     "You are Chintu, an Autonomous Full-Stack AI Engineer operating under a Hierarchical Multi-Agent System (HMAS) Manager-Worker-Auditor architecture.\n"
     "- Role: Lead Orchestrator & Project Manager.\n"
@@ -561,6 +563,43 @@ def run_autonomous_agent(prompt: str, chat_id: int) -> str:
     )
     res = chat.send_message(prompt)
     record_activity()
+
+    # Loop to handle function calls and multi-turn tool execution
+    for _ in range(10):
+        if not res.candidates or not res.candidates[0].content or not res.candidates[0].content.parts:
+            break
+        
+        has_fc = False
+        tool_outputs = []
+        for part in res.candidates[0].content.parts:
+            if hasattr(part, "function_call") and part.function_call:
+                has_fc = True
+                func_name = part.function_call.name
+                func_args = dict(part.function_call.args)
+                print(f"Executing tool {func_name} with args {func_args}", flush=True)
+                try:
+                    if func_name in available_tools:
+                        tool_result = available_tools[func_name](**func_args)
+                    else:
+                        tool_result = f"Error: Tool {func_name} not found."
+                except Exception as e:
+                    tool_result = f"Error executing {func_name}: {str(e)}"
+                
+                tool_outputs.append(
+                    types.Part.from_function_response(
+                        name=func_name,
+                        response={"result": str(tool_result)}
+                    )
+                )
+        
+        if has_fc and tool_outputs:
+            record_activity()
+            res = chat.send_message(tool_outputs)
+            record_activity()
+            continue
+        else:
+            break
+
     if not (res.text and res.text.strip()):
         f_up = chat.send_message("Summarize results.")
         return f_up.text if f_up.text else "Task completed."
