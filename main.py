@@ -7,6 +7,8 @@ import ssl
 import re
 import json
 import smtplib
+import tempfile
+import requests
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 import contextvars
@@ -17,6 +19,7 @@ from telegram.ext import ApplicationBuilder, MessageHandler, filters, ContextTyp
 from google import genai
 from google.genai import types
 from groq import Groq
+from huggingface_hub import InferenceClient
 from duckduckgo_search import DDGS
 from e2b_code_interpreter import Sandbox
 from supabase import create_client, Client
@@ -26,8 +29,11 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 # Environment & Config
 GEMINI_API_KEY = (os.getenv("GEMINI_API_KEY") or "").strip()
 GROQ_API_KEY = (os.getenv("GROQ_API_KEY") or "").strip()
+HF_TOKEN = (os.getenv("HF_TOKEN") or "").strip()
 TELEGRAM_TOKEN = (os.getenv("TELEGRAM_BOT_TOKEN") or "").strip()
-ALLOWED_USER_ID = int((os.getenv("TELEGRAM_ADMIN_ID") or "8513926902").strip() or 0)
+TELEGRAM_BOT_TOKEN = TELEGRAM_TOKEN
+ADMIN_CHAT_ID = int((os.getenv("TELEGRAM_ADMIN_ID") or "8513926902").strip() or 0)
+ALLOWED_USER_ID = ADMIN_CHAT_ID
 E2B_API_KEY = (os.getenv("E2B_API_KEY") or "").strip()
 SUPABASE_URL = (os.getenv("SUPABASE_URL") or "").strip().rstrip("/")
 SUPABASE_KEY = (os.getenv("SUPABASE_KEY") or "").strip()
@@ -56,6 +62,45 @@ last_progress_time = time.time()
 def record_activity():
     global last_progress_time
     last_progress_time = time.time()
+
+# ----------------- HUGGING FACE INFERENCE TOOLS -----------------
+
+def generate_ai_image(prompt: str, filename: str = "concept_visual.png") -> str:
+    """Generates an image via Hugging Face FLUX/SDXL models and sends it directly to Telegram."""
+    record_activity()
+    if not HF_TOKEN:
+        return "ERROR: HF_TOKEN missing in environment variables."
+    try:
+        client = InferenceClient(api_key=HF_TOKEN)
+        image = client.text_to_image(prompt=prompt.strip(), model="black-forest-labs/FLUX.1-schnell")
+        filepath = os.path.join(tempfile.gettempdir(), filename)
+        image.save(filepath)
+        
+        # Dispatch directly to Telegram chat
+        if TELEGRAM_BOT_TOKEN and ADMIN_CHAT_ID:
+            with open(filepath, "rb") as photo_file:
+                url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendPhoto"
+                requests.post(url, data={"chat_id": ADMIN_CHAT_ID, "caption": f"Generated Visual: {prompt[:100]}"}, files={"photo": photo_file}, timeout=30)
+        record_activity()
+        return f"SUCCESS: Generated image for prompt '{prompt}' and dispatched to Telegram."
+    except Exception as e:
+        record_activity()
+        return f"Image generation error: {str(e)}"
+
+def consult_hf_specialist(prompt: str, model_id: str = "Qwen/Qwen2.5-Coder-32B-Instruct") -> str:
+    """Queries open-source specialized models on Hugging Face for coding, translation, or alternative reasoning."""
+    record_activity()
+    if not HF_TOKEN:
+        return "ERROR: HF_TOKEN missing in environment variables."
+    try:
+        client = InferenceClient(api_key=HF_TOKEN)
+        messages = [{"role": "user", "content": prompt.strip()}]
+        response = client.chat.completions.create(model=model_id, messages=messages, max_tokens=1000)
+        record_activity()
+        return response.choices[0].message.content
+    except Exception as e:
+        record_activity()
+        return f"Hugging Face query error: {str(e)}"
 
 # ----------------- OUTREACH & EMAIL TOOLS -----------------
 
@@ -418,6 +463,8 @@ def consult_llama_specialist(task_description: str, code_or_context: str) -> str
         return f"Llama error: {str(e)}"
 
 agent_tools = [
+    generate_ai_image,
+    consult_hf_specialist,
     send_client_email,
     hunt_client_leads,
     schedule_recurring_task,
@@ -444,6 +491,7 @@ SYSTEM_PROMPT = (
     "You are Chintu, an Autonomous Full-Stack AI Engineer.\n"
     "- CLIENT ACQUISITION & LEAD HUNTING: Use `hunt_client_leads` to autonomously find fresh hiring and gig leads across Reddit, X, and creator boards using DuckDuckGo, and `send_client_email` to contact clients and deliver proposals.\n"
     "- AUTONOMOUS SCHEDULING: Use `schedule_recurring_task`, `list_scheduled_tasks`, and `cancel_scheduled_task` to manage background jobs.\n"
+    "- HUGGING FACE SUITE: Use `generate_ai_image` to create visuals via FLUX models and dispatch them to Telegram, and `consult_hf_specialist` to query open-source reasoning/coding models like Qwen.\n"
     "- GITHUB: Use `github_commit_file` to commit changes directly, `github_read_file` to read repo code, and `github_create_repository` for new repos.\n"
     "- MEDIA: Use `send_telegram_photo` for charts and `send_telegram_document` for files.\n"
     "- MEMORY: Use `remember_information` and `recall_information` with Supabase.\n"
