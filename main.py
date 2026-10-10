@@ -80,37 +80,31 @@ def record_activity():
     last_progress_time = time.time()
 
 # ----------------- DYNAMIC TELEGRAM PROGRESS CARD & TELEMETRY ENGINE -----------------
-
 class ProgressCardTracker:
-    def __init__(self, bot, chat_id: int, task_title: str, steps: list[str]):
+    def __init__(self, bot, chat_id: int, task_title: str, steps: list):
         self.bot = bot
         self.chat_id = chat_id
         self.task_title = task_title
-        self.steps = steps  # list of step title strings
+        self.steps = steps
         self.statuses = ["⏳ Pending" for _ in steps]
         self.details = ["" for _ in steps]
         self.message_id = None
         self.last_edit_time = 0.0
-        self._lock = asyncio.Lock()
-        try:
-            self.loop = asyncio.get_running_loop()
-        except RuntimeError:
-            try:
-                self.loop = asyncio.get_event_loop()
-            except Exception:
-                self.loop = None
+        self._lock = threading.Lock()
 
     def run_thread_safe(self, coro):
-        if self.loop and self.loop.is_running():
-            return asyncio.run_coroutine_threadsafe(coro, self.loop)
-        else:
-            try:
+        global main_loop
+        try:
+            if main_loop and main_loop.is_running():
+                future = asyncio.run_coroutine_threadsafe(coro, main_loop)
+                return future.result(timeout=10)
+            else:
                 return asyncio.run(coro)
-            except Exception:
-                pass
+        except Exception as e:
+            print(f"[Dispatch error]: {e}", flush=True)
 
     def _render_card(self) -> str:
-        lines = [f"⚡ Task: {self.task_title}", f"Status: In Progress ⏳\n"]
+        lines = [f"⚡ Task: {self.task_title}", "Status: In Progress ⏳\n"]
         for idx, step in enumerate(self.steps):
             stat = self.statuses[idx]
             det = f" - {self.details[idx]}" if self.details[idx] else ""
@@ -122,8 +116,9 @@ class ProgressCardTracker:
             return
         try:
             text = self._render_card()
-            msg = await self.bot.send_message(chat_id=self.chat_id, text=text)
-            self.message_id = msg.message_id
+            msg = self.run_thread_safe(self.bot.send_message(chat_id=self.chat_id, text=text))
+            if msg:
+                self.message_id = msg.message_id
             self.last_edit_time = time.time()
         except Exception as e:
             print(f"ProgressCard initialize error: {e}", flush=True)
@@ -131,7 +126,7 @@ class ProgressCardTracker:
     async def update_step(self, step_index: int, status: str, detail: str = ""):
         if step_index < 0 or step_index >= len(self.steps):
             return
-        async with self._lock:
+        with self._lock:
             self.statuses[step_index] = status
             if detail:
                 self.details[step_index] = detail
@@ -139,30 +134,25 @@ class ProgressCardTracker:
             if not self.bot or not self.message_id:
                 return
 
-            # Debouncer: ensure min 0.8s between edits unless status is final/done/failed
             now = time.time()
-            if now - self.last_edit_time < 0.8 and status not in ["✅ Done", "🚫 Failed", "✅ Recovered & Done"]:
+            if now - self.last_edit_time < 0.8 and status not in ["✅ Done", "🚫 Failed"]:
                 return
 
             text = self._render_card()
             try:
-                await self.bot.edit_message_text(chat_id=self.chat_id, message_id=self.message_id, text=text)
+                self.run_thread_safe(self.bot.edit_message_text(
+                    chat_id=self.chat_id,
+                    message_id=self.message_id,
+                    text=text
+                ))
                 self.last_edit_time = time.time()
-            except RetryAfter as ra:
-                await asyncio.sleep(ra.retry_after)
-                try:
-                    await self.bot.edit_message_text(chat_id=self.chat_id, message_id=self.message_id, text=text)
-                except Exception:
-                    pass
-            except BadRequest:
-                pass
             except Exception as e:
                 print(f"ProgressCard update error: {e}", flush=True)
 
     async def finalize(self, success: bool = True, final_note: str = ""):
         if not self.bot or not self.message_id:
             return
-        async with self._lock:
+        with self._lock:
             lines = [f"⚡ Task: {self.task_title}", f"Status: {'Completed ✅' if success else 'Failed 🚫'}\n"]
             for idx, step in enumerate(self.steps):
                 stat = self.statuses[idx]
@@ -172,8 +162,12 @@ class ProgressCardTracker:
                 lines.append(f"\n💡 {final_note}")
             text = "\n".join(lines)
             try:
-                await self.bot.edit_message_text(chat_id=self.chat_id, message_id=self.message_id, text=text)
-            except Exception:
+                self.run_thread_safe(self.bot.edit_message_text(
+                    chat_id=self.chat_id,
+                    message_id=self.message_id,
+                    text=text
+                ))
+            except Exception as e:
                 pass
 
 # Autonomous Self-Healing Telemetry Wrapper with True Recursive Retry Loop
