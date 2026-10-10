@@ -398,8 +398,14 @@ def fetch_webpage(url: str) -> str:
         return f"Fetch error: {str(e)}"
 
 def run_terminal_command(command: str) -> str:
-    """Runs a bash command on the local container."""
+    """Runs a bash command on the local container with E2B sandbox isolation for python/pip commands."""
     record_activity()
+    stripped_cmd = command.strip().lower()
+    
+    # ENFORCE E2B SANDBOX ISOLATION: Block python/pip executions on host and re-route to E2B microVM
+    if stripped_cmd.startswith(("python", "python3", "pip", "pip3", "pytest", "poetry")):
+        return f"BLOCKED HOST EXECUTION: Executing Python or package management commands directly on Render host is forbidden.\nRe-routing to execute_in_cloud_microvm (E2B Cloud Sandbox)...\n\n" + execute_in_cloud_microvm(command)
+    
     try:
         r = subprocess.run(command, shell=True, capture_output=True, text=True, timeout=60)
         record_activity()
@@ -560,6 +566,7 @@ SYSTEM_PROMPT = (
     "You are Chintu, an Autonomous Full-Stack AI Engineer operating under a Hierarchical Multi-Agent System (HMAS) Manager-Worker-Auditor architecture.\n"
     "- Role: Lead Orchestrator & Project Manager.\n"
     "- Core Operational Rule: Break down EVERY task you receive into smaller, bite-sized sub-tasks and execute them strictly step-by-step. Never attempt monolithic, all-in-one runs. Provide progress updates between discrete steps.\n"
+    "- CRITICAL ARCHITECTURE RULE: Render is an orchestration node capped at 512MB RAM. You are strictly forbidden from executing Python code, tests, or imports on the host machine. ALL code execution, package testing, and script runs MUST use execute_in_cloud_microvm (E2B Cloud Sandbox).\n"
     "- Delegation & Workers:\n"
     "  * For each sub-task, plan and spawn targeted worker executions (via specialized internal prompts, E2B sandbox routines, DuckDuckGo searches, Hugging Face models, and Composio actions).\n"
     "  * Enforce a hard recursion limit (workers cannot spawn sub-workers; only the Lead Orchestrator delegates via `delegate_subtask`).\n"
@@ -569,7 +576,7 @@ SYSTEM_PROMPT = (
     "  * Only deploy or commit artifacts once the auditor approves or corrects them.\n"
     "- Verification Gate:\n"
     "  * When building scripts or live assets, validate execution via `execute_in_cloud_microvm` (E2B) prior to final GitHub commit and deployment.\n"
-    "- CLIENT ACQUISITION & LEAD HUNTING: Use `hunt_client_leads` to autonomously find fresh hiring and gig leads across Reddit, X, and creator boards using DuckDuckGo, and `send_client_email` to contact clients and deliver proposals.\n"
+    "- CLIENT ACQUISITION & LEAD HUNTING: Use `hunt_client_leads` to autonomously find fresh hiring and gig leads across Reddit, x, and creator boards using DuckDuckGo, and `send_client_email` to contact clients and deliver proposals.\n"
     "- AUTONOMOUS SCHEDULING: Use `schedule_recurring_task`, `list_scheduled_tasks`, and `cancel_scheduled_task` to manage background jobs.\n"
     "- HUGGING FACE SUITE: Use `generate_ai_image` to create visuals via FLUX models and dispatch them to Telegram, and `consult_hf_specialist` to query open-source reasoning/coding models like Qwen.\n"
     "- GITHUB: Use `github_commit_file` to commit changes directly, `github_read_file` to read repo code, and `github_create_repository` for new repos.\n"
@@ -671,6 +678,7 @@ async def handle_msg(update: Update, context: ContextTypes.DEFAULT_TYPE):
         chat_id = update.effective_chat.id
         msg_text = update.message.text
 
+        # ASYNC TELEGRAM MESSAGE DEBOUNCER (3.5-second buffer)
         user_message_buffer.setdefault(chat_id, []).append(msg_text)
         if chat_id in user_buffer_tasks:
             user_buffer_tasks[chat_id].cancel()
