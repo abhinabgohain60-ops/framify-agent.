@@ -510,6 +510,82 @@ def execute_composio_action(action_name: str, arguments: dict = None) -> str:
         record_activity()
         return f"Composio execution note: {str(e)}"
 
+# ----------------- PERMANENT AGENT DISPATCHER & SELF-LEARNING ENGINE -----------------
+
+def dispatch_to_agent(agent_id: str, task_prompt: str, context_payload: str = "") -> str:
+    """Invokes a persistent worker agent from the Supabase registry using its specialized model and instructions, incorporating past mistake remedies and skill learnings."""
+    record_activity()
+    if not supabase:
+        return "ERROR: Supabase is required for agent registry and learning memory."
+    
+    try:
+        # 1. Fetch agent profile from Supabase
+        agent_res = supabase.table("chintu_agent_registry").select("*").eq("agent_id", agent_id.strip().lower()).execute()
+        if not agent_res.data:
+            return f"ERROR: Worker agent '{agent_id}' not found in Supabase registry."
+        
+        agent_profile = agent_res.data[0]
+        engine_model = agent_profile.get("engine_model", "Qwen/Qwen2.5-Coder-32B-Instruct")
+        system_instructions = agent_profile.get("system_instructions", "")
+        
+        # 2. Query chintu_mistakes_ledger for reflection and error prevention
+        mistakes_res = supabase.table("chintu_mistakes_ledger").select("error_signature, root_cause, remedy").limit(10).execute()
+        reflection_guidelines = ""
+        if mistakes_res.data:
+            guidelines = [f"• Past Mistake: {m.get('error_signature')} | Cause: {m.get('root_cause')} | Mandatory Remedy: {m.get('remedy')}" for m in mistakes_res.data]
+            reflection_guidelines = "\n### LEARNED MISTAKES & PREVENTATIVE RULES:\n" + "\n".join(guidelines)
+            
+        full_instructions = f"{system_instructions}\n{reflection_guidelines}\n\nContext Payload:\n{context_payload}"
+        
+        # 3. Route execution based on engine endpoint
+        worker_output = ""
+        if "Qwen" in engine_model or "hf" in engine_model.lower() or "/" in engine_model:
+            if not HF_TOKEN:
+                return "ERROR: HF_TOKEN required for Hugging Face worker agents."
+            client = InferenceClient(api_key=HF_TOKEN)
+            messages = [
+                {"role": "system", "content": full_instructions},
+                {"role": "user", "content": task_prompt}
+            ]
+            resp = client.chat.completions.create(model=engine_model, messages=messages, max_tokens=1500)
+            worker_output = resp.choices[0].message.content
+        elif "llama" in engine_model.lower():
+            if not groq_client:
+                return "ERROR: GROQ_API_KEY required for Groq worker agents."
+            resp = groq_client.chat.completions.create(
+                model=engine_model,
+                messages=[
+                    {"role": "system", "content": full_instructions},
+                    {"role": "user", "content": task_prompt}
+                ],
+                temperature=0.2,
+                max_tokens=1500
+            )
+            worker_output = resp.choices[0].message.content
+        else:
+            worker_output = consult_hf_specialist(f"{full_instructions}\n\nTask: {task_prompt}")
+            
+        # 4. Log interaction into agent's task history in Supabase
+        history_list = agent_profile.get("task_history") or []
+        history_list.append({"task": task_prompt[:200], "timestamp": time.time(), "status": "success"})
+        supabase.table("chintu_agent_registry").update({"task_history": history_list}).eq("agent_id", agent_id.strip().lower()).execute()
+        
+        record_activity()
+        return worker_output
+    except Exception as e:
+        record_activity()
+        # Record failure into chintu_mistakes_ledger for autonomous learning
+        try:
+            if supabase:
+                supabase.table("chintu_mistakes_ledger").insert({
+                    "error_signature": f"Agent {agent_id} execution failure",
+                    "root_cause": str(e),
+                    "remedy": "Check model availability, prompt formatting, or payload size."
+                }).execute()
+        except Exception:
+            pass
+        return f"Agent dispatch error for '{agent_id}': {str(e)}"
+
 # --- DYNAMIC AGENT TOOLS ---
 
 def register_new_tool(tool_name: str, python_code: str) -> str:
@@ -557,22 +633,25 @@ agent_tools = [
     read_file,
     patch_file,
     execute_composio_action,
-    register_new_tool
+    register_new_tool,
+    dispatch_to_agent
 ]
 
 available_tools = {t.__name__: t for t in agent_tools}
 
 SYSTEM_PROMPT = (
     "You are Chintu, an Autonomous Full-Stack AI Engineer operating under a Hierarchical Multi-Agent System (HMAS) Manager-Worker-Auditor architecture.\n"
-    "- Role: Lead Orchestrator & Project Manager.\n"
+    "- Role: Lead Orchestrator & Agency Director.\n"
     "- Core Operational Rule: Break down EVERY task you receive into smaller, bite-sized sub-tasks and execute them strictly step-by-step. Never attempt monolithic, all-in-one runs. Provide progress updates between discrete steps.\n"
+    "- PERMANENT WORKER AGENTS: You manage permanent specialized AI Worker Agents registered in Supabase ('chintu_agent_registry'). Before starting any technical task, query Supabase for existing workers (e.g., 'frontend-dev-agent', 'lead-scout-agent', 'auditor-agent') or dispatch tasks via `dispatch_to_agent`.\n"
+    "- SELF-EVOLVING MISTAKES & SKILLS LEARNING ENGINE: Query 'chintu_mistakes_ledger' before execution to review past errors, root causes, and mandatory remedies, preventing repeated failures.\n"
     "- CRITICAL ARCHITECTURE RULE: Render is an orchestration node capped at 512MB RAM. You are strictly forbidden from executing Python code, tests, or imports on the host machine. ALL code execution, package testing, and script runs MUST use execute_in_cloud_microvm (E2B Cloud Sandbox).\n"
     "- Delegation & Workers:\n"
-    "  * For each sub-task, plan and spawn targeted worker executions (via specialized internal prompts, E2B sandbox routines, DuckDuckGo searches, Hugging Face models, and Composio actions).\n"
-    "  * Enforce a hard recursion limit (workers cannot spawn sub-workers; only the Lead Orchestrator delegates via `delegate_subtask`).\n"
+    "  * For each sub-task, plan and spawn targeted worker executions (via `dispatch_to_agent`, E2B sandbox routines, DuckDuckGo searches, Hugging Face models, and Composio actions).\n"
+    "  * Enforce a hard recursion limit (workers cannot spawn sub-workers; only the Lead Orchestrator delegates via `dispatch_to_agent` or `delegate_subtask`).\n"
     "- Auditor Protocol (Llama 3.3 via Groq):\n"
     "  * Never push unverified code or raw drafts directly to production.\n"
-    "  * All code generation, structural markup, and critical logic generated by workers must undergo an adversarial audit by Llama 3.3 via `delegate_subtask` to check for bugs, responsiveness, broken dependencies, and security flaws.\n"
+    "  * All code generation, structural markup, and critical logic generated by workers must undergo an adversarial audit by Llama 3.3 via `delegate_subtask` (or the permanent 'auditor-agent') to check for bugs, responsiveness, broken dependencies, and security flaws.\n"
     "  * Only deploy or commit artifacts once the auditor approves or corrects them.\n"
     "- Verification Gate:\n"
     "  * When building scripts or live assets, validate execution via `execute_in_cloud_microvm` (E2B) prior to final GitHub commit and deployment.\n"
