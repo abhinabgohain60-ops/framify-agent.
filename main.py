@@ -475,7 +475,8 @@ def execute_composio_action(action_name: str, arguments: dict = None) -> str:
         result = composio.tools.execute(
             action_name.upper().strip(),
             arguments=arguments or {},
-            user_id="default"
+            user_id="default",
+            dangerously_skip_version_check=True
         )
         record_activity()
         return f"Composio Action [{action_name}] Success: {str(result)}"
