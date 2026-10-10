@@ -45,7 +45,7 @@ supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY) if (SUPABASE_URL an
 github_client = Github(GITHUB_TOKEN) if GITHUB_TOKEN else None
 
 GEMINI_MODEL = "gemini-3.5-flash-lite"
-LLAMA_MODEL = "llama-3.3-70b-versatile"
+LLAMA_MODEL = "openai/gpt-oss-120b"
 
 active_chat_id: contextvars.ContextVar[int] = contextvars.ContextVar("active_chat_id", default=0)
 bot_instance = None
@@ -360,14 +360,14 @@ def patch_file(file_path: str, target_block: str, replacement_block: str) -> str
         return f"Patch error: {str(e)}"
 
 def consult_llama_specialist(task_description: str, code_or_context: str) -> str:
-    """Consults Llama 3.3 70B specialist on Groq for deep reasoning."""
+    """Consults Llama specialist on Groq for deep reasoning."""
     record_activity()
     if not groq_client: return "ERROR: GROQ_API_KEY missing."
     try:
         resp = groq_client.chat.completions.create(
             model=LLAMA_MODEL,
             messages=[
-                {"role": "system", "content": "You are Llama 3.3 70B Specialist. Solve complex engineering tasks."},
+                {"role": "system", "content": "You are Llama Specialist. Solve complex engineering tasks."},
                 {"role": "user", "content": f"TASK:\n{task_description}\n\nCONTEXT:\n{code_or_context}"}
             ],
             temperature=0.2,
@@ -480,4 +480,3 @@ api = FastAPI(lifespan=lifespan)
 @api.get("/")
 def home():
     return {"status": "ok", "scheduler": "active", "email": "active"}
-    
