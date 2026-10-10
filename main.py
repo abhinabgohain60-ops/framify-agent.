@@ -18,6 +18,7 @@ from telegram import Update
 from telegram.ext import ApplicationBuilder, MessageHandler, filters, ContextTypes
 from google import genai
 from google.genai import types
+from google.genai.errors import APIError
 from groq import Groq
 from huggingface_hub import InferenceClient
 from duckduckgo_search import DDGS
@@ -524,14 +525,35 @@ async def handle_msg(update: Update, context: ContextTypes.DEFAULT_TYPE):
         loop = asyncio.get_running_loop()
         chat_id = update.effective_chat.id
         record_activity()
-        fut = loop.run_in_executor(None, run_autonomous_agent, task, chat_id)
-        while not fut.done():
-            await asyncio.sleep(2.0)
-            if (time.time() - last_progress_time) > 120.0:
-                fut.cancel()
-                await status.edit_text("Halt: Agent timed out.")
-                return
-        out = await fut
+        
+        # Wrapped with 503 retry logic
+        retries = 2
+        out = None
+        for attempt in range(retries + 1):
+            try:
+                fut = loop.run_in_executor(None, run_autonomous_agent, task, chat_id)
+                while not fut.done():
+                    await asyncio.sleep(2.0)
+                    if (time.time() - last_progress_time) > 120.0:
+                        fut.cancel()
+                        await status.edit_text("Halt: Agent timed out.")
+                        return
+                out = await fut
+                break
+            except (APIError, Exception) as err:
+                err_str = str(err)
+                is_503 = isinstance(err, APIError) or "503" in err_str or "UNAVAILABLE" in err_str
+                if is_503 and attempt < retries:
+                    await status.edit_text(f"⚠️ Google AI service busy (503). Retrying in 5s (attempt {attempt + 1}/{retries})...")
+                    await asyncio.sleep(5.0)
+                    record_activity()
+                    continue
+                elif is_503:
+                    await status.edit_text("⚠️ Google AI model service is currently experiencing high demand (503). Please retry in 30 seconds.")
+                    return
+                else:
+                    raise err
+
         await status.edit_text(out[:4000] if out else "Execution complete.")
     except Exception as e:
         print(f"Handler error: {e}", flush=True)
