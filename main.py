@@ -92,6 +92,22 @@ class ProgressCardTracker:
         self.message_id = None
         self.last_edit_time = 0.0
         self._lock = asyncio.Lock()
+        try:
+            self.loop = asyncio.get_running_loop()
+        except RuntimeError:
+            try:
+                self.loop = asyncio.get_event_loop()
+            except Exception:
+                self.loop = None
+
+    def run_thread_safe(self, coro):
+        if self.loop and self.loop.is_running():
+            return asyncio.run_coroutine_threadsafe(coro, self.loop)
+        else:
+            try:
+                return asyncio.run(coro)
+            except Exception:
+                pass
 
     def _render_card(self) -> str:
         lines = [f"⚡ Task: {self.task_title}", f"Status: In Progress ⏳\n"]
@@ -160,58 +176,35 @@ class ProgressCardTracker:
             except Exception:
                 pass
 
-# Autonomous Self-Healing Telemetry Wrapper
+# Autonomous Self-Healing Telemetry Wrapper with True Recursive Retry Loop
 async def execute_with_self_healing(card: ProgressCardTracker, step_idx: int, step_title: str, func, *args, **kwargs):
-    await card.update_step(step_idx, "⏳ In Progress", f"Executing {step_title}...")
-    try:
-        if supabase:
-            mem_check = supabase.table("chintu_memory").select("value").eq("category", "autonomous_healing_lessons").ilike("key", f"%{step_title.lower()}%").limit(1).execute()
-            if mem_check.data:
-                print(f"Applying learned healing lesson for {step_title}", flush=True)
-
-        res = func(*args, **kwargs)
-        await card.update_step(step_idx, "✅ Done", f"{step_title} passed.")
-        return res
-    except Exception as err:
-        err_str = str(err)
-        await card.update_step(step_idx, "🚫 Failed", f"Issue: {err_str[:60]}")
-        await card.update_step(step_idx, "🔄 Self-Healing Active", "Diagnosing root cause & patching via microVM...")
-        
-        repair_success = False
-        patched_result = None
+    max_attempts = 3
+    for attempt in range(max_attempts):
         try:
-            diagnosis_prompt = f"Analyze error: {err_str} during step '{step_title}'. Provide corrected robust Python/tool execution logic."
-            if groq_client:
-                diag_resp = groq_client.chat.completions.create(
-                    model="llama-3.3-70b-versatile",
-                    messages=[{"role": "system", "content": "You are a self-healing error resolver. Fix the error snippet."},
-                              {"role": "user", "content": diagnosis_prompt}],
-                    temperature=0.2, max_tokens=1000
-                ).choices[0].message.content
+            await card.update_step(step_idx, "⏳ In Progress", f"Executing {step_title} (Attempt {attempt+1}/{max_attempts})...")
+            if asyncio.iscoroutinefunction(func):
+                result = await func(*args, **kwargs)
             else:
-                diag_resp = f"Fallback retry patch for {step_title}"
-
-            sandbox_test = execute_in_cloud_microvm(f"print('Testing self-healing patch for {step_title}')")
-            
-            if supabase:
-                lesson_key = f"heal_{int(time.time())}_{step_title.lower().replace(' ', '_')}"
-                supabase.table("chintu_memory").upsert({
-                    "key": lesson_key,
-                    "category": "autonomous_healing_lessons",
-                    "value": f"Error: {err_str} | Step: {step_title} | Diagnosis: {diag_resp[:300]}"
-                }, on_conflict="key").execute()
-
-            patched_result = func(*args, **kwargs)
-            repair_success = True
-        except Exception as heal_err:
-            pass
-
-        if repair_success:
-            await card.update_step(step_idx, "✅ Recovered & Done", f"Healed and verified successfully.")
-            return patched_result
-        else:
-            await card.update_step(step_idx, "🚫 Failed", f"Self-healing exhausted for {step_title}.")
-            raise err
+                result = func(*args, **kwargs)
+            await card.update_step(step_idx, "✅ Done", f"{step_title} succeeded.")
+            return result
+        except Exception as err:
+            err_str = str(err)
+            if attempt < max_attempts - 1:
+                await card.update_step(step_idx, "🔄 Healing", f"Attempt {attempt+1} failed: {err_str[:40]}. Retrying...")
+                try:
+                    if supabase:
+                        supabase.table("chintu_memory").upsert({
+                            "key": f"heal_attempt_{int(time.time())}_{step_idx}",
+                            "category": "autonomous_healing_lessons",
+                            "value": f"Step: {step_title} | Attempt: {attempt+1} | Error: {err_str}"
+                        }, on_conflict="key").execute()
+                except Exception:
+                    pass
+                await asyncio.sleep(1.0)
+            else:
+                await card.update_step(step_idx, "🚫 Failed", f"Self-healing exhausted after {max_attempts} attempts: {err_str[:40]}")
+                raise err
 
 # ----------------- HUGGING FACE INFERENCE TOOLS -----------------
 
