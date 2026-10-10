@@ -26,6 +26,7 @@ from e2b_code_interpreter import Sandbox
 from supabase import create_client, Client
 from github import Github, GithubException
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from composio import Composio
 
 # Environment & Config
 GEMINI_API_KEY = (os.getenv("GEMINI_API_KEY") or "").strip()
@@ -40,6 +41,7 @@ SUPABASE_URL = (os.getenv("SUPABASE_URL") or "").strip().rstrip("/")
 SUPABASE_KEY = (os.getenv("SUPABASE_KEY") or "").strip()
 GITHUB_TOKEN = (os.getenv("GITHUB_TOKEN") or "").strip()
 DEFAULT_REPO = (os.getenv("GITHUB_REPO") or "abhinabgohain60-ops/framify-agent.").strip()
+COMPOSIO_API_KEY = (os.getenv("COMPOSIO_API_KEY") or "").strip()
 
 # Email Configuration
 GMAIL_ADDRESS = (os.getenv("GMAIL_ADDRESS") or "").strip()
@@ -463,6 +465,24 @@ def consult_llama_specialist(task_description: str, code_or_context: str) -> str
         record_activity()
         return f"Llama error: {str(e)}"
 
+def execute_composio_action(action_name: str, arguments: dict = None) -> str:
+    """Executes actions across 1000+ apps (Gmail, Notion, GitHub, Twitter, Slack) via Composio."""
+    record_activity()
+    if not COMPOSIO_API_KEY:
+        return "ERROR: COMPOSIO_API_KEY is not configured in environment variables."
+    try:
+        composio = Composio(api_key=COMPOSIO_API_KEY)
+        result = composio.tools.execute(
+            action_name.upper().strip(),
+            arguments=arguments or {},
+            user_id="default"
+        )
+        record_activity()
+        return f"Composio Action [{action_name}] Success: {str(result)}"
+    except Exception as e:
+        record_activity()
+        return f"Composio execution note: {str(e)}"
+
 agent_tools = [
     generate_ai_image,
     consult_hf_specialist,
@@ -485,7 +505,8 @@ agent_tools = [
     run_terminal_command,
     write_project_file,
     read_file,
-    patch_file
+    patch_file,
+    execute_composio_action
 ]
 
 SYSTEM_PROMPT = (
@@ -494,6 +515,7 @@ SYSTEM_PROMPT = (
     "- AUTONOMOUS SCHEDULING: Use `schedule_recurring_task`, `list_scheduled_tasks`, and `cancel_scheduled_task` to manage background jobs.\n"
     "- HUGGING FACE SUITE: Use `generate_ai_image` to create visuals via FLUX models and dispatch them to Telegram, and `consult_hf_specialist` to query open-source reasoning/coding models like Qwen.\n"
     "- GITHUB: Use `github_commit_file` to commit changes directly, `github_read_file` to read repo code, and `github_create_repository` for new repos.\n"
+    "- COMPOSIO UNIFIED ACTIONS: Use `execute_composio_action` to execute tools and actions across 1000+ apps (Gmail, Notion, GitHub, Twitter, Slack, etc.).\n"
     "- MEDIA: Use `send_telegram_photo` for charts and `send_telegram_document` for files.\n"
     "- MEMORY: Use `remember_information` and `recall_information` with Supabase.\n"
     "- REASONING: Use `consult_llama_specialist` for complex logic or coding tasks."
