@@ -479,3 +479,5 @@ api = FastAPI(lifespan=lifespan)
 
 @api.get("/")
 def home():
+    return {"status": "ok", "scheduler": "active", "email": "active"}
+    
