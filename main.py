@@ -5,6 +5,7 @@ import time
 import urllib.request
 import ssl
 import re
+import json
 import contextvars
 from contextlib import asynccontextmanager
 from fastapi import FastAPI
@@ -17,6 +18,7 @@ from duckduckgo_search import DDGS
 from e2b_code_interpreter import Sandbox
 from supabase import create_client, Client
 from github import Github, GithubException
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 # Environment & Config
 GEMINI_API_KEY = (os.getenv("GEMINI_API_KEY") or "").strip()
@@ -41,6 +43,7 @@ LLAMA_MODEL = "llama-3.3-70b-versatile"
 active_chat_id: contextvars.ContextVar[int] = contextvars.ContextVar("active_chat_id", default=0)
 bot_instance = None
 main_loop = None
+scheduler = AsyncIOScheduler()
 last_progress_time = time.time()
 
 def record_activity():
@@ -52,53 +55,43 @@ def record_activity():
 def github_read_file(file_path: str, repo_name: str = "", branch: str = "main") -> str:
     """Reads raw contents of a file from GitHub."""
     record_activity()
-    if not github_client:
-        return "ERROR: GITHUB_TOKEN missing."
+    if not github_client: return "ERROR: GITHUB_TOKEN missing."
     target_repo = repo_name.strip() if repo_name.strip() else DEFAULT_REPO
     try:
         repo = github_client.get_repo(target_repo)
         fc = repo.get_contents(file_path, ref=branch)
-        record_activity()
         return fc.decoded_content.decode("utf-8")
     except Exception as e:
-        record_activity()
         return f"GitHub read error: {str(e)}"
 
 def github_commit_file(file_path: str, content: str, commit_message: str, repo_name: str = "", branch: str = "main") -> str:
     """Commits or updates a file in GitHub, triggering Render redeployment."""
     record_activity()
-    if not github_client:
-        return "ERROR: GITHUB_TOKEN missing."
+    if not github_client: return "ERROR: GITHUB_TOKEN missing."
     target_repo = repo_name.strip() if repo_name.strip() else DEFAULT_REPO
     try:
         repo = github_client.get_repo(target_repo)
         try:
             cur = repo.get_contents(file_path, ref=branch)
             repo.update_file(path=file_path, message=commit_message, content=content, sha=cur.sha, branch=branch)
-            record_activity()
             return f"SUCCESS: Updated '{file_path}' in '{target_repo}'."
         except GithubException as ge:
             if ge.status == 404:
                 repo.create_file(path=file_path, message=commit_message, content=content, branch=branch)
-                record_activity()
                 return f"SUCCESS: Created '{file_path}' in '{target_repo}'."
             raise ge
     except Exception as e:
-        record_activity()
         return f"GitHub commit error: {str(e)}"
 
 def github_create_repository(repo_name: str, description: str = "", private: bool = False) -> str:
     """Creates a new repository under the GitHub account."""
     record_activity()
-    if not github_client:
-        return "ERROR: GITHUB_TOKEN missing."
+    if not github_client: return "ERROR: GITHUB_TOKEN missing."
     try:
         u = github_client.get_user()
         r = u.create_repo(name=repo_name, description=description, private=private, auto_init=True)
-        record_activity()
         return f"SUCCESS: Created repo '{r.full_name}'."
     except Exception as e:
-        record_activity()
         return f"GitHub create repo error: {str(e)}"
 
 # ----------------- TELEGRAM MEDIA DELIVERY -----------------
@@ -106,39 +99,31 @@ def github_create_repository(repo_name: str, description: str = "", private: boo
 def send_telegram_photo(file_path: str, caption: str = "") -> str:
     """Dispatches a local photo or chart directly to Telegram."""
     record_activity()
-    if not os.path.exists(file_path):
-        return f"ERROR: File '{file_path}' not found."
-    chat_id = active_chat_id.get()
-    if not chat_id or not bot_instance or not main_loop:
-        return "ERROR: Telegram dispatch unavailable."
+    if not os.path.exists(file_path): return f"ERROR: File '{file_path}' not found."
+    chat_id = active_chat_id.get() or ALLOWED_USER_ID
+    if not chat_id or not bot_instance or not main_loop: return "ERROR: Telegram dispatch unavailable."
     try:
         async def _send():
             with open(file_path, "rb") as f:
                 await bot_instance.send_photo(chat_id=chat_id, photo=f, caption=caption[:1024])
         asyncio.run_coroutine_threadsafe(_send(), main_loop).result(timeout=30)
-        record_activity()
         return f"SUCCESS: Sent photo '{file_path}'."
     except Exception as e:
-        record_activity()
         return f"Photo dispatch error: {str(e)}"
 
 def send_telegram_document(file_path: str, caption: str = "") -> str:
     """Dispatches any local file directly to Telegram."""
     record_activity()
-    if not os.path.exists(file_path):
-        return f"ERROR: File '{file_path}' not found."
-    chat_id = active_chat_id.get()
-    if not chat_id or not bot_instance or not main_loop:
-        return "ERROR: Telegram dispatch unavailable."
+    if not os.path.exists(file_path): return f"ERROR: File '{file_path}' not found."
+    chat_id = active_chat_id.get() or ALLOWED_USER_ID
+    if not chat_id or not bot_instance or not main_loop: return "ERROR: Telegram dispatch unavailable."
     try:
         async def _send():
             with open(file_path, "rb") as f:
                 await bot_instance.send_document(chat_id=chat_id, document=f, caption=caption[:1024])
         asyncio.run_coroutine_threadsafe(_send(), main_loop).result(timeout=30)
-        record_activity()
         return f"SUCCESS: Sent document '{file_path}'."
     except Exception as e:
-        record_activity()
         return f"Doc dispatch error: {str(e)}"
 
 # ----------------- MEMORY TOOLS -----------------
@@ -146,45 +131,91 @@ def send_telegram_document(file_path: str, caption: str = "") -> str:
 def remember_information(key: str, value: str, category: str = "general") -> str:
     """Persists memories to Supabase."""
     record_activity()
-    if not supabase:
-        return "ERROR: Supabase missing."
+    if not supabase: return "ERROR: Supabase missing."
     try:
         supabase.table("chintu_memory").upsert({"key": key.strip().lower(), "value": value.strip(), "category": category.strip().lower()}, on_conflict="key").execute()
-        record_activity()
         return f"SUCCESS: Remembered '{key}'."
     except Exception as e:
-        record_activity()
         return f"Memory save error: {str(e)}"
 
 def recall_information(query_key: str = "") -> str:
     """Recalls memories from Supabase."""
     record_activity()
-    if not supabase:
-        return "ERROR: Supabase missing."
+    if not supabase: return "ERROR: Supabase missing."
     try:
         if query_key.strip():
             res = supabase.table("chintu_memory").select("key, value, category").ilike("key", f"%{query_key.strip()}%").limit(5).execute()
         else:
             res = supabase.table("chintu_memory").select("key, value, category").order("updated_at", desc=True).limit(10).execute()
-        record_activity()
-        if not res.data:
-            return f"No memories found for '{query_key}'."
+        if not res.data: return f"No memories found for '{query_key}'."
         return "\n".join([f"[{m.get('category')}] {m.get('key')}: {m.get('value')}" for m in res.data])
     except Exception as e:
-        record_activity()
         return f"Recall error: {str(e)}"
+
+# ----------------- PHASE 4: CRON SCHEDULER TOOLS -----------------
+
+async def _scheduled_task_runner(task_id: str, prompt: str, target_chat_id: int):
+    """Internal runner executed in background by APScheduler."""
+    try:
+        loop = asyncio.get_running_loop()
+        res = await loop.run_in_executor(None, run_autonomous_agent, prompt, target_chat_id)
+        if bot_instance and target_chat_id:
+            await bot_instance.send_message(
+                chat_id=target_chat_id,
+                text=f"⏰ [Cron Task: {task_id}]\n\n{res[:3900]}"
+            )
+    except Exception as e:
+        print(f"Scheduled task error for {task_id}: {e}", flush=True)
+
+def schedule_recurring_task(task_id: str, prompt: str, interval_minutes: int) -> str:
+    """Schedules an autonomous task to run repeatedly every interval_minutes and dispatch results to Telegram."""
+    record_activity()
+    target_chat = active_chat_id.get() or ALLOWED_USER_ID
+    clean_id = task_id.strip().lower().replace(" ", "_")
+    interval = max(1, int(interval_minutes))
+    try:
+        scheduler.add_job(
+            _scheduled_task_runner,
+            "interval",
+            minutes=interval,
+            id=clean_id,
+            replace_existing=True,
+            args=[clean_id, prompt, target_chat]
+        )
+        if supabase:
+            job_meta = json.dumps({"prompt": prompt, "interval_minutes": interval, "chat_id": target_chat})
+            remember_information(f"cron_{clean_id}", job_meta, category="cron_schedule")
+        return f"SUCCESS: Scheduled recurring task '{clean_id}' every {interval} minute(s)."
+    except Exception as e:
+        return f"Scheduling error: {str(e)}"
+
+def list_scheduled_tasks() -> str:
+    """Lists all active background recurring cron tasks."""
+    record_activity()
+    jobs = scheduler.get_jobs()
+    if not jobs: return "No active scheduled recurring tasks found."
+    lines = [f"- ID: '{j.id}' (Next Run: {j.next_run_time})" for j in jobs]
+    return "Active Scheduled Tasks:\n" + "\n".join(lines)
+
+def cancel_scheduled_task(task_id: str) -> str:
+    """Cancels and removes a scheduled recurring task by ID."""
+    record_activity()
+    clean_id = task_id.strip().lower().replace(" ", "_")
+    try:
+        scheduler.remove_job(clean_id)
+        return f"SUCCESS: Cancelled scheduled task '{clean_id}'."
+    except Exception as e:
+        return f"Failed to cancel task '{clean_id}': {str(e)}"
 
 # ----------------- SYSTEM & SPECIALIST -----------------
 
 def execute_in_cloud_microvm(code: str) -> str:
     """Executes Python code in an E2B microVM sandbox."""
     record_activity()
-    if not E2B_API_KEY:
-        return "ERROR: E2B_API_KEY missing."
+    if not E2B_API_KEY: return "ERROR: E2B_API_KEY missing."
     try:
         with Sandbox.create(api_key=E2B_API_KEY) as s:
             r = s.run_code(code)
-            record_activity()
             out = []
             if r.text: out.append(r.text)
             if r.logs.stdout: out.append("".join(r.logs.stdout))
@@ -192,7 +223,6 @@ def execute_in_cloud_microvm(code: str) -> str:
             if r.error: out.append(f"{r.error.name}: {r.error.value}")
             return "\n".join(out) if out else "Executed without output."
     except Exception as e:
-        record_activity()
         return f"MicroVM error: {str(e)}"
 
 def web_search(query: str) -> str:
@@ -203,7 +233,6 @@ def web_search(query: str) -> str:
             res = list(d.text(query, max_results=4))
         return "\n\n".join([f"{r.get('title')}: {r.get('body')} ({r.get('href')})" for r in res]) if res else "No results."
     except Exception as e:
-        record_activity()
         return f"Search error: {str(e)}"
 
 def fetch_webpage(url: str) -> str:
@@ -215,11 +244,9 @@ def fetch_webpage(url: str) -> str:
         ctx.check_hostname = False
         ctx.verify_mode = ssl.CERT_NONE
         with urllib.request.urlopen(req, timeout=15, context=ctx) as r:
-            record_activity()
             t = " ".join(re.sub(r"<[^>]+>", " ", re.sub(r"<(script|style).*?</\1>", "", r.read().decode("utf-8", errors="ignore"), flags=re.DOTALL)).split())
             return t[:3000]
     except Exception as e:
-        record_activity()
         return f"Fetch error: {str(e)}"
 
 def run_terminal_command(command: str) -> str:
@@ -227,11 +254,9 @@ def run_terminal_command(command: str) -> str:
     record_activity()
     try:
         r = subprocess.run(command, shell=True, capture_output=True, text=True, timeout=60)
-        record_activity()
         out = r.stdout or r.stderr
         return out[:3000] if out else "Success."
     except Exception as e:
-        record_activity()
         return f"Bash error: {str(e)}"
 
 def write_project_file(file_path: str, content: str) -> str:
@@ -239,12 +264,9 @@ def write_project_file(file_path: str, content: str) -> str:
     record_activity()
     try:
         os.makedirs(os.path.dirname(file_path) if os.path.dirname(file_path) else ".", exist_ok=True)
-        with open(file_path, "w", encoding="utf-8") as f:
-            f.write(content)
-        record_activity()
+        with open(file_path, "w", encoding="utf-8") as f: f.write(content)
         return f"SUCCESS: Wrote '{file_path}'."
     except Exception as e:
-        record_activity()
         return f"Write error: {str(e)}"
 
 def read_file(file_path: str, start_line: int = 1, line_count: int = 100) -> str:
@@ -252,12 +274,10 @@ def read_file(file_path: str, start_line: int = 1, line_count: int = 100) -> str
     record_activity()
     try:
         if not os.path.exists(file_path): return f"ERROR: File '{file_path}' missing."
-        with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
-            lines = f.readlines()
+        with open(file_path, "r", encoding="utf-8", errors="ignore") as f: lines = f.readlines()
         s = max(1, start_line) - 1
         return "".join(lines[s:s + line_count])
     except Exception as e:
-        record_activity()
         return f"Read error: {str(e)}"
 
 def patch_file(file_path: str, target_block: str, replacement_block: str) -> str:
@@ -268,34 +288,32 @@ def patch_file(file_path: str, target_block: str, replacement_block: str) -> str
         with open(file_path, "r", encoding="utf-8") as f: c = f.read()
         if target_block not in c: return f"Target block missing in '{file_path}'."
         with open(file_path, "w", encoding="utf-8") as f: f.write(c.replace(target_block, replacement_block, 1))
-        record_activity()
         return f"SUCCESS: Patched '{file_path}'."
     except Exception as e:
-        record_activity()
         return f"Patch error: {str(e)}"
 
 def consult_llama_specialist(task_description: str, code_or_context: str) -> str:
     """Consults Llama 3.3 70B specialist on Groq for deep reasoning."""
     record_activity()
-    if not groq_client:
-        return "ERROR: GROQ_API_KEY missing."
+    if not groq_client: return "ERROR: GROQ_API_KEY missing."
     try:
         resp = groq_client.chat.completions.create(
             model=LLAMA_MODEL,
             messages=[
-                {"role": "system", "content": "You are Llama 3.3 70B Specialist. Solve complex engineering or logic tasks."},
+                {"role": "system", "content": "You are Llama 3.3 70B Specialist. Solve complex engineering tasks."},
                 {"role": "user", "content": f"TASK:\n{task_description}\n\nCONTEXT:\n{code_or_context}"}
             ],
             temperature=0.2,
             max_tokens=2048
         )
-        record_activity()
         return f"[Llama Specialist]: {resp.choices[0].message.content}"
     except Exception as e:
-        record_activity()
         return f"Llama error: {str(e)}"
 
 agent_tools = [
+    schedule_recurring_task,
+    list_scheduled_tasks,
+    cancel_scheduled_task,
     github_read_file,
     github_commit_file,
     github_create_repository,
@@ -315,11 +333,11 @@ agent_tools = [
 
 SYSTEM_PROMPT = (
     "You are Chintu, an Autonomous Full-Stack AI Engineer.\n"
-    "- When requested to commit or update code on GitHub, invoke `github_commit_file` directly. Do not fake file creation.\n"
-    "- Use `github_read_file` to read repo code; use `github_create_repository` for new repos.\n"
-    "- Use `send_telegram_photo` for visual charts and `send_telegram_document` for files.\n"
-    "- Use `remember_information` and `recall_information` for long-term Supabase memory.\n"
-    "- Use `consult_llama_specialist` for complex reasoning."
+    "- AUTONOMOUS SCHEDULING: Use `schedule_recurring_task`, `list_scheduled_tasks`, and `cancel_scheduled_task` to manage background jobs.\n"
+    "- GITHUB: Use `github_commit_file` to commit changes directly, `github_read_file` to read repo code, and `github_create_repository` for new repos.\n"
+    "- MEDIA: Use `send_telegram_photo` for charts and `send_telegram_document` for files.\n"
+    "- MEMORY: Use `remember_information` and `recall_information` with Supabase.\n"
+    "- REASONING: Use `consult_llama_specialist` for complex logic or coding tasks."
 )
 
 def run_autonomous_agent(prompt: str, chat_id: int) -> str:
@@ -380,12 +398,14 @@ async def run_telegram_worker():
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    task = asyncio.create_task(run_telegram_worker())
+    scheduler.start()
+    worker_task = asyncio.create_task(run_telegram_worker())
     yield
-    task.cancel()
+    scheduler.shutdown()
+    worker_task.cancel()
 
 api = FastAPI(lifespan=lifespan)
 
 @api.get("/")
 def home():
-    return {"status": "ok"}
+    return {"status": "ok", "scheduler": "active"}
