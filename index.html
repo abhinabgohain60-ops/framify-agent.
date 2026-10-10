@@ -1,0 +1,206 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>Chintu Showcase - Autonomous AI Engineer</title>
+    <style>
+        * {
+            box-sizing: border-box;
+        }
+        body {
+            overflow-x: hidden;
+            width: 100vw;
+            margin: 0;
+            padding: 0;
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
+            color: #ffffff;
+            background-color: #0b0f19;
+        }
+        #bg-canvas {
+            position: fixed;
+            top: 0;
+            left: 0;
+            width: 100vw;
+            height: 100vh;
+            z-index: -1;
+            pointer-events: none;
+        }
+        .container {
+            max-width: 1200px;
+            margin: 0 auto;
+            padding: 24px;
+        }
+        header {
+            padding: 40px 0;
+            text-align: center;
+        }
+        h1 {
+            font-size: 2.5rem;
+            margin-bottom: 16px;
+            background: linear-gradient(135deg, #6366f1, #a855f7, #ec4899);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+        }
+        p {
+            color: #94a3b8;
+            font-size: 1.1rem;
+            max-width: 600px;
+            margin: 0 auto 32px auto;
+        }
+        .hero-buttons {
+            display: flex;
+            gap: 16px;
+            justify-content: center;
+            align-items: center;
+            margin-bottom: 48px;
+        }
+        .btn {
+            padding: 12px 24px;
+            font-size: 1rem;
+            font-weight: 600;
+            border-radius: 8px;
+            border: none;
+            cursor: pointer;
+            transition: transform 0.2s, opacity 0.2s;
+            text-decoration: none;
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+        }
+        .btn-primary {
+            background: linear-gradient(135deg, #6366f1, #8b5cf6);
+            color: white;
+        }
+        .btn-secondary {
+            background: rgba(255, 255, 255, 0.1);
+            color: white;
+            border: 1px solid rgba(255, 255, 255, 0.2);
+        }
+        .btn:hover {
+            opacity: 0.9;
+            transform: translateY(-2px);
+        }
+        .card-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+            gap: 16px;
+            padding: 16px;
+        }
+        .card {
+            background: rgba(15, 23, 42, 0.75);
+            border: 1px solid rgba(255, 255, 255, 0.1);
+            border-radius: 12px;
+            padding: 24px;
+            backdrop-filter: blur(10px);
+            transition: transform 0.3s, border-color 0.3s;
+        }
+        .card:hover {
+            transform: translateY(-4px);
+            border-color: #6366f1;
+        }
+        .card h3 {
+            margin-top: 0;
+            margin-bottom: 12px;
+            font-size: 1.25rem;
+            color: #f8fafc;
+        }
+        .card p {
+            margin: 0;
+            font-size: 0.95rem;
+            color: #94a3b8;
+        }
+        @media (max-width: 768px) {
+            .hero-buttons {
+                flex-direction: column;
+                width: 100%;
+            }
+            .hero-buttons .btn {
+                width: 100%;
+                min-height: 48px;
+            }
+            h1 {
+                font-size: 2rem;
+            }
+        }
+    </style>
+</head>
+<body>
+    <canvas id="bg-canvas"></canvas>
+    
+    <div class="container">
+        <header>
+            <h1>Chintu Showcase</h1>
+            <p>Autonomous Full-Stack AI Engineer operating under HMAS Architecture with 3D immersive visuals and robust responsive layouts.</p>
+            <div class="hero-buttons">
+                <a href="#projects" class="btn btn-primary">Explore Projects</a>
+                <a href="#contact" class="btn btn-secondary">Contact Chintu</a>
+            </div>
+        </header>
+
+        <section id="projects" class="card-grid">
+            <div class="card">
+                <h3>HMAS Multi-Agent System</h3>
+                <p>Manager-Worker-Auditor architecture ensuring zero-defect autonomous software engineering.</p>
+            </div>
+            <div class="card">
+                <h3>E2B Cloud Sandboxes</h3>
+                <p>Secure microVM execution environment for running and testing code prior to production.</p>
+            </div>
+            <div class="card">
+                <h3>Hugging Face Suite</h3>
+                <p>State-of-the-art FLUX image generation and Qwen/Llama open-source reasoning models.</p>
+            </div>
+            <div class="card">
+                <h3>Composio Automations</h3>
+                <p>Unified cross-app integrations across GitHub, Gmail, Slack, Notion, and Twitter.</p>
+            </div>
+        </section>
+    </div>
+
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+    <script>
+        const canvas = document.getElementById('bg-canvas');
+        const renderer = new THREE.WebGLRenderer({ canvas, alpha: true, antialias: true });
+        renderer.setSize(window.innerWidth, window.innerHeight);
+        renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+
+        const scene = new THREE.Scene();
+        const camera = new THREE.PerspectiveCamera(75, window.innerWidth / window.innerHeight, 0.1, 1000);
+        camera.position.z = 5;
+
+        const geometry = new THREE.IcosahedronGeometry(2, 1);
+        const material = new THREE.MeshBasicMaterial({ color: 0x6366f1, wireframe: true, transparent: true, opacity: 0.25 });
+        const sphere = new THREE.Mesh(geometry, material);
+        scene.add(sphere);
+
+        const particlesGeometry = new THREE.BufferGeometry();
+        const particlesCount = 500;
+        const posArray = new Float32Array(particlesCount * 3);
+
+        for(let i = 0; i < particlesCount * 3; i++) {
+            posArray[i] = (Math.random() - 0.5) * 15;
+        }
+
+        particlesGeometry.setAttribute('position', new THREE.BufferAttribute(posArray, 3));
+        const particlesMaterial = new THREE.PointsMaterial({ size: 0.02, color: 0xa855f7, transparent: true, opacity: 0.5 });
+        const particlesMesh = new THREE.Points(particlesGeometry, particlesMaterial);
+        scene.add(particlesMesh);
+
+        window.addEventListener('resize', () => {
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+        });
+
+        fn animate() {
+            requestAnimationFrame(animate);
+            sphere.rotation.x += 0.002;
+            sphere.rotation.y += 0.003;
+            particlesMesh.rotation.y -= 0.001;
+            renderer.render(scene, camera);
+        }
+        animate();
+    </script>
+</body>
+</html>
