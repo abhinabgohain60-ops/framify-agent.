@@ -45,7 +45,7 @@ supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY) if (SUPABASE_URL an
 github_client = Github(GITHUB_TOKEN) if GITHUB_TOKEN else None
 
 GEMINI_MODEL = "gemini-3.5-flash-lite"
-LLAMA_MODEL = "openai/gpt-oss-120b"
+LLAMA_MODEL = "llama-3.3-70b-versatile"
 
 active_chat_id: contextvars.ContextVar[int] = contextvars.ContextVar("active_chat_id", default=0)
 bot_instance = None
