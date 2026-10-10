@@ -6,6 +6,9 @@ import urllib.request
 import ssl
 import re
 import json
+import smtplib
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
 import contextvars
 from contextlib import asynccontextmanager
 from fastapi import FastAPI
@@ -31,6 +34,10 @@ SUPABASE_KEY = (os.getenv("SUPABASE_KEY") or "").strip()
 GITHUB_TOKEN = (os.getenv("GITHUB_TOKEN") or "").strip()
 DEFAULT_REPO = (os.getenv("GITHUB_REPO") or "abhinabgohain60-ops/framify-agent.").strip()
 
+# Email Configuration
+GMAIL_ADDRESS = (os.getenv("GMAIL_ADDRESS") or "").strip()
+GMAIL_APP_PASSWORD = (os.getenv("GMAIL_APP_PASSWORD") or "").strip().replace(" ", "")
+
 # Clients
 gemini_client = genai.Client(api_key=GEMINI_API_KEY)
 groq_client = Groq(api_key=GROQ_API_KEY) if GROQ_API_KEY else None
@@ -50,6 +57,33 @@ def record_activity():
     global last_progress_time
     last_progress_time = time.time()
 
+# ----------------- OUTREACH & EMAIL TOOLS -----------------
+
+def send_client_email(to_email: str, subject: str, message_body: str) -> str:
+    """Sends a professional email or project proposal to a client or recipient via Gmail SMTP."""
+    record_activity()
+    if not GMAIL_ADDRESS or not GMAIL_APP_PASSWORD:
+        return "ERROR: GMAIL_ADDRESS or GMAIL_APP_PASSWORD missing in environment."
+    try:
+        msg = MIMEMultipart()
+        msg["From"] = GMAIL_ADDRESS
+        msg["To"] = to_email.strip()
+        msg["Subject"] = subject.strip()
+        msg.attach(MIMEText(message_body, "plain"))
+
+        server = smtplib.SMTP("smtp.gmail.com", 587, timeout=25)
+        server.ehlo()
+        server.starttls()
+        server.ehlo()
+        server.login(GMAIL_ADDRESS, GMAIL_APP_PASSWORD)
+        server.send_message(msg)
+        server.quit()
+        record_activity()
+        return f"SUCCESS: Sent email to '{to_email.strip()}' with subject '{subject.strip()}'."
+    except Exception as e:
+        record_activity()
+        return f"Email sending error: {str(e)}"
+
 # ----------------- GITHUB TOOLS -----------------
 
 def github_read_file(file_path: str, repo_name: str = "", branch: str = "main") -> str:
@@ -60,8 +94,10 @@ def github_read_file(file_path: str, repo_name: str = "", branch: str = "main") 
     try:
         repo = github_client.get_repo(target_repo)
         fc = repo.get_contents(file_path, ref=branch)
+        record_activity()
         return fc.decoded_content.decode("utf-8")
     except Exception as e:
+        record_activity()
         return f"GitHub read error: {str(e)}"
 
 def github_commit_file(file_path: str, content: str, commit_message: str, repo_name: str = "", branch: str = "main") -> str:
@@ -74,13 +110,16 @@ def github_commit_file(file_path: str, content: str, commit_message: str, repo_n
         try:
             cur = repo.get_contents(file_path, ref=branch)
             repo.update_file(path=file_path, message=commit_message, content=content, sha=cur.sha, branch=branch)
+            record_activity()
             return f"SUCCESS: Updated '{file_path}' in '{target_repo}'."
         except GithubException as ge:
             if ge.status == 404:
                 repo.create_file(path=file_path, message=commit_message, content=content, branch=branch)
+                record_activity()
                 return f"SUCCESS: Created '{file_path}' in '{target_repo}'."
             raise ge
     except Exception as e:
+        record_activity()
         return f"GitHub commit error: {str(e)}"
 
 def github_create_repository(repo_name: str, description: str = "", private: bool = False) -> str:
@@ -90,8 +129,10 @@ def github_create_repository(repo_name: str, description: str = "", private: boo
     try:
         u = github_client.get_user()
         r = u.create_repo(name=repo_name, description=description, private=private, auto_init=True)
+        record_activity()
         return f"SUCCESS: Created repo '{r.full_name}'."
     except Exception as e:
+        record_activity()
         return f"GitHub create repo error: {str(e)}"
 
 # ----------------- TELEGRAM MEDIA DELIVERY -----------------
@@ -107,8 +148,10 @@ def send_telegram_photo(file_path: str, caption: str = "") -> str:
             with open(file_path, "rb") as f:
                 await bot_instance.send_photo(chat_id=chat_id, photo=f, caption=caption[:1024])
         asyncio.run_coroutine_threadsafe(_send(), main_loop).result(timeout=30)
+        record_activity()
         return f"SUCCESS: Sent photo '{file_path}'."
     except Exception as e:
+        record_activity()
         return f"Photo dispatch error: {str(e)}"
 
 def send_telegram_document(file_path: str, caption: str = "") -> str:
@@ -122,8 +165,10 @@ def send_telegram_document(file_path: str, caption: str = "") -> str:
             with open(file_path, "rb") as f:
                 await bot_instance.send_document(chat_id=chat_id, document=f, caption=caption[:1024])
         asyncio.run_coroutine_threadsafe(_send(), main_loop).result(timeout=30)
+        record_activity()
         return f"SUCCESS: Sent document '{file_path}'."
     except Exception as e:
+        record_activity()
         return f"Doc dispatch error: {str(e)}"
 
 # ----------------- MEMORY TOOLS -----------------
@@ -134,8 +179,10 @@ def remember_information(key: str, value: str, category: str = "general") -> str
     if not supabase: return "ERROR: Supabase missing."
     try:
         supabase.table("chintu_memory").upsert({"key": key.strip().lower(), "value": value.strip(), "category": category.strip().lower()}, on_conflict="key").execute()
+        record_activity()
         return f"SUCCESS: Remembered '{key}'."
     except Exception as e:
+        record_activity()
         return f"Memory save error: {str(e)}"
 
 def recall_information(query_key: str = "") -> str:
@@ -147,12 +194,14 @@ def recall_information(query_key: str = "") -> str:
             res = supabase.table("chintu_memory").select("key, value, category").ilike("key", f"%{query_key.strip()}%").limit(5).execute()
         else:
             res = supabase.table("chintu_memory").select("key, value, category").order("updated_at", desc=True).limit(10).execute()
+        record_activity()
         if not res.data: return f"No memories found for '{query_key}'."
         return "\n".join([f"[{m.get('category')}] {m.get('key')}: {m.get('value')}" for m in res.data])
     except Exception as e:
+        record_activity()
         return f"Recall error: {str(e)}"
 
-# ----------------- PHASE 4: CRON SCHEDULER TOOLS -----------------
+# ----------------- CRON SCHEDULER TOOLS -----------------
 
 async def _scheduled_task_runner(task_id: str, prompt: str, target_chat_id: int):
     """Internal runner executed in background by APScheduler."""
@@ -185,8 +234,10 @@ def schedule_recurring_task(task_id: str, prompt: str, interval_minutes: int) ->
         if supabase:
             job_meta = json.dumps({"prompt": prompt, "interval_minutes": interval, "chat_id": target_chat})
             remember_information(f"cron_{clean_id}", job_meta, category="cron_schedule")
+        record_activity()
         return f"SUCCESS: Scheduled recurring task '{clean_id}' every {interval} minute(s)."
     except Exception as e:
+        record_activity()
         return f"Scheduling error: {str(e)}"
 
 def list_scheduled_tasks() -> str:
@@ -203,8 +254,10 @@ def cancel_scheduled_task(task_id: str) -> str:
     clean_id = task_id.strip().lower().replace(" ", "_")
     try:
         scheduler.remove_job(clean_id)
+        record_activity()
         return f"SUCCESS: Cancelled scheduled task '{clean_id}'."
     except Exception as e:
+        record_activity()
         return f"Failed to cancel task '{clean_id}': {str(e)}"
 
 # ----------------- SYSTEM & SPECIALIST -----------------
@@ -216,6 +269,7 @@ def execute_in_cloud_microvm(code: str) -> str:
     try:
         with Sandbox.create(api_key=E2B_API_KEY) as s:
             r = s.run_code(code)
+            record_activity()
             out = []
             if r.text: out.append(r.text)
             if r.logs.stdout: out.append("".join(r.logs.stdout))
@@ -223,6 +277,7 @@ def execute_in_cloud_microvm(code: str) -> str:
             if r.error: out.append(f"{r.error.name}: {r.error.value}")
             return "\n".join(out) if out else "Executed without output."
     except Exception as e:
+        record_activity()
         return f"MicroVM error: {str(e)}"
 
 def web_search(query: str) -> str:
@@ -231,8 +286,10 @@ def web_search(query: str) -> str:
     try:
         with DDGS() as d:
             res = list(d.text(query, max_results=4))
+        record_activity()
         return "\n\n".join([f"{r.get('title')}: {r.get('body')} ({r.get('href')})" for r in res]) if res else "No results."
     except Exception as e:
+        record_activity()
         return f"Search error: {str(e)}"
 
 def fetch_webpage(url: str) -> str:
@@ -244,9 +301,11 @@ def fetch_webpage(url: str) -> str:
         ctx.check_hostname = False
         ctx.verify_mode = ssl.CERT_NONE
         with urllib.request.urlopen(req, timeout=15, context=ctx) as r:
+            record_activity()
             t = " ".join(re.sub(r"<[^>]+>", " ", re.sub(r"<(script|style).*?</\1>", "", r.read().decode("utf-8", errors="ignore"), flags=re.DOTALL)).split())
             return t[:3000]
     except Exception as e:
+        record_activity()
         return f"Fetch error: {str(e)}"
 
 def run_terminal_command(command: str) -> str:
@@ -254,9 +313,11 @@ def run_terminal_command(command: str) -> str:
     record_activity()
     try:
         r = subprocess.run(command, shell=True, capture_output=True, text=True, timeout=60)
+        record_activity()
         out = r.stdout or r.stderr
         return out[:3000] if out else "Success."
     except Exception as e:
+        record_activity()
         return f"Bash error: {str(e)}"
 
 def write_project_file(file_path: str, content: str) -> str:
@@ -265,8 +326,10 @@ def write_project_file(file_path: str, content: str) -> str:
     try:
         os.makedirs(os.path.dirname(file_path) if os.path.dirname(file_path) else ".", exist_ok=True)
         with open(file_path, "w", encoding="utf-8") as f: f.write(content)
+        record_activity()
         return f"SUCCESS: Wrote '{file_path}'."
     except Exception as e:
+        record_activity()
         return f"Write error: {str(e)}"
 
 def read_file(file_path: str, start_line: int = 1, line_count: int = 100) -> str:
@@ -275,9 +338,11 @@ def read_file(file_path: str, start_line: int = 1, line_count: int = 100) -> str
     try:
         if not os.path.exists(file_path): return f"ERROR: File '{file_path}' missing."
         with open(file_path, "r", encoding="utf-8", errors="ignore") as f: lines = f.readlines()
+        record_activity()
         s = max(1, start_line) - 1
         return "".join(lines[s:s + line_count])
     except Exception as e:
+        record_activity()
         return f"Read error: {str(e)}"
 
 def patch_file(file_path: str, target_block: str, replacement_block: str) -> str:
@@ -288,8 +353,10 @@ def patch_file(file_path: str, target_block: str, replacement_block: str) -> str
         with open(file_path, "r", encoding="utf-8") as f: c = f.read()
         if target_block not in c: return f"Target block missing in '{file_path}'."
         with open(file_path, "w", encoding="utf-8") as f: f.write(c.replace(target_block, replacement_block, 1))
+        record_activity()
         return f"SUCCESS: Patched '{file_path}'."
     except Exception as e:
+        record_activity()
         return f"Patch error: {str(e)}"
 
 def consult_llama_specialist(task_description: str, code_or_context: str) -> str:
@@ -306,11 +373,14 @@ def consult_llama_specialist(task_description: str, code_or_context: str) -> str
             temperature=0.2,
             max_tokens=2048
         )
+        record_activity()
         return f"[Llama Specialist]: {resp.choices[0].message.content}"
     except Exception as e:
+        record_activity()
         return f"Llama error: {str(e)}"
 
 agent_tools = [
+    send_client_email,
     schedule_recurring_task,
     list_scheduled_tasks,
     cancel_scheduled_task,
@@ -333,6 +403,7 @@ agent_tools = [
 
 SYSTEM_PROMPT = (
     "You are Chintu, an Autonomous Full-Stack AI Engineer.\n"
+    "- CLIENT OUTREACH: Use `send_client_email` to contact clients, deliver proposals, or send notifications directly.\n"
     "- AUTONOMOUS SCHEDULING: Use `schedule_recurring_task`, `list_scheduled_tasks`, and `cancel_scheduled_task` to manage background jobs.\n"
     "- GITHUB: Use `github_commit_file` to commit changes directly, `github_read_file` to read repo code, and `github_create_repository` for new repos.\n"
     "- MEDIA: Use `send_telegram_photo` for charts and `send_telegram_document` for files.\n"
@@ -408,4 +479,3 @@ api = FastAPI(lifespan=lifespan)
 
 @api.get("/")
 def home():
-    return {"status": "ok", "scheduler": "active"}
