@@ -12,3 +12,4 @@ PyGithub
 apscheduler
 praw
 huggingface_hub
+composio
