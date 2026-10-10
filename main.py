@@ -53,7 +53,7 @@ groq_client = Groq(api_key=GROQ_API_KEY) if GROQ_API_KEY else None
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY) if (SUPABASE_URL and SUPABASE_KEY) else None
 github_client = Github(GITHUB_TOKEN) if GITHUB_TOKEN else None
 
-# Speed-to-Power Pure Gemini Free-Tier Cascade
+# Resilient Speed-to-Power Pure Gemini Free-Tier Cascade
 GEMINI_MODELS_CASCADE = [
     "gemini-3.5-flash-lite",
     "gemini-3.1-flash-lite",
