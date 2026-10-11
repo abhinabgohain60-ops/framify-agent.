@@ -90,8 +90,8 @@ class ProgressCardTracker:
         self.statuses = ["⏳ Pending" for _ in steps]
         self.details = ["" for _ in steps]
         self.message_id = None
-        self.last_edit_time = 0.0
         self._lock = threading.Lock()
+        self._update_queue = None
 
     def run_thread_safe(self, coro):
         global main_loop
@@ -104,7 +104,7 @@ class ProgressCardTracker:
         if main_loop and main_loop.is_running():
             try:
                 future = asyncio.run_coroutine_threadsafe(coro, main_loop)
-                return future.result(timeout=10)
+                return future.result(timeout=15)
             except Exception as e:
                 print(f"[Dispatch error]: {e}", flush=True)
                 return None
@@ -131,13 +131,30 @@ class ProgressCardTracker:
         if not self.bot or not self.chat_id:
             return
         try:
+            self._update_queue = asyncio.Queue()
             text = self._render_card()
-            msg = self.run_thread_safe(self.bot.send_message(chat_id=self.chat_id, text=text))
+            msg = await self.bot.send_message(chat_id=self.chat_id, text=text)
             if msg:
                 self.message_id = msg.message_id
-            self.last_edit_time = time.time()
+            asyncio.create_task(self._worker_loop())
         except Exception as e:
             print(f"ProgressCard initialize error: {e}", flush=True)
+
+    async def _worker_loop(self):
+        while self._update_queue:
+            try:
+                text = await self._update_queue.get()
+                if text is None:
+                    break
+                await self.bot.edit_message_text(
+                    chat_id=self.chat_id,
+                    message_id=self.message_id,
+                    text=text
+                )
+                self._update_queue.task_done()
+                await asyncio.sleep(0.3)
+            except Exception as e:
+                print(f"ProgressCard worker loop error: {e}", flush=True)
 
     async def update_step(self, step_index: int, status: str, detail: str = ""):
         if step_index < 0 or step_index >= len(self.steps):
@@ -150,20 +167,19 @@ class ProgressCardTracker:
             if not self.bot or not self.message_id:
                 return
 
-            now = time.time()
-            if now - self.last_edit_time < 0.8 and status not in ["✅ Done", "🚫 Failed"]:
-                return
-
             text = self._render_card()
+
+        if self._update_queue:
             try:
-                self.run_thread_safe(self.bot.edit_message_text(
-                    chat_id=self.chat_id,
-                    message_id=self.message_id,
-                    text=text
-                ))
-                self.last_edit_time = time.time()
+                while not self._update_queue.empty():
+                    try:
+                        self._update_queue.get_nowait()
+                        self._update_queue.task_done()
+                    except asyncio.QueueEmpty:
+                        break
+                await self._update_queue.put(text)
             except Exception as e:
-                print(f"ProgressCard update error: {e}", flush=True)
+                print(f"ProgressCard queue put error: {e}", flush=True)
 
     async def finalize(self, success: bool = True, final_note: str = ""):
         if not self.bot or not self.message_id:
@@ -177,14 +193,22 @@ class ProgressCardTracker:
             if final_note:
                 lines.append(f"\n💡 {final_note}")
             text = "\n".join(lines)
+
+        if self._update_queue:
             try:
-                self.run_thread_safe(self.bot.edit_message_text(
-                    chat_id=self.chat_id,
-                    message_id=self.message_id,
-                    text=text
-                ))
-            except Exception as e:
+                await self._update_queue.put(text)
+                await asyncio.sleep(0.5)
+                await self._update_queue.put(None)
+            except Exception:
                 pass
+        try:
+            self.run_thread_safe(self.bot.edit_message_text(
+                chat_id=self.chat_id,
+                message_id=self.message_id,
+                text=text
+            ))
+        except Exception as e:
+            pass
 
 # Autonomous Self-Healing Telemetry Wrapper with True Recursive Retry Loop
 async def execute_with_self_healing(card: ProgressCardTracker, step_idx: int, step_title: str, func, *args, **kwargs):
@@ -219,7 +243,6 @@ async def execute_with_self_healing(card: ProgressCardTracker, step_idx: int, st
 # ----------------- HUGGING FACE INFERENCE TOOLS -----------------
     
 def patch_core_system(file_path: str, new_content: str, commit_message: str) -> str:
-        
     """
     CRITICAL INFRASTRUCTURE TOOL: Allows the agent to modify its own source code.
     Use this to patch bugs in main.py, fix the event loop, or add new capabilities.
@@ -238,12 +261,10 @@ def patch_core_system(file_path: str, new_content: str, commit_message: str) -> 
     }
     
     try:
-        # 1. Fetch current file SHA (required by GitHub to update a file)
         req = urllib.request.Request(url, headers=headers)
         with urllib.request.urlopen(req) as response:
             sha = json.loads(response.read().decode())['sha']
             
-        # 2. Push the rewritten code
         encoded_content = base64.b64encode(new_content.encode('utf-8')).decode('utf-8')
         data = {
             "message": commit_message, 
@@ -708,19 +729,7 @@ def dispatch_to_agent(agent_id: str, task_prompt: str, context_payload: str = ""
             
         full_instructions = f"{system_instructions}\n{reflection_guidelines}\n\nContext Payload:\n{context_payload}"
         
-        worker_output = ""
-        if "Qwen" in engine_model or "hf" in engine_model.lower() or "/" in engine_model:
-            if not HF_TOKEN:
-                return "ERROR: HF_TOKEN required for Hugging Face worker agents."
-            client = InferenceClient(api_key=HF_TOKEN)
-            messages = [
-                {"role": "system", "content": full_instructions},
-                {"role": "user", "content": task_prompt}
-            ]
-            resp = client.chat.completions.create(model=engine_model, messages=messages, max_tokens=1500)
-            worker_output = resp.choices[0].message.content
-        else:
-            worker_output = consult_hf_specialist(f"{full_instructions}\n\nTask: {task_prompt}")
+        worker_output = consult_llama_specialist(f"{full_instructions}\n\nTask: {task_prompt}", "")
             
         history_list = agent_profile.get("task_history") or []
         history_list.append({"task": task_prompt[:200], "timestamp": time.time(), "status": "success"})
