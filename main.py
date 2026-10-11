@@ -217,7 +217,48 @@ async def execute_with_self_healing(card: ProgressCardTracker, step_idx: int, st
                 raise err
 
 # ----------------- HUGGING FACE INFERENCE TOOLS -----------------
-
+    
+def patch_core_system(file_path: str, new_content: str, commit_message: str) -> str:
+        
+    """
+    CRITICAL INFRASTRUCTURE TOOL: Allows the agent to modify its own source code.
+    Use this to patch bugs in main.py, fix the event loop, or add new capabilities.
+    This commits directly to the framify-agent repository and triggers a Render restart.
+    """
+    import urllib.request
+    import json
+    import base64
+    
+    repo = "abhinabgohain60-ops/framify-agent"
+    url = f"https://api.github.com/repos/{repo}/contents/{file_path}"
+    headers = {
+        "Authorization": f"token {GITHUB_TOKEN}",
+        "Accept": "application/vnd.github.v3+json",
+        "User-Agent": "Chintu-Auto-Patcher"
+    }
+    
+    try:
+        # 1. Fetch current file SHA (required by GitHub to update a file)
+        req = urllib.request.Request(url, headers=headers)
+        with urllib.request.urlopen(req) as response:
+            sha = json.loads(response.read().decode())['sha']
+            
+        # 2. Push the rewritten code
+        encoded_content = base64.b64encode(new_content.encode('utf-8')).decode('utf-8')
+        data = {
+            "message": commit_message, 
+            "content": encoded_content, 
+            "sha": sha, 
+            "branch": "main"
+        }
+        
+        put_req = urllib.request.Request(url, data=json.dumps(data).encode('utf-8'), headers=headers, method="PUT")
+        with urllib.request.urlopen(put_req) as response:
+            return f"SUCCESS: {file_path} patched. Render is now rebooting the server to apply your changes."
+            
+    except Exception as e:
+        return f"FAILED to patch core system: {str(e)}"
+        
 def generate_ai_image(prompt: str, filename: str = "concept_visual.png") -> str:
     """Generates an image via Hugging Face FLUX/SDXL models and sends it directly to Telegram."""
     record_activity()
@@ -739,7 +780,8 @@ agent_tools = [
     patch_file,
     execute_composio_action,
     register_new_tool,
-    dispatch_to_agent
+    dispatch_to_agent, 
+    patch_core_system
 ]
 
 available_tools = {t.__name__: t for t in agent_tools}
