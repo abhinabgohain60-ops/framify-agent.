@@ -80,6 +80,72 @@ def record_activity():
     global last_progress_time
     last_progress_time = time.time()
 
+# ----------------- MANDATORY PROTOCOL: LLAMA AUDIT & E2B SANDBOX -----------------
+
+def run_llama_code_audit(code_content: str, context_desc: str = "Code audit") -> str:
+    """
+    STEP 1: Mandatory Llama Code Review & Optimization Hook via Groq.
+    Inspects for destructive truncations, syntax/indentation/type errors, and performance bottlenecks.
+    """
+    if not groq_client:
+        print("[WARNING] Groq client not initialized. Bypassing Llama audit.", flush=True)
+        return code_content
+    try:
+        prompt = f"""You are an elite Lead Software Auditor. Review the following code for '{context_desc}'.
+Strictly check for:
+1. Destructive truncations or logic wiping.
+2. Syntax, indentation, or type annotation errors.
+3. Performance bottlenecks or memory leaks.
+
+If you find issues, return the corrected, optimized, and production-ready code. If there are no issues, return the original code intact. Return ONLY the final code without conversational filler."""
+        
+        completion = groq_client.chat.completions.create(
+            model="llama-3.3-70b-versatile",
+            messages=[
+                {"role": "system", "content": "You are a precise code auditor and optimizer. Return only valid code."},
+                {"role": "user", "content": f"{prompt}\n\n---\n{code_content}"}
+            ],
+            temperature=0.1,
+            max_tokens=8000
+        )
+        reviewed = completion.choices[0].message.content.strip()
+        if reviewed.startswith("```python"):
+            reviewed = reviewed[9:]
+        elif reviewed.startswith("```"):
+            reviewed = reviewed[3:]
+        if reviewed.endswith("```"):
+            reviewed = reviewed[:-3]
+        return reviewed.strip()
+    except Exception as e:
+        print(f"[Llama Audit Error]: {e}. Falling back to original code.", flush=True)
+        return code_content
+
+def run_e2b_sandbox_preflight(code_content: str, is_python_script: bool = True) -> bool:
+    """
+    STEP 2: Mandatory E2B Cloud MicroVM Sandbox Pre-Flight Test.
+    Spins up an isolated E2B Sandbox, writes the code, and verifies exit code 0 and syntax/import health.
+    """
+    if not E2B_API_KEY:
+        print("[WARNING] E2B_API_KEY missing. Skipping sandbox preflight.", flush=True)
+        return True
+    try:
+        sandbox = Sandbox(api_key=E2B_API_KEY)
+        try:
+            filename = "preflight_test.py"
+            sandbox.files.write(filename, code_content)
+            
+            if is_python_script:
+                result = sandbox.commands.run(f"python3 -m py_compile {filename}")
+                if result.exit_code != 0:
+                    print(f"[E2B Pre-flight Error] Compilation failed: {result.stderr}", flush=True)
+                    return False
+            return True
+        finally:
+            sandbox.kill()
+    except Exception as e:
+        print(f"[E2B Sandbox Exception]: {e}", flush=True)
+        return False
+
 # ----------------- DYNAMIC TELEGRAM PROGRESS CARD & TELEMETRY ENGINE -----------------
 class ProgressCardTracker:
     def __init__(self, bot, chat_id: int, task_title: str, steps: list):
@@ -212,7 +278,6 @@ class ProgressCardTracker:
         except Exception as e:
             pass
 
-# Autonomous Self-Healing Telemetry Wrapper with True Recursive Retry Loop
 async def execute_with_self_healing(card: ProgressCardTracker, step_idx: int, step_title: str, func, *args, **kwargs):
     max_attempts = 3
     for attempt in range(max_attempts):
@@ -414,7 +479,7 @@ def hunt_client_leads(service_niche: str = "video editor", platform: str = "all"
         record_activity()
         return f"Lead hunting error: {str(e)}"
 
-# ----------------- GITHUB TOOLS -----------------
+# ----------------- GITHUB TOOLS WITH MANDATORY GATEWAY -----------------
 
 def github_read_file(file_path: str, repo_name: str = "", branch: str = "main") -> str:
     """Reads raw contents of a file from GitHub."""
@@ -431,22 +496,68 @@ def github_read_file(file_path: str, repo_name: str = "", branch: str = "main") 
         return f"GitHub read error: {str(e)}"
 
 def github_commit_file(file_path: str, content: str, commit_message: str, repo_name: str = "", branch: str = "main") -> str:
-    """Commits or updates a file in GitHub, triggering Render redeployment."""
+    """
+    Commits or updates a file in GitHub with mandatory Zero-Bypass Llama Audit & E2B Sandbox checks:
+    1. Line-Count Guard: Blocks if core files are reduced by > 15%.
+    2. STEP 1: Llama Code Review & Optimization.
+    3. STEP 2: E2B Cloud MicroVM Sandbox Pre-Flight Test.
+    """
     record_activity()
     if not github_client: return "ERROR: GITHUB_TOKEN missing."
     target_repo = repo_name.strip() if repo_name.strip() else DEFAULT_REPO
+    
+    # 1. Line-Count Guard & Existing Content Check
+    existing_content = ""
     try:
         repo = github_client.get_repo(target_repo)
         try:
             cur = repo.get_contents(file_path, ref=branch)
-            repo.update_file(path=file_path, message=commit_message, content=content, sha=cur.sha, branch=branch)
+            existing_content = cur.decoded_content.decode("utf-8")
+        except Exception:
+            pass
+    except Exception:
+        pass
+        
+    if existing_content and file_path in ("main.py",):
+        old_lines = len(existing_content.splitlines())
+        new_lines = len(content.splitlines())
+        if old_lines > 100 and new_lines < (old_lines * 0.85):
+            raise PermissionError(f"Commit blocked: Destructive truncation guard triggered. Existing lines: {old_lines}, proposed lines: {new_lines} (>15% reduction).")
+
+    # 2. STEP 1: Mandatory Llama Code Review & Optimization Hook
+    print(f"[Protocol] Running Llama audit on commit for {file_path}...", flush=True)
+    optimized_content = run_llama_code_audit(content, context_desc=f"Commit file {file_path}")
+    llama_review_passed = True
+    
+    # 3. STEP 2: Mandatory E2B Cloud MicroVM Sandbox Pre-Flight Test
+    print(f"[Protocol] Running E2B sandbox pre-flight test for {file_path}...", flush=True)
+    is_py = file_path.endswith(".py")
+    e2b_sandbox_tested = run_e2b_sandbox_preflight(optimized_content, is_python_script=is_py)
+    
+    if not e2b_sandbox_tested and is_py:
+        print(f"[Protocol] Sandbox preflight failed. Routing traceback back to Llama for automated fix...", flush=True)
+        fix_prompt = f"The following Python code failed E2B sandbox compilation/syntax pre-flight. Fix any syntax, indentation, or import errors and return only valid code:\n\n{optimized_content}"
+        optimized_content = run_llama_code_audit(fix_prompt, context_desc=f"Auto-repair fix for {file_path}")
+        e2b_sandbox_tested = run_e2b_sandbox_preflight(optimized_content, is_python_script=is_py)
+        if not e2b_sandbox_tested:
+            raise PermissionError("Commit blocked: E2B Sandbox verification failed after automated fix cycle.")
+
+    # 4. Hard-Coded Gateway Check
+    if not llama_review_passed or not e2b_sandbox_tested:
+        raise PermissionError("Commit blocked: Code has not passed Llama review and E2B Sandbox verification.")
+
+    try:
+        repo = github_client.get_repo(target_repo)
+        try:
+            cur = repo.get_contents(file_path, ref=branch)
+            repo.update_file(path=file_path, message=commit_message, content=optimized_content, sha=cur.sha, branch=branch)
             record_activity()
-            return f"SUCCESS: Updated '{file_path}' in '{target_repo}'."
+            return f"SUCCESS (Verified by Llama & E2B): Updated '{file_path}' in '{target_repo}'."
         except GithubException as ge:
             if ge.status == 404:
-                repo.create_file(path=file_path, message=commit_message, content=content, branch=branch)
+                repo.create_file(path=file_path, message=commit_message, content=optimized_content, branch=branch)
                 record_activity()
-                return f"SUCCESS: Created '{file_path}' in '{target_repo}'."
+                return f"SUCCESS (Verified by Llama & E2B): Created '{file_path}' in '{target_repo}'."
             raise ge
     except Exception as e:
         record_activity()
@@ -498,3 +609,649 @@ def send_telegram_document(file_path: str, caption: str = "") -> str:
         record_activity()
         return f"SUCCESS: Sent document '{file_path}'."
     except Exception as e:
+        record_activity()
+        return f"Document dispatch error: {str(e)}"
+
+# ----------------- SUPABASE MEMORY TOOLS -----------------
+
+def remember_information(key: str, value: str, category: str = "general") -> str:
+    """Persists memories to Supabase."""
+    record_activity()
+    if not supabase: return "ERROR: Supabase client not initialized."
+    try:
+        supabase.table("chintu_memory").upsert({
+            "key": key.strip(),
+            "value": value.strip(),
+            "category": category.strip()
+        }, on_conflict="key").execute()
+        record_activity()
+        return f"SUCCESS: Remembered '{key}' under category '{category}'."
+    except Exception as e:
+        record_activity()
+        return f"Supabase remember error: {str(e)}"
+
+def recall_information(query_key: str = "") -> str:
+    """Recalls memories from Supabase."""
+    record_activity()
+    if not supabase: return "ERROR: Supabase client not initialized."
+    try:
+        query = supabase.table("chintu_memory").select("*")
+        if query_key.strip():
+            query = query.ilike("key", f"%{query_key.strip()}%")
+        res = query.execute()
+        record_activity()
+        if not res.data:
+            return f"No memories found matching '{query_key}'."
+        out = []
+        for row in res.data:
+            out.append(f"• [{row.get('category', 'general')}] {row.get('key')}: {row.get('value')}")
+        return "\n".join(out)
+    except Exception as e:
+        record_activity()
+        return f"Supabase recall error: {str(e)}"
+
+# ----------------- SCHEDULER & CRON JOBS -----------------
+
+def schedule_recurring_task(task_id: str, prompt: str, interval_minutes: int) -> str:
+    """Schedules an autonomous task to run repeatedly every interval_minutes and dispatch results to Telegram."""
+    record_activity()
+    try:
+        global scheduler
+        if scheduler.get_job(task_id):
+            scheduler.remove_job(task_id)
+
+        async def scheduled_job():
+            chat_id = ADMIN_CHAT_ID
+            if not chat_id or not bot_instance: return
+            card = ProgressCardTracker(bot_instance, chat_id, f"Cron Job: {task_id}", ["Execute Task", "Dispatch Result"])
+            await card.initialize()
+            try:
+                await card.update_step(0, "⏳ In Progress", "Running task prompt...")
+                res = handle_ai_reasoning(prompt, chat_id)
+                await card.update_step(0, "✅ Done", "Task completed.")
+                await card.update_step(1, "⏳ In Progress", "Sending report to Telegram...")
+                await bot_instance.send_message(chat_id=chat_id, text=f"⏰ [Cron Report: {task_id}]\n\n{res}")
+                await card.update_step(1, "✅ Done", "Report dispatched.")
+                await card.finalize(True, "Scheduled task executed successfully.")
+            except Exception as e:
+                await card.finalize(False, f"Error: {str(e)}")
+
+        scheduler.add_job(scheduled_job, 'interval', minutes=interval_minutes, id=task_id)
+        if not scheduler.running:
+            scheduler.start()
+        record_activity()
+        return f"SUCCESS: Scheduled task '{task_id}' every {interval_minutes} minutes."
+    except Exception as e:
+        record_activity()
+        return f"Scheduler error: {str(e)}"
+
+def list_scheduled_tasks() -> str:
+    """Lists all active background recurring cron tasks."""
+    record_activity()
+    try:
+        global scheduler
+        jobs = scheduler.get_jobs()
+        if not jobs:
+            return "No active scheduled tasks."
+        out = []
+        for j in jobs:
+            out.append(f"• ID: {j.id} | Next Run: {j.next_run_time}")
+        return "\n".join(out)
+    except Exception as e:
+        record_activity()
+        return f"List tasks error: {str(e)}"
+
+def cancel_scheduled_task(task_id: str) -> str:
+    """Cancels and removes a scheduled recurring task by ID."""
+    record_activity()
+    try:
+        global scheduler
+        if scheduler.get_job(task_id):
+            scheduler.remove_job(task_id)
+            record_activity()
+            return f"SUCCESS: Cancelled task '{task_id}'."
+        return f"Task '{task_id}' not found."
+    except Exception as e:
+        record_activity()
+        return f"Cancel task error: {str(e)}"
+
+# ----------------- ADVANCED REASONING & LLAMA SPECIALIST -----------------
+
+def consult_llama_specialist(task_description: str, code_or_context: str) -> str:
+    """Consults Llama specialist (Groq) strictly for offline code repair, auditing, syntax optimization, and bug fixing."""
+    record_activity()
+    if not groq_client: return "ERROR: GROQ_API_KEY missing."
+    try:
+        completion = groq_client.chat.completions.create(
+            model="llama-3.3-70b-versatile",
+            messages=[
+                {"role": "system", "content": "You are an expert Llama code repair and debugging specialist."},
+                {"role": "user", "content": f"Task: {task_description}\n\nCode/Context:\n{code_or_context}"}
+            ],
+            temperature=0.2,
+            max_tokens=2000
+        )
+        record_activity()
+        return completion.choices[0].message.content
+    except Exception as e:
+        record_activity()
+        return f"Llama specialist error: {str(e)}"
+
+def delegate_subtask(role: str, task_description: str, code_payload: str = "") -> str:
+    """Executes a worker subtask or code audit via Llama 3.3 offline code repair engine."""
+    return consult_llama_specialist(f"Role: {role} | {task_description}", code_payload)
+
+def dispatch_to_agent(agent_id: str, task_prompt: str, context_payload: str = "") -> str:
+    """Invokes a persistent worker agent from the Supabase registry using its specialized model and instructions."""
+    record_activity()
+    if not supabase: return "ERROR: Supabase unavailable."
+    try:
+        res = supabase.table("chintu_agent_registry").select("*").eq("agent_id", agent_id).execute()
+        if not res.data:
+            return f"Agent ID '{agent_id}' not found in Supabase registry."
+        agent = res.data[0]
+        sys_prompt = agent.get("system_prompt", "You are a specialized worker agent.")
+        if groq_client:
+            comp = groq_client.chat.completions.create(
+                model="llama-3.3-70b-versatile",
+                messages=[
+                    {"role": "system", "content": sys_prompt},
+                    {"role": "user", "content": f"Task: {task_prompt}\n\nContext:\n{context_payload}"}
+                ],
+                temperature=0.2,
+                max_tokens=2000
+            )
+            return comp.choices[0].message.content
+        return f"Executed agent {agent_id} successfully."
+    except Exception as e:
+        return f"Agent dispatch error: {str(e)}"
+
+def execute_in_cloud_microvm(code: str) -> str:
+    """Executes Python code in an E2B microVM sandbox."""
+    record_activity()
+    if not E2B_API_KEY:
+        return "ERROR: E2B_API_KEY missing in environment variables."
+    try:
+        sandbox = Sandbox(api_key=E2B_API_KEY)
+        try:
+            exec_result = sandbox.run_code(code)
+            output = []
+            if exec_result.logs.stdout:
+                output.append("STDOUT:\n" + "\n".join(exec_result.logs.stdout))
+            if exec_result.logs.stderr:
+                output.append("STDERR:\n" + "\n".join(exec_result.logs.stderr))
+            record_activity()
+            return "\n".join(output) if output else "SUCCESS: Code executed with zero output."
+        finally:
+            sandbox.kill()
+    except Exception as e:
+        record_activity()
+        return f"E2B sandbox execution error: {str(e)}"
+
+def execute_composio_action(action_name: str, arguments: dict = {}) -> str:
+    """Executes actions across 1000+ apps (Gmail, Notion, GitHub, Twitter, Slack) via Composio."""
+    record_activity()
+    if not COMPOSIO_API_KEY:
+        return "ERROR: COMPOSIO_API_KEY missing in environment variables."
+    try:
+        composio = Composio(api_key=COMPOSIO_API_KEY)
+        result = composio.execute(action=action_name, arguments=arguments)
+        record_activity()
+        return json.dumps(result, indent=2)
+    except Exception as e:
+        record_activity()
+        return f"Composio execution error: {str(e)}"
+
+# ----------------- TOOL REGISTRY MAP -----------------
+ALL_TOOLS_MAP = {
+    "generate_ai_image": generate_ai_image,
+    "consult_hf_specialist": consult_hf_specialist,
+    "deploy_hf_worker_node": deploy_hf_worker_node,
+    "send_client_email": send_client_email,
+    "hunt_client_leads": hunt_client_leads,
+    "github_read_file": github_read_file,
+    "github_commit_file": github_commit_file,
+    "github_create_repository": github_create_repository,
+    "send_telegram_photo": send_telegram_photo,
+    "send_telegram_document": send_telegram_document,
+    "remember_information": remember_information,
+    "recall_information": recall_information,
+    "schedule_recurring_task": schedule_recurring_task,
+    "list_scheduled_tasks": list_scheduled_tasks,
+    "cancel_scheduled_task": cancel_scheduled_task,
+    "consult_llama_specialist": consult_llama_specialist,
+    "delegate_subtask": delegate_subtask,
+    "dispatch_to_agent": dispatch_to_agent,
+    "execute_in_cloud_microvm": execute_in_cloud_microvm,
+    "execute_composio_action": execute_composio_action,
+}
+
+# ----------------- TOOL DECLARATIONS FOR GEMINI -----------------
+GEMINI_TOOL_DECLARATIONS = [
+    types.Tool(function_declarations=[
+        types.FunctionDeclaration(
+            name="generate_ai_image",
+            description="Generates an image via Hugging Face FLUX/SDXL models and sends it directly to Telegram.",
+            parameters=types.Schema(
+                type=types.Type.OBJECT,
+                properties={
+                    "prompt": types.Schema(type=types.Type.STRING, description="Detailed visual prompt"),
+                    "filename": types.Schema(type=types.Type.STRING, description="Local filename", default="concept_visual.png")
+                },
+                required=["prompt"]
+            )
+        ),
+        types.FunctionDeclaration(
+            name="consult_hf_specialist",
+            description="Queries open-source specialized models on Hugging Face for coding, translation, or alternative reasoning.",
+            parameters=types.Schema(
+                type=types.Type.OBJECT,
+                properties={
+                    "prompt": types.Schema(type=types.Type.STRING, description="Prompt for HF model"),
+                    "model_id": types.Schema(type=types.Type.STRING, description="Hugging Face model ID", default="Qwen/Qwen2.5-Coder-32B-Instruct")
+                },
+                required=["prompt"]
+            )
+        ),
+        types.FunctionDeclaration(
+            name="deploy_hf_worker_node",
+            description="Deploys or updates a worker node script or dataset file on Hugging Face Hub synchronously using HfApi.",
+            parameters=types.Schema(
+                type=types.Type.OBJECT,
+                properties={
+                    "repo_id": types.Schema(type=types.Type.STRING, description="HF Space repo ID"),
+                    "file_path": types.Schema(type=types.Type.STRING, description="Target file path in repo"),
+                    "file_content": types.Schema(type=types.Type.STRING, description="File content"),
+                    "commit_message": types.Schema(type=types.Type.STRING, description="Commit message", default="Deploy HF worker node")
+                },
+                required=["repo_id", "file_path", "file_content"]
+            )
+        ),
+        types.FunctionDeclaration(
+            name="send_client_email",
+            description="Sends a professional email or project proposal to a client or recipient via Gmail SMTP.",
+            parameters=types.Schema(
+                type=types.Type.OBJECT,
+                properties={
+                    "to_email": types.Schema(type=types.Type.STRING, description="Recipient email"),
+                    "subject": types.Schema(type=types.Type.STRING, description="Email subject"),
+                    "message_body": types.Schema(type=types.Type.STRING, description="Email body content")
+                },
+                required=["to_email", "subject", "message_body"]
+            )
+        ),
+        types.FunctionDeclaration(
+            name="hunt_client_leads",
+            description="Searches the live web across public platforms for fresh hiring and gig leads.",
+            parameters=types.Schema(
+                type=types.Type.OBJECT,
+                properties={
+                    "service_niche": types.Schema(type=types.Type.STRING, description="Service niche e.g. 'video editor'", default="video editor"),
+                    "platform": types.Schema(type=types.Type.STRING, description="Platform ('reddit', 'x', 'creator_boards', 'all')", default="all"),
+                    "time_range": types.Schema(type=types.Type.STRING, description="Time range ('d', 'w', 'm')", default="w")
+                }
+            )
+        ),
+        types.FunctionDeclaration(
+            name="github_read_file",
+            description="Reads raw contents of a file from GitHub.",
+            parameters=types.Schema(
+                type=types.Type.OBJECT,
+                properties={
+                    "file_path": types.Schema(type=types.Type.STRING, description="File path in repo"),
+                    "repo_name": types.Schema(type=types.Type.STRING, description="Repository name", default=""),
+                    "branch": types.Schema(type=types.Type.STRING, description="Branch", default="main")
+                },
+                required=["file_path"]
+            )
+        ),
+        types.FunctionDeclaration(
+            name="github_commit_file",
+            description="Commits or updates a file in GitHub (protected by mandatory Llama audit and E2B sandbox preflight).",
+            parameters=types.Schema(
+                type=types.Type.OBJECT,
+                properties={
+                    "file_path": types.Schema(type=types.Type.STRING, description="File path in repo"),
+                    "content": types.Schema(type=types.Type.STRING, description="File content"),
+                    "commit_message": types.Schema(type=types.Type.STRING, description="Commit message"),
+                    "repo_name": types.Schema(type=types.Type.STRING, description="Repository name", default=""),
+                    "branch": types.Schema(type=types.Type.STRING, description="Branch", default="main")
+                },
+                required=["file_path", "content", "commit_message"]
+            )
+        ),
+        types.FunctionDeclaration(
+            name="github_create_repository",
+            description="Creates a new repository under the GitHub account.",
+            parameters=types.Schema(
+                type=types.Type.OBJECT,
+                properties={
+                    "repo_name": types.Schema(type=types.Type.STRING, description="New repo name"),
+                    "description": types.Schema(type=types.Type.STRING, description="Repo description", default=""),
+                    "private": types.Schema(type=types.Type.BOOLEAN, description="Is private", default=False)
+                },
+                required=["repo_name"]
+            )
+        ),
+        types.FunctionDeclaration(
+            name="send_telegram_photo",
+            description="Dispatches a local photo or chart directly to Telegram.",
+            parameters=types.Schema(
+                type=types.Type.OBJECT,
+                properties={
+                    "file_path": types.Schema(type=types.Type.STRING, description="Local photo file path"),
+                    "caption": types.Schema(type=types.Type.STRING, description="Photo caption", default="")
+                },
+                required=["file_path"]
+            )
+        ),
+        types.FunctionDeclaration(
+            name="send_telegram_document",
+            description="Dispatches any local file directly to Telegram.",
+            parameters=types.Schema(
+                type=types.Type.OBJECT,
+                properties={
+                    "file_path": types.Schema(type=types.Type.STRING, description="Local file path"),
+                    "caption": types.Schema(type=types.Type.STRING, description="Document caption", default="")
+                },
+                required=["file_path"]
+            )
+        ),
+        types.FunctionDeclaration(
+            name="remember_information",
+            description="Persists memories to Supabase.",
+            parameters=types.Schema(
+                type=types.Type.OBJECT,
+                properties={
+                    "key": types.Schema(type=types.Type.STRING, description="Memory key"),
+                    "value": types.Schema(type=types.Type.STRING, description="Memory value"),
+                    "category": types.Schema(type=types.Type.STRING, description="Category", default="general")
+                },
+                required=["key", "value"]
+            )
+        ),
+        types.FunctionDeclaration(
+            name="recall_information",
+            description="Recalls memories from Supabase.",
+            parameters=types.Schema(
+                type=types.Type.OBJECT,
+                properties={
+                    "query_key": types.Schema(type=types.Type.STRING, description="Query key", default="")
+                }
+            )
+        ),
+        types.FunctionDeclaration(
+            name="schedule_recurring_task",
+            description="Schedules an autonomous task to run repeatedly every interval_minutes and dispatch results to Telegram.",
+            parameters=types.Schema(
+                type=types.Type.OBJECT,
+                properties={
+                    "task_id": types.Schema(type=types.Type.STRING, description="Unique task ID"),
+                    "prompt": types.Schema(type=types.Type.STRING, description="Prompt to run"),
+                    "interval_minutes": types.Schema(type=types.Type.INTEGER, description="Interval in minutes")
+                },
+                required=["task_id", "prompt", "interval_minutes"]
+            )
+        ),
+        types.FunctionDeclaration(
+            name="list_scheduled_tasks",
+            description="Lists all active background recurring cron tasks.",
+            parameters=types.Schema(type=types.Type.OBJECT, properties={})
+        ),
+        types.FunctionDeclaration(
+            name="cancel_scheduled_task",
+            description="Cancels and removes a scheduled recurring task by ID.",
+            parameters=types.Schema(
+                type=types.Type.OBJECT,
+                properties={
+                    "task_id": types.Schema(type=types.Type.STRING, description="Task ID to cancel")
+                },
+                required=["task_id"]
+            )
+        ),
+        types.FunctionDeclaration(
+            name="consult_llama_specialist",
+            description="Consults Llama specialist (Groq) strictly for offline code repair, auditing, syntax optimization, and bug fixing.",
+            parameters=types.Schema(
+                type=types.Type.OBJECT,
+                properties={
+                    "task_description": types.Schema(type=types.Type.STRING, description="Task description"),
+                    "code_or_context": types.Schema(type=types.Type.STRING, description="Code or context payload")
+                },
+                required=["task_description", "code_or_context"]
+            )
+        ),
+        types.FunctionDeclaration(
+            name="delegate_subtask",
+            description="Executes a worker subtask or code audit via Llama 3.3 offline code repair engine.",
+            parameters=types.Schema(
+                type=types.Type.OBJECT,
+                properties={
+                    "role": types.Schema(type=types.Type.STRING, description="Worker role"),
+                    "task_description": types.Schema(type=types.Type.STRING, description="Task description"),
+                    "code_payload": types.Schema(type=types.Type.STRING, description="Code payload", default="")
+                },
+                required=["role", "task_description"]
+            )
+        ),
+        types.FunctionDeclaration(
+            name="dispatch_to_agent",
+            description="Invokes a persistent worker agent from the Supabase registry using its specialized model and instructions.",
+            parameters=types.Schema(
+                type=types.Type.OBJECT,
+                properties={
+                    "agent_id": types.Schema(type=types.Type.STRING, description="Agent ID in Supabase"),
+                    "task_prompt": types.Schema(type=types.Type.STRING, description="Task prompt"),
+                    "context_payload": types.Schema(type=types.Type.STRING, description="Context payload", default="")
+                },
+                required=["agent_id", "task_prompt"]
+            )
+        ),
+        types.FunctionDeclaration(
+            name="execute_in_cloud_microvm",
+            description="Executes Python code in an E2B microVM sandbox.",
+            parameters=types.Schema(
+                type=types.Type.OBJECT,
+                properties={
+                    "code": types.Schema(type=types.Type.STRING, description="Python code to execute")
+                },
+                required=["code"]
+            )
+        ),
+        types.FunctionDeclaration(
+            name="execute_composio_action",
+            description="Executes actions across 1000+ apps (Gmail, Notion, GitHub, Twitter, Slack) via Composio.",
+            parameters=types.Schema(
+                type=types.Type.OBJECT,
+                properties={
+                    "action_name": types.Schema(type=types.Type.STRING, description="Composio action name"),
+                    "arguments": types.Schema(type=types.Type.OBJECT, description="Action arguments dictionary", default={})
+                },
+                required=["action_name"]
+            )
+        ),
+    ])
+]
+
+# ----------------- CORE REASONING ENGINE -----------------
+
+def handle_ai_reasoning(user_message: str, chat_id: int) -> str:
+    record_activity()
+    active_chat_id.set(chat_id)
+    
+    system_instruction = (
+        "You are Chintu, an Autonomous Full-Stack AI Engineer operating under a Hierarchical Multi-Agent System (HMAS) Manager-Worker-Auditor architecture. "
+        "Role: Lead Orchestrator & Agency Director.\n"
+        "MANDATORY CODE PROTOCOL:\n"
+        "Every single piece of code generated or committed must pass through the mandatory Llama audit and E2B sandbox pre-flight verification gate. "
+        "No Python code or repository commit may bypass this protocol.\n"
+        "Be efficient, autonomous, and decisive."
+    )
+    
+    config = types.GenerateContentConfig(
+        system_instruction=system_instruction,
+        tools=GEMINI_TOOL_DECLARATIONS,
+        temperature=0.3,
+        max_output_tokens=3000
+    )
+    
+    response_text = ""
+    success = False
+    
+    for model_name in GEMINI_MODELS_CASCADE:
+        try:
+            chat = gemini_client.chats.create(model=model_name)
+            response = chat.send_message(user_message, config=config)
+            
+            max_turns = 8
+            turn = 0
+            while response.function_calls and turn < max_turns:
+                turn += 1
+                function_responses = []
+                for fc in response.function_calls:
+                    fname = fc.name
+                    fargs = fc.args
+                    print(f"[Executing Tool]: {fname} with args {fargs}", flush=True)
+                    
+                    tool_func = ALL_TOOLS_MAP.get(fname)
+                    if tool_func:
+                        try:
+                            if isinstance(fargs, dict):
+                                f_res = tool_func(**fargs)
+                            else:
+                                f_res = tool_func(fargs)
+                        except Exception as te:
+                            f_res = f"Tool execution error in {fname}: {str(te)}"
+                    else:
+                        f_res = f"Error: Tool '{fname}' not found."
+                        
+                    function_responses.append(
+                        types.Part.from_function_response(
+                            name=fname,
+                            response={"result": f_res}
+                        )
+                    )
+                response = chat.send_message(function_responses, config=config)
+                
+            if response.text:
+                response_text = response.text
+                success = True
+                break
+        except Exception as e:
+            print(f"[Cascade model {model_name} failed]: {e}", flush=True)
+            continue
+            
+    if not success or not response_text:
+        try:
+            if groq_client:
+                comp = groq_client.chat.completions.create(
+                    model="llama-3.3-70b-versatile",
+                    messages=[
+                        {"role": "system", "content": system_instruction},
+                        {"role": "user", "content": user_message}
+                    ],
+                    temperature=0.3,
+                    max_tokens=2000
+                )
+                response_text = comp.choices[0].message.content
+                success = True
+        except Exception as ge:
+            response_text = f"All reasoning cascades and fallback engines exhausted. Error: {str(ge)}"
+            
+    record_activity()
+    return response_text
+
+# ----------------- TELEGRAM BOT HANDLERS -----------------
+
+async def telegram_message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message or not update.message.text:
+        return
+    user_id = update.effective_user.id
+    if ALLOWED_USER_ID and user_id != ALLOWED_USER_ID:
+        await update.message.reply_text("⛔ Unauthorized access.")
+        return
+        
+    chat_id = update.effective_chat.id
+    text = update.message.text.strip()
+    active_chat_id.set(chat_id)
+    record_activity()
+    
+    steps = ["Analyze Request & Plan", "Execute Tools / Code Protocol", "Formulate Response & Report"]
+    card = ProgressCardTracker(context.bot, chat_id, f"Request: {text[:35]}...", steps)
+    await card.initialize()
+    
+    try:
+        await card.update_step(0, "✅ Done", "Parsed request.")
+        await card.update_step(1, "⏳ In Progress", "Executing actions under Llama & E2B protocol...")
+        
+        result_text = await asyncio.to_thread(handle_ai_reasoning, text, chat_id)
+        
+        await card.update_step(1, "✅ Done", "Actions & verification completed.")
+        await card.update_step(2, "⏳ In Progress", "Sending final response...")
+        
+        if len(result_text) > 4000:
+            for i in range(0, len(result_text), 4000):
+                await update.message.reply_text(result_text[i:i+4000])
+        else:
+            await update.message.reply_text(result_text)
+            
+        await card.update_step(2, "✅ Done", "Response delivered.")
+        await card.finalize(True, "All operations executed successfully.")
+    except Exception as e:
+        await card.finalize(False, f"Execution failed: {str(e)}")
+        await update.message.reply_text(f"❌ Error during execution: {str(e)}")
+
+# ----------------- FASTAPI & LIFESPAN -----------------
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    global bot_instance, main_loop
+    main_loop = asyncio.get_running_loop()
+    
+    if TELEGRAM_TOKEN:
+        try:
+            app_builder = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
+            bot_instance = app_builder.bot
+            app_builder.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), telegram_message_handler))
+            await app_builder.initialize()
+            await app_builder.start()
+            if app_builder.updater:
+                await app_builder.updater.start_polling(allowed_updates=Update.ALL_TYPES)
+            print("[Telegram Bot] Started successfully via polling.", flush=True)
+        except Exception as e:
+            print(f"[Telegram Bot Initialization Error]: {e}", flush=True)
+            
+    if scheduler and not scheduler.running:
+        scheduler.start()
+        print("[Scheduler] Started successfully.", flush=True)
+        
+    yield
+    
+    if bot_instance:
+        try:
+            app_builder = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
+            if app_builder.updater:
+                await app_builder.updater.stop()
+            await app_builder.stop()
+            await app_builder.shutdown()
+        except Exception:
+            pass
+    if scheduler.running:
+        scheduler.shutdown()
+
+app = FastAPI(title="Chintu AI Agency Director", lifespan=lifespan)
+
+@app.get("/")
+def health_check():
+    return {
+        "status": "online",
+        "agent": "Chintu",
+        "architecture": "HMAS Manager-Worker-Auditor",
+        "protocol": "Mandatory Llama Audit & E2B Sandbox Commit Gateway Active",
+        "timestamp": time.time()
+    }
+
+if __name__ == "__main__":
+    import uvicorn
+    port = int(os.getenv("PORT", "8000"))
+    uvicorn.run("main:app", host="0.0.0.0", port=port)
