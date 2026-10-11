@@ -57,8 +57,9 @@ github_client = Github(GITHUB_TOKEN) if GITHUB_TOKEN else None
 
 # Updated Gemini Model Cascade (Prioritizing gemini-3-flash-preview)
 GEMINI_MODELS_CASCADE = [
-    "gemini-3.8-flash",
     "gemini-3.5-flash",
+    "gemini-3.5-flash-lite",
+    "gemini-3.8-flash",
 ]
 
 active_chat_id: contextvars.ContextVar[int] = contextvars.ContextVar("active_chat_id", default=0)
