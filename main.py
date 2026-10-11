@@ -55,16 +55,14 @@ groq_client = Groq(api_key=GROQ_API_KEY) if GROQ_API_KEY else None
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY) if (SUPABASE_URL and SUPABASE_KEY) else None
 github_client = Github(GITHUB_TOKEN) if GITHUB_TOKEN else None
 
-# Resilient Speed-to-Power Pure Gemini Free-Tier Cascade
+# Updated Gemini Model Cascade (Prioritizing gemini-3-flash-preview)
 GEMINI_MODELS_CASCADE = [
-    "gemini-3.5-flash-lite",
-    "gemini-3.1-flash-lite",
-    "gemini-2.5-flash-lite",
-    "gemini-3.6-flash",
-    "gemini-3.5-flash",
+    "gemini-3-flash-preview",
     "gemini-2.5-flash",
-    "gemini-3.7-flash",
-    "gemini-3.8-flash",
+    "gemini-2.5-pro",
+    "gemini-2.0-flash",
+    "gemini-1.5-flash",
+    "gemini-1.5-pro",
 ]
 
 active_chat_id: contextvars.ContextVar[int] = contextvars.ContextVar("active_chat_id", default=0)
@@ -311,41 +309,10 @@ async def execute_with_self_healing(card: ProgressCardTracker, step_idx: int, st
     
 def patch_core_system(file_path: str, new_content: str, commit_message: str) -> str:
     """
-    CRITICAL INFRASTRUCTURE TOOL: Allows the agent to modify its own source code.
-    Use this to patch bugs in main.py, fix the event loop, or add new capabilities.
-    This commits directly to the framify-agent repository and triggers a Render restart.
+    [DEPRECATED / FROZEN] Dynamic core patching of main.py is deprecated.
+    main.py is frozen against runtime feature rewrites. Use modules under /tools/ instead.
     """
-    import urllib.request
-    import json
-    import base64
-    
-    repo = "abhinabgohain60-ops/framify-agent."
-    url = f"https://api.github.com/repos/{repo}/contents/{file_path}"
-    headers = {
-        "Authorization": f"token {GITHUB_TOKEN}",
-        "Accept": "application/vnd.github.v3+json",
-        "User-Agent": "Chintu-Auto-Patcher"
-    }
-    
-    try:
-        req = urllib.request.Request(url, headers=headers)
-        with urllib.request.urlopen(req) as response:
-            sha = json.loads(response.read().decode())['sha']
-            
-        encoded_content = base64.b64encode(new_content.encode('utf-8')).decode('utf-8')
-        data = {
-            "message": commit_message, 
-            "content": encoded_content, 
-            "sha": sha, 
-            "branch": "main"
-        }
-        
-        put_req = urllib.request.Request(url, data=json.dumps(data).encode('utf-8'), headers=headers, method="PUT")
-        with urllib.request.urlopen(put_req) as response:
-            return f"SUCCESS: {file_path} patched. Render is now rebooting the server to apply your changes."
-            
-    except Exception as e:
-        return f"FAILED to patch core system: {str(e)}"
+    return "ERROR: Dynamic patching of main.py is deprecated and frozen. Please use modular tools in the /tools/ directory."
         
 def generate_ai_image(prompt: str, filename: str = "concept_visual.png") -> str:
     """Generates an image via Hugging Face FLUX/SDXL models and sends it directly to Telegram."""
@@ -1186,6 +1153,7 @@ async def telegram_message_handler(update: Update, context: ContextTypes.DEFAULT
         
         result_text = await asyncio.to_thread(handle_ai_reasoning, text, chat_id)
         
+        # Execution Guard: Break out immediately upon successful dispatch / response
         await card.update_step(1, "✅ Done", "Actions & verification completed.")
         await card.update_step(2, "⏳ In Progress", "Sending final response...")
         
@@ -1197,6 +1165,7 @@ async def telegram_message_handler(update: Update, context: ContextTypes.DEFAULT
             
         await card.update_step(2, "✅ Done", "Response delivered.")
         await card.finalize(True, "All operations executed successfully.")
+        return  # Execution Guard: Ensure no duplicate retries trigger
     except Exception as e:
         await card.finalize(False, f"Execution failed: {str(e)}")
         await update.message.reply_text(f"❌ Error during execution: {str(e)}")
