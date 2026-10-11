@@ -93,7 +93,7 @@ class ProgressCardTracker:
         self.last_edit_time = 0.0
         self._lock = threading.Lock()
 
-                def run_thread_safe(self, coro):
+    def run_thread_safe(self, coro):
         global main_loop
         if main_loop is None or not main_loop.is_running():
             try:
