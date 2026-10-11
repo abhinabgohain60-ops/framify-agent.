@@ -686,7 +686,7 @@ def consult_llama_specialist(task_description: str, code_or_context: str) -> str
     if not groq_client: return "ERROR: GROQ_API_KEY missing."
     try:
         completion = groq_client.chat.completions.create(
-            model="llama-3.3-70b-versatile",
+            model="llama-3.1-8b-instant",
             messages=[
                 {"role": "system", "content": "You are an expert Llama code repair and debugging specialist."},
                 {"role": "user", "content": f"Task: {task_description}\n\nCode/Context:\n{code_or_context}"}
@@ -716,7 +716,7 @@ def dispatch_to_agent(agent_id: str, task_prompt: str, context_payload: str = ""
         sys_prompt = agent.get("system_prompt", "You are a specialized worker agent.")
         if groq_client:
             comp = groq_client.chat.completions.create(
-                model="llama-3.3-70b-versatile",
+                model="llama-3.1-8b-instant",
                 messages=[
                     {"role": "system", "content": sys_prompt},
                     {"role": "user", "content": f"Task: {task_prompt}\n\nContext:\n{context_payload}"}
