@@ -22,7 +22,7 @@ from google import genai
 from google.genai import types
 from google.genai.errors import APIError
 from groq import Groq
-from huggingface_hub import InferenceClient
+from huggingface_hub import InferenceClient, HfApi
 from duckduckgo_search import DDGS
 from e2b_code_interpreter import Sandbox
 from supabase import create_client, Client
@@ -110,10 +110,12 @@ class ProgressCardTracker:
                 return None
         else:
             try:
-                new_loop = asyncio.new_event_loop()
-                asyncio.set_event_loop(new_loop)
-                res = new_loop.run_until_complete(coro)
-                new_loop.close()
+                try:
+                    loop = asyncio.get_running_loop()
+                except RuntimeError:
+                    loop = asyncio.new_event_loop()
+                    asyncio.set_event_loop(loop)
+                res = loop.run_until_complete(coro)
                 return res
             except Exception as e:
                 print(f"[Fallback error]: {e}", flush=True)
@@ -240,7 +242,7 @@ async def execute_with_self_healing(card: ProgressCardTracker, step_idx: int, st
                 await card.update_step(step_idx, "🚫 Failed", f"Self-healing exhausted after {max_attempts} attempts: {err_str[:40]}")
                 raise err
 
-# ----------------- HUGGING FACE INFERENCE TOOLS -----------------
+# ----------------- HUGGING FACE INFERENCE TOOLS & WORKER NODES -----------------
     
 def patch_core_system(file_path: str, new_content: str, commit_message: str) -> str:
     """
@@ -315,6 +317,37 @@ def consult_hf_specialist(prompt: str, model_id: str = "Qwen/Qwen2.5-Coder-32B-I
     except Exception as e:
         record_activity()
         return f"Hugging Face query error: {str(e)}"
+
+def deploy_hf_worker_node(repo_id: str, file_path: str, file_content: str, commit_message: str = "Deploy HF worker node") -> str:
+    """
+    Deploys or updates a worker node script or dataset file on Hugging Face Hub synchronously using HfApi 
+    to avoid async event loop dependencies entirely.
+    """
+    record_activity()
+    if not HF_TOKEN:
+        return "ERROR: HF_TOKEN missing in environment variables."
+    try:
+        api = HfApi(token=HF_TOKEN)
+        try:
+            api.repo_info(repo_id=repo_id, repo_type="space")
+        except Exception:
+            try:
+                api.create_repo(repo_id=repo_id, repo_type="space", space_sdk="streamlit", private=False)
+            except Exception as e:
+                return f"Failed to verify/create HF space repository: {str(e)}"
+
+        api.upload_string(
+            repo_id=repo_id,
+            repo_type="space",
+            string=file_content,
+            path_in_repo=file_path,
+            commit_message=commit_message
+        )
+        record_activity()
+        return f"SUCCESS: Deployed worker node file '{file_path}' to Hugging Face space '{repo_id}'."
+    except Exception as e:
+        record_activity()
+        return f"HF deployment error: {str(e)}"
 
 # ----------------- OUTREACH & EMAIL TOOLS -----------------
 
@@ -503,7 +536,11 @@ def recall_information(query_key: str = "") -> str:
 async def _scheduled_task_runner(task_id: str, prompt: str, target_chat_id: int):
     """Internal runner executed in background by APScheduler."""
     try:
-        loop = asyncio.get_running_loop()
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
         res = await loop.run_in_executor(None, run_autonomous_agent, prompt, target_chat_id)
         if bot_instance and target_chat_id:
             await bot_instance.send_message(
@@ -766,6 +803,7 @@ def register_new_tool(tool_name: str, python_code: str) -> str:
 agent_tools = [
     generate_ai_image,
     consult_hf_specialist,
+    deploy_hf_worker_node,
     send_client_email,
     hunt_client_leads,
     schedule_recurring_task,
@@ -890,15 +928,23 @@ def run_autonomous_agent(prompt: str, chat_id: int, card: ProgressCardTracker = 
                 print(f"Executing tool {func_name} with args {func_args}", flush=True)
                 
                 if card:
-                    loop = asyncio.get_event_loop()
+                    try:
+                        loop = asyncio.get_running_loop()
+                    except RuntimeError:
+                        loop = asyncio.new_event_loop()
+                        asyncio.set_event_loop(loop)
                     asyncio.run_coroutine_threadsafe(card.update_step(0, "⏳ In Progress", f"Executing tool: {func_name}"), loop)
 
                 try:
                     if func_name in available_tools:
                         if card:
+                            try:
+                                loop = asyncio.get_running_loop()
+                            except RuntimeError:
+                                loop = asyncio.new_event_loop()
+                                asyncio.set_event_loop(loop)
                             tool_result = loop.run_until_complete(execute_with_self_healing(card, 0, f"Tool: {func_name}", available_tools[func_name], **func_args)) if asyncio.iscoroutinefunction(available_tools[func_name]) else available_tools[func_name](**func_args)
                         else:
-                        
                             tool_result = available_tools[func_name](**func_args)
                     else:
                         tool_result = f"Error: Tool {func_name} not found."
@@ -952,7 +998,11 @@ async def handle_msg(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 )
                 await card.initialize()
                 
-                loop = asyncio.get_running_loop()
+                try:
+                    loop = asyncio.get_running_loop()
+                except RuntimeError:
+                    loop = asyncio.new_event_loop()
+                    asyncio.set_event_loop(loop)
                 record_activity()
                 
                 retries = 2
@@ -1010,7 +1060,11 @@ async def handle_msg(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def run_telegram_worker():
     global bot_instance, main_loop
-    main_loop = asyncio.get_running_loop()
+    try:
+        main_loop = asyncio.get_running_loop()
+    except RuntimeError:
+        main_loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(main_loop)
     await asyncio.sleep(3)
     while True:
         try:
