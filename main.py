@@ -57,12 +57,8 @@ github_client = Github(GITHUB_TOKEN) if GITHUB_TOKEN else None
 
 # Updated Gemini Model Cascade (Prioritizing gemini-3-flash-preview)
 GEMINI_MODELS_CASCADE = [
-    "gemini-3-flash-preview",
-    "gemini-2.5-flash",
-    "gemini-2.5-pro",
-    "gemini-2.0-flash",
-    "gemini-1.5-flash",
-    "gemini-1.5-pro",
+    "gemini-3.8-flash",
+    "gemini-3.5-flash",
 ]
 
 active_chat_id: contextvars.ContextVar[int] = contextvars.ContextVar("active_chat_id", default=0)
@@ -98,7 +94,7 @@ Strictly check for:
 If you find issues, return the corrected, optimized, and production-ready code. If there are no issues, return the original code intact. Return ONLY the final code without conversational filler."""
         
         completion = groq_client.chat.completions.create(
-            model="llama-3.3-70b-versatile",
+            model="llama-3.1-8b-instant",
             messages=[
                 {"role": "system", "content": "You are a precise code auditor and optimizer. Return only valid code."},
                 {"role": "user", "content": f"{prompt}\n\n---\n{code_content}"}
