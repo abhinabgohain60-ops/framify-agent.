@@ -1208,9 +1208,10 @@ async def lifespan(app: FastAPI):
     if scheduler.running:
         scheduler.shutdown()
 
-app = FastAPI(title="Chintu AI Agency Director", lifespan=lifespan)
+api = FastAPI(title="Chintu AI Agency Director", lifespan=lifespan)
+app = api  # Alias for safety and Render start command compatibility (main:api)
 
-@app.get("/")
+@api.get("/")
 def health_check():
     return {
         "status": "online",
@@ -1223,4 +1224,4 @@ def health_check():
 if __name__ == "__main__":
     import uvicorn
     port = int(os.getenv("PORT", "8000"))
-    uvicorn.run("main:app", host="0.0.0.0", port=port)
+    uvicorn.run("main:api", host="0.0.0.0", port=port)
