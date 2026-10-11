@@ -1108,7 +1108,7 @@ def handle_ai_reasoning(user_message: str, chat_id: int) -> str:
         try:
             if groq_client:
                 comp = groq_client.chat.completions.create(
-                    model="llama-3.3-70b-versatile",
+                    model="llama-3.1-8b-instant",
                     messages=[
                         {"role": "system", "content": system_instruction},
                         {"role": "user", "content": user_message}
