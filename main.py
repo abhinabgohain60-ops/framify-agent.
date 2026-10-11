@@ -898,6 +898,7 @@ def run_autonomous_agent(prompt: str, chat_id: int, card: ProgressCardTracker = 
                         if card:
                             tool_result = loop.run_until_complete(execute_with_self_healing(card, 0, f"Tool: {func_name}", available_tools[func_name], **func_args)) if asyncio.iscoroutinefunction(available_tools[func_name]) else available_tools[func_name](**func_args)
                         else:
+                        
                             tool_result = available_tools[func_name](**func_args)
                     else:
                         tool_result = f"Error: Tool {func_name} not found."
