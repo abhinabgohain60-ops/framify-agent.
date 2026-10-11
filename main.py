@@ -93,16 +93,31 @@ class ProgressCardTracker:
         self.last_edit_time = 0.0
         self._lock = threading.Lock()
 
-    def run_thread_safe(self, coro):
+        def run_thread_safe(self, coro):
         global main_loop
-        try:
-            if main_loop and main_loop.is_running():
+        if main_loop is None or not main_loop.is_running():
+            try:
+                main_loop = asyncio.get_running_loop()
+            except RuntimeError:
+                pass
+
+        if main_loop and main_loop.is_running():
+            try:
                 future = asyncio.run_coroutine_threadsafe(coro, main_loop)
                 return future.result(timeout=10)
-            else:
-                return asyncio.run(coro)
-        except Exception as e:
-            print(f"[Dispatch error]: {e}", flush=True)
+            except Exception as e:
+                print(f"[Dispatch error]: {e}", flush=True)
+                return None
+        else:
+            try:
+                new_loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(new_loop)
+                res = new_loop.run_until_complete(coro)
+                new_loop.close()
+                return res
+            except Exception as e:
+                print(f"[Fallback error]: {e}", flush=True)
+                return None
 
     def _render_card(self) -> str:
         lines = [f"⚡ Task: {self.task_title}", "Status: In Progress ⏳\n"]
