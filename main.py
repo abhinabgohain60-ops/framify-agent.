@@ -488,23 +488,23 @@ def github_commit_file(file_path: str, content: str, commit_message: str, repo_n
     print(f"[Protocol] Running Llama audit on commit for {file_path}...", flush=True)
     optimized_content = run_llama_code_audit(content, context_desc=f"Commit file {file_path}")
     llama_review_passed = True
-    
-        # 3. STEP 2: AST Syntax Pre-Flight Test for Python Files
-        is_py = file_path.endswith(".py")
-        ast_passed = True
-        if is_py:
-            try:
-                import ast
-                ast.parse(optimized_content)
-                print(f"[Protocol] AST syntax pre-flight test passed cleanly for {file_path}.")
-            except SyntaxError as e:
-                ast_passed = False
-                print(f"[Protocol] AST verification failed: {e}")
-                raise PermissionError(f"Commit blocked: Python syntax error on line {e.lineno}: {e.msg}")
 
-        # 4. Gateway Check
-        if not llama_review_passed or not ast_passed:
-            raise PermissionError("Commit blocked: Code has not passed validation gates.")
+    # 3. STEP 2: AST Syntax Pre-Flight Test For Python Files
+    is_py = file_path.endswith(".py")
+    ast_passed = True
+    if is_py:
+        try:
+            import ast
+            ast.parse(optimized_content)
+            print(f"[Protocol] AST syntax pre-flight test passed cleanly for {file_path}.")
+        except SyntaxError as e:
+            ast_passed = False
+            print(f"[Protocol] AST verification failed: {e}")
+            raise PermissionError(f"Commit blocked: Python syntax error on line {e.lineno}: {e.msg}")
+
+    # 4. Gateway Check
+    if not llama_review_passed or not ast_passed:
+        raise PermissionError("Commit blocked: Code has not passed validation gates.")
 
     try:
         repo = github_client.get_repo(target_repo)
