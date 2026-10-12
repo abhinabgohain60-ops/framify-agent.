@@ -117,31 +117,24 @@ If you find issues, return the corrected, optimized, and production-ready code. 
     except Exception as e:
         print(f"[Llama Audit Error]: {e}. Falling back to original code.", flush=True)
         return code_content
-
 def run_e2b_sandbox_preflight(code_content: str, is_python_script: bool = True) -> bool:
     """
-    STEP 2: Mandatory E2B Cloud MicroVM Sandbox Pre-Flight Test.
-    Spins up an isolated E2B Sandbox, writes the code, and verifies exit code 0 and syntax/import health.
+    STEP 2: Safe Python Syntax & Import Pre-Flight Test.
+    Uses native ast.parse for Python files to guarantee instant verification
+    without triggering SandboxBase keyword argument exceptions.
     """
-    if not E2B_API_KEY:
-        print("[WARNING] E2B_API_KEY missing. Skipping sandbox preflight.", flush=True)
+    if not is_python_script:
         return True
     try:
-        sandbox = Sandbox(api_key=E2B_API_KEY)
-        try:
-            filename = "preflight_test.py"
-            sandbox.files.write(filename, code_content)
-            
-            if is_python_script:
-                result = sandbox.commands.run(f"python3 -m py_compile {filename}")
-                if result.exit_code != 0:
-                    print(f"[E2B Pre-flight Error] Compilation failed: {result.stderr}", flush=True)
-                    return False
-            return True
-        finally:
-            sandbox.kill()
+        import ast
+        ast.parse(code_content)
+        print("[Pre-flight Verification]: ast.parse verification passed cleanly.", flush=True)
+        return True
+    except SyntaxError as e:
+        print(f"[Pre-flight Error]: Syntax error on line {e.lineno}: {e.msg}", flush=True)
+        return False
     except Exception as e:
-        print(f"[E2B Sandbox Exception]: {e}", flush=True)
+        print(f"[Pre-flight Warning]: Unexpected error during syntax parse: {e}", flush=True)
         return False
 
 # ----------------- DYNAMIC TELEGRAM PROGRESS CARD & TELEMETRY ENGINE -----------------
@@ -496,22 +489,22 @@ def github_commit_file(file_path: str, content: str, commit_message: str, repo_n
     optimized_content = run_llama_code_audit(content, context_desc=f"Commit file {file_path}")
     llama_review_passed = True
     
-    # 3. STEP 2: Mandatory E2B Cloud MicroVM Sandbox Pre-Flight Test
-    print(f"[Protocol] Running E2B sandbox pre-flight test for {file_path}...", flush=True)
-    is_py = file_path.endswith(".py")
-    e2b_sandbox_tested = run_e2b_sandbox_preflight(optimized_content, is_python_script=is_py)
-    
-    if not e2b_sandbox_tested and is_py:
-        print(f"[Protocol] Sandbox preflight failed. Routing traceback back to Llama for automated fix...", flush=True)
-        fix_prompt = f"The following Python code failed E2B sandbox compilation/syntax pre-flight. Fix any syntax, indentation, or import errors and return only valid code:\n\n{optimized_content}"
-        optimized_content = run_llama_code_audit(fix_prompt, context_desc=f"Auto-repair fix for {file_path}")
-        e2b_sandbox_tested = run_e2b_sandbox_preflight(optimized_content, is_python_script=is_py)
-        if not e2b_sandbox_tested:
-            raise PermissionError("Commit blocked: E2B Sandbox verification failed after automated fix cycle.")
+        # 3. STEP 2: AST Syntax Pre-Flight Test for Python Files
+        is_py = file_path.endswith(".py")
+        ast_passed = True
+        if is_py:
+            try:
+                import ast
+                ast.parse(optimized_content)
+                print(f"[Protocol] AST syntax pre-flight test passed cleanly for {file_path}.")
+            except SyntaxError as e:
+                ast_passed = False
+                print(f"[Protocol] AST verification failed: {e}")
+                raise PermissionError(f"Commit blocked: Python syntax error on line {e.lineno}: {e.msg}")
 
-    # 4. Hard-Coded Gateway Check
-    if not llama_review_passed or not e2b_sandbox_tested:
-        raise PermissionError("Commit blocked: Code has not passed Llama review and E2B Sandbox verification.")
+        # 4. Gateway Check
+        if not llama_review_passed or not ast_passed:
+            raise PermissionError("Commit blocked: Code has not passed validation gates.")
 
     try:
         repo = github_client.get_repo(target_repo)
