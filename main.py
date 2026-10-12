@@ -1054,7 +1054,7 @@ def handle_ai_reasoning(user_message: str, chat_id: int) -> str:
     response_text = ""
     success = False
     
-    for model_name in GEMINI_MODELS_CASCADE:
+        for model_name in GEMINI_MODELS_CASCADE:
         try:
             chat = gemini_client.chats.create(model=model_name)
             response = chat.send_message(user_message, config=config)
@@ -1093,13 +1093,13 @@ def handle_ai_reasoning(user_message: str, chat_id: int) -> str:
                 response_text = response.text
                 success = True
                 break
-            except Exception as e:
-                        err_msg = str(e)
-                        print(f"[Cascade model {model_name} failed]: {err_msg}", flush=True)
-                        if "429" in err_msg or "RESOURCE_EXHAUSTED" in err_msg:
-                                print("[Quota Alert]: Gemini quota hit. Diverting directly to Groq fallback engine.", flush=True)
-                            break
-                        continue
+        except Exception as e:
+            err_msg = str(e)
+            print(f"[Cascade model {model_name} failed]: {err_msg}", flush=True)
+            if "429" in err_msg or "RESOURCE_EXHAUSTED" in err_msg:
+                print("[Quota Alert]: Gemini quota hit. Diverting directly to Groq fallback engine.", flush=True)
+                break
+            continue
 
     if not success or not response_text:
         try:
