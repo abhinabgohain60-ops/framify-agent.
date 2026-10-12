@@ -61,6 +61,8 @@ GEMINI_MODELS_CASCADE = [
     "gemini-3.1-flash-lite",
     "gemini-2.0-flash",
     "gemini-2.0-flash-lite",
+    "gemini-2.5-flash-lite",
+    "gemini-2.5-flash",
 ]
 
 active_chat_id: contextvars.ContextVar[int] = contextvars.ContextVar("active_chat_id", default=0)
