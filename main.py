@@ -96,7 +96,7 @@ Strictly check for:
 If you find issues, return the corrected, optimized, and production-ready code. If there are no issues, return the original code intact. Return ONLY the final code without conversational filler."""
         
         completion = groq_client.chat.completions.create(
-            model="llama-3.1-8b-instant",
+            model="openai/gpt-oss-120b",
             messages=[
                 {"role": "system", "content": "You are a precise code auditor and optimizer. Return only valid code."},
                 {"role": "user", "content": f"{prompt}\n\n---\n{code_content}"}
