@@ -1052,7 +1052,7 @@ def handle_ai_reasoning(user_message: str, chat_id: int) -> str:
     )
     
     response_text = ""
-        success = False
+    success = False
     
     for model_name in GEMINI_MODELS_CASCADE:
         try:
