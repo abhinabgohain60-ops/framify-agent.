@@ -55,14 +55,10 @@ groq_client = Groq(api_key=GROQ_API_KEY) if GROQ_API_KEY else None
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY) if (SUPABASE_URL and SUPABASE_KEY) else None
 github_client = Github(GITHUB_TOKEN) if GITHUB_TOKEN else None
 
-# Updated Gemini Model Cascade (Prioritizing gemini-3-flash-preview)
 GEMINI_MODELS_CASCADE = [
-    "gemini-3.5-flash-lite",
-    "gemini-3.1-flash-lite",
-    "gemini-2.0-flash",
-    "gemini-2.0-flash-lite",
-    "gemini-2.5-flash-lite",
-    "gemini-2.5-flash",
+    "gemini-3.5-flash-lite",   # High throughput, lowest token latency
+    "gemini-3.1-flash-lite",   # Secondary high-speed fallback
+    "gemini-3.8-flash",        # Complex logic / high-capacity reasoning fallback
 ]
 
 active_chat_id: contextvars.ContextVar[int] = contextvars.ContextVar("active_chat_id", default=0)
@@ -1097,10 +1093,14 @@ def handle_ai_reasoning(user_message: str, chat_id: int) -> str:
                 response_text = response.text
                 success = True
                 break
-        except Exception as e:
-            print(f"[Cascade model {model_name} failed]: {e}", flush=True)
-            continue
-            
+            except Exception as e:
+                        err_msg = str(e)
+                        print(f"[Cascade model {model_name} failed]: {err_msg}", flush=True)
+                        if "429" in err_msg or "RESOURCE_EXHAUSTED" in err_msg:
+                                print("[Quota Alert]: Gemini quota hit. Diverting directly to Groq fallback engine.", flush=True)
+                            break
+                        continue
+
     if not success or not response_text:
         try:
             if groq_client:
