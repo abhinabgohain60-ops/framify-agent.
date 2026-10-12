@@ -57,9 +57,10 @@ github_client = Github(GITHUB_TOKEN) if GITHUB_TOKEN else None
 
 # Updated Gemini Model Cascade (Prioritizing gemini-3-flash-preview)
 GEMINI_MODELS_CASCADE = [
-    "gemini-3.5-flash",
     "gemini-3.5-flash-lite",
-    "gemini-3.8-flash",
+    "gemini-3.1-flash-lite",
+    "gemini-2.0-flash",
+    "gemini-2.0-flash-lite",
 ]
 
 active_chat_id: contextvars.ContextVar[int] = contextvars.ContextVar("active_chat_id", default=0)
@@ -1109,7 +1110,7 @@ def handle_ai_reasoning(user_message: str, chat_id: int) -> str:
         try:
             if groq_client:
                 comp = groq_client.chat.completions.create(
-                    model="llama-3.1-8b-instant",
+                    model="openai/gpt-oss-120b",
                     messages=[
                         {"role": "system", "content": system_instruction},
                         {"role": "user", "content": user_message}
