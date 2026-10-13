@@ -38,39 +38,36 @@ DEFAULT_REPO = os.environ.get("DEFAULT_REPO", "abhinabgohain60-ops/framify-agent
 
 gemini_client = genai.Client(api_key=GEMINI_API_KEY) if GEMINI_API_KEY else None
 
-ACTIVE_GEMINI_MODELS: List[str] = []
+# Strictly filtered standard text-generation models
+ACTIVE_GEMINI_MODELS: List[str] = [
+    "gemini-flash-lite-latest",
+    "gemini-2.0-flash",
+    "gemini-1.5-flash"
+]
 
 def discover_available_models():
     global ACTIVE_GEMINI_MODELS
-    whitelist_priority = [
-        "gemini-flash-lite-latest",
-        "gemini-2.0-flash",
-        "gemini-2.0-flash-lite",
-        "gemini-1.5-flash"
-    ]
+    # Strict whitelist to eliminate live, bidi WebSocket, and non-standard endpoints
+    whitelist = ["gemini-flash-lite-latest", "gemini-2.0-flash", "gemini-1.5-flash"]
     discovered = []
     if gemini_client:
         try:
             for m in gemini_client.models.list():
                 m_name = getattr(m, "name", "").replace("models/", "")
-                if any(bad in m_name for bad in ["2.5", "pro", "tts", "image", "audio", "embed", "robotics", "transcribe", "customtools"]):
+                # Exclude all non-generateContent models
+                if any(bad in m_name for bad in [
+                    "live", "bidi", "translate", "banana", "omni", "thinking",
+                    "preview", "tts", "image", "audio", "embed", "robotics", "customtools"
+                ]):
                     continue
-                if "gemini" in m_name:
+                if m_name in whitelist:
                     discovered.append(m_name)
-            logger.info(f"[Model Discovery] Valid text models: {discovered}")
         except Exception as e:
-            logger.warning(f"[Model Discovery] List failed: {e}")
+            logger.warning(f"[Model Discovery] Discovery bypass: {e}")
 
-    ordered = [m for m in whitelist_priority if m in discovered]
-    for m in discovered:
-        if m not in ordered and not any(bad in m for bad in ["2.5", "pro", "flash-latest"]):
-            ordered.append(m)
-
-    if not ordered:
-        ordered = ["gemini-flash-lite-latest", "gemini-2.0-flash", "gemini-1.5-flash"]
-
-    ACTIVE_GEMINI_MODELS = ordered
-    logger.info(f"[Active Cascade Order]: {ACTIVE_GEMINI_MODELS}")
+    ordered = [m for m in whitelist if m in discovered]
+    ACTIVE_GEMINI_MODELS = ordered if ordered else whitelist
+    logger.info(f"[Active Valid Text Models]: {ACTIVE_GEMINI_MODELS}")
 
 def github_read_file(repo_name: str, file_path: str) -> str:
     token = GITHUB_TOKEN or ""
@@ -392,7 +389,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     user_text = update.message.text
     
-    # 1. Send initial progress card
     status_card = (
         f"{render_progress_bar(15)}\n\n"
         "Current status: Initializing plan & analyzing requirements\n\n"
@@ -404,7 +400,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     status_msg = await update.message.reply_text(status_card)
     await update.message.reply_chat_action("typing")
     
-    # 2. Advance progress card dynamically while processing
     async def progress_ticker():
         try:
             await asyncio.sleep(3.5)
@@ -430,13 +425,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     ticker_task = asyncio.create_task(progress_ticker())
     
-    # 3. Await reasoning output
     try:
         reply = await generate_reasoning_response(user_text)
     finally:
         ticker_task.cancel()
         
-    # 4. Finalize status card to 100% and deliver output
     try:
         await status_msg.edit_text(
             f"{render_progress_bar(100)}\n\n"
