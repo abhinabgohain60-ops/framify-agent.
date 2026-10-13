@@ -1,6 +1,5 @@
 import ast
 import base64
-import ast
 import os
 import sys
 import json
@@ -29,6 +28,11 @@ GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
 GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN", "")
 SUPABASE_URL = os.environ.get("SUPABASE_URL", "")
 SUPABASE_KEY = os.environ.get("SUPABASE_KEY", "")
+HF_TOKEN = os.environ.get("HF_TOKEN", "")
+E2B_API_KEY = os.environ.get("E2B_API_KEY", "")
+COMPOSIO_API_KEY = os.environ.get("COMPOSIO_API_KEY", os.environ.get("COMPOSIO_API_", ""))
+RENDER_API_KEY = os.environ.get("RENDER_API_KEY", "")
+RENDER_SERVICE_ID = os.environ.get("RENDER_SERVICE_ID", os.environ.get("RENDER_SERVIC...", "srv-db497mfk1mc73f9l6tg"))
 DEFAULT_REPO = os.environ.get("DEFAULT_REPO", "abhinabgohain60-ops/framify-agent.")
 
 gemini_client = genai.Client(api_key=GEMINI_API_KEY) if GEMINI_API_KEY else None
@@ -111,6 +115,26 @@ def github_commit_file(repo_name: str, file_path: str, content: str, commit_mess
         return f"Error committing file: {str(e)}"
 
 def execute_in_cloud_microvm(code: str) -> str:
+    if E2B_API_KEY:
+        try:
+            headers = {
+                "X-API-Key": E2B_API_KEY,
+                "Content-Type": "application/json"
+            }
+            # Attempt execution via E2B sandbox API
+            e2b_url = "https://api.e2b.dev/sandboxes"
+            sb_res = requests.post(e2b_url, headers=headers, json={"template": "base"}, timeout=12)
+            if sb_res.status_code in [200, 201]:
+                sb_id = sb_res.json().get("sandboxID")
+                exec_url = f"https://api.e2b.dev/sandboxes/{sb_id}/execute"
+                run_res = requests.post(exec_url, headers=headers, json={"code": code}, timeout=20)
+                # Cleanup sandbox
+                requests.delete(f"https://api.e2b.dev/sandboxes/{sb_id}", headers=headers, timeout=5)
+                if run_res.status_code == 200:
+                    return f"E2B 16GB Sandbox Result:\n{run_res.text}"
+        except Exception as e:
+            logger.warning(f"E2B microVM direct dispatch error: {e}. Falling back to internal runner.")
+
     stdout_buf = io.StringIO()
     stderr_buf = io.StringIO()
     try:
@@ -122,7 +146,8 @@ def execute_in_cloud_microvm(code: str) -> str:
                 "os": os,
                 "sys": sys,
                 "datetime": datetime,
-                "ast": ast
+                "ast": ast,
+                "base64": base64
             }
             exec(code, safe_globals)
         out = stdout_buf.getvalue()
@@ -136,7 +161,7 @@ def execute_in_cloud_microvm(code: str) -> str:
     except Exception as e:
         return f"Sandbox Execution Error:\n{traceback.format_exc()}"
 
-def supabase_db_query(table: str, operation: str = "select", data: Optional[Dict[str, Any]] = None) -> str:
+def supabase_db_query(table: str, operation: str = "select", query_filter: Optional[str] = None, data: Optional[Dict[str, Any]] = None) -> str:
     if not SUPABASE_URL or not SUPABASE_KEY:
         return "Supabase credentials not configured in environment."
     headers = {
@@ -147,14 +172,54 @@ def supabase_db_query(table: str, operation: str = "select", data: Optional[Dict
     url = f"{SUPABASE_URL}/rest/v1/{table}"
     try:
         if operation == "select":
-            res = requests.get(f"{url}?select=*&order=created_at.desc&limit=20", headers=headers, timeout=10)
+            query_str = f"?{query_filter}" if query_filter else "?select=*&order=created_at.desc&limit=20"
+            res = requests.get(f"{url}{query_str}", headers=headers, timeout=10)
             return json.dumps(res.json())
         elif operation == "insert" and data:
             res = requests.post(url, headers=headers, json=data, timeout=10)
             return f"Insert status: {res.status_code}"
-        return f"Unsupported operation: {operation}"
+        elif operation == "delete" and query_filter:
+            res = requests.delete(f"{url}?{query_filter}", headers=headers, timeout=10)
+            return f"Delete status: {res.status_code} (Filter: {query_filter})"
+        return f"Unsupported operation or missing filter/data: {operation}"
     except Exception as e:
         return f"Supabase error: {str(e)}"
+
+def huggingface_task_runner(model_id: str, inputs: Any) -> str:
+    if not HF_TOKEN:
+        return "HF_TOKEN not configured in environment."
+    headers = {"Authorization": f"Bearer {HF_TOKEN}"}
+    url = f"https://api-inference.huggingface.co/models/{model_id}"
+    try:
+        payload = {"inputs": inputs} if isinstance(inputs, str) else inputs
+        res = requests.post(url, headers=headers, json=payload, timeout=25)
+        if res.status_code == 200:
+            return json.dumps(res.json())
+        return f"HF Inference Error ({res.status_code}): {res.text}"
+    except Exception as e:
+        return f"HuggingFace runner error: {str(e)}"
+
+def render_service_manager(action: str = "status") -> str:
+    if not RENDER_API_KEY:
+        return "RENDER_API_KEY not configured in environment."
+    headers = {
+        "Authorization": f"Bearer {RENDER_API_KEY}",
+        "Accept": "application/json"
+    }
+    base_url = "https://api.render.com/v1/services"
+    try:
+        if action == "status":
+            url = f"{base_url}/{RENDER_SERVICE_ID}" if RENDER_SERVICE_ID else base_url
+            res = requests.get(url, headers=headers, timeout=10)
+            return json.dumps(res.json())
+        elif action == "restart":
+            if not RENDER_SERVICE_ID:
+                return "RENDER_SERVICE_ID required for restart action."
+            res = requests.post(f"{base_url}/{RENDER_SERVICE_ID}/restart", headers=headers, timeout=10)
+            return f"Restart response: {res.status_code}"
+        return f"Unsupported Render action: {action}"
+    except Exception as e:
+        return f"Render API error: {str(e)}"
 
 def create_golden_state_backup(tag: str = "stable_snapshot") -> str:
     current_code = github_read_file(DEFAULT_REPO, "main.py")
@@ -179,17 +244,26 @@ ALL_TOOLS_LIST = [
     github_commit_file,
     execute_in_cloud_microvm,
     supabase_db_query,
+    huggingface_task_runner,
+    render_service_manager,
     create_golden_state_backup,
     web_search_research,
 ]
 
 SYSTEM_INSTRUCTION = """You are Chintu, an autonomous HMAS AI Engineer.
-You have tools to read/commit code to your GitHub repo, run isolated code in a microVM sandbox, query Supabase memory, create Golden State backups, and perform web research.
-Self-Healing & Problem Solving Protocol:
-- When an action or tool fails (e.g. missing import, syntax error, or API rejection), analyze the error immediately.
-- Use your tools (such as github_read_file and github_commit_file) to inspect the code, correct the bug, and re-attempt execution.
-- Maintain persistent execution until the goal succeeds or an unrecoverable external dependency blocks progress.
-- Once verified, confirm the final resolution and details to the user."""
+Capabilities & Integrations:
+- GitHub code reading & committing (AST verified).
+- Cloud MicroVM sandbox Python execution via E2B / isolated runner with full outbound network access.
+- Supabase persistent database memory queries, insertions, and record deletion.
+- Hugging Face model inference via HF_TOKEN.
+- Render Service Management via RENDER_API_KEY.
+- Web search and online research.
+- Golden State snapshots.
+
+Operating Directives:
+1. Memory Isolation & Cleanup: Disregard and purge any legacy memory entries from deprecated bot builds or discarded models (e.g., Llama/Groq fallback references). When encountering obsolete records, delete them using supabase_db_query with operation='delete'.
+2. Self-Healing & Problem Solving: If an action or tool fails, diagnose the error, inspect the relevant code, apply the necessary fix, and re-test.
+3. Execution: Run tools to completion, then present a concise summary of the outcome to the user."""
 
 def _sync_chat_call(model_name: str, message: str) -> str:
     config = types.GenerateContentConfig(
@@ -203,7 +277,6 @@ def _sync_chat_call(model_name: str, message: str) -> str:
     if resp.text:
         return resp.text
         
-    # Extract output from candidate parts if text field is empty
     if resp.candidates:
         parts_out = []
         for part in resp.candidates[0].content.parts:
