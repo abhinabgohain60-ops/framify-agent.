@@ -30,39 +30,38 @@ DEFAULT_REPO = os.environ.get("DEFAULT_REPO", "abhinabgohain60-ops/framify-agent
 
 gemini_client = genai.Client(api_key=GEMINI_API_KEY) if GEMINI_API_KEY else None
 
-ACTIVE_GEMINI_MODELS: List[str] = [
-    "gemini-3.8-flash",
-    "gemini-3.5-flash",
-    "gemini-3.1-pro-preview",
-    "gemini-3.0-flash"
-]
+ACTIVE_GEMINI_MODELS: List[str] = []
 
 def discover_available_models():
     global ACTIVE_GEMINI_MODELS
-    priority_order = [
-        "gemini-3.8-flash",
-        "gemini-3.5-flash",
-        "gemini-3.1-pro-preview",
-        "gemini-3.0-flash"
+    whitelist_priority = [
+        "gemini-2.5-flash",
+        "gemini-2.0-flash",
+        "gemini-1.5-flash",
+        "gemini-flash-latest"
     ]
     discovered = []
     if gemini_client:
         try:
             for m in gemini_client.models.list():
                 m_name = getattr(m, "name", "").replace("models/", "")
+                if any(bad in m_name for bad in ["tts", "image", "audio", "embed", "robotics", "transcribe", "customtools"]):
+                    continue
                 if "gemini" in m_name:
                     discovered.append(m_name)
-            logger.info(f"[Model Discovery] Found models: {discovered}")
+            logger.info(f"[Model Discovery] Valid text models: {discovered}")
         except Exception as e:
-            logger.warning(f"[Model Discovery] Could not list models: {e}")
-            
-    ordered = [m for m in priority_order if m in discovered]
+            logger.warning(f"[Model Discovery] List failed: {e}")
+
+    ordered = [m for m in whitelist_priority if m in discovered]
     for m in discovered:
-        if m not in ordered and any(v in m for v in ["flash", "pro"]):
+        if m not in ordered:
             ordered.append(m)
-            
-    if ordered:
-        ACTIVE_GEMINI_MODELS = ordered
+
+    if not ordered:
+        ordered = ["gemini-2.5-flash", "gemini-2.0-flash", "gemini-1.5-flash"]
+
+    ACTIVE_GEMINI_MODELS = ordered
     logger.info(f"[Active Cascade Order]: {ACTIVE_GEMINI_MODELS}")
 
 def github_read_file(repo_name: str, file_path: str) -> str:
@@ -103,7 +102,7 @@ def github_commit_file(repo_name: str, file_path: str, content: str, commit_mess
             
         put_res = requests.put(url, headers=headers, json=payload, timeout=15)
         if put_res.status_code in [200, 201]:
-            return f"Successfully committed {file_path} to {repo_name}."
+            return f"SUCCESS: File {file_path} committed to {repo_name}."
         return f"Commit failed ({put_res.status_code}): {put_res.text}"
     except Exception as e:
         return f"Error committing file: {str(e)}"
@@ -156,19 +155,19 @@ def supabase_db_query(table: str, operation: str = "select", data: Optional[Dict
 
 def create_golden_state_backup(tag: str = "stable_snapshot") -> str:
     current_code = github_read_file(DEFAULT_REPO, "main.py")
-    if current_code.startswith("GitHub Read Error"):
-        return f"Failed to read source file: {current_code}"
+    if "Error" in current_code[:30]:
+        return f"Backup failed: Unable to read main.py -> {current_code}"
     
     timestamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
     backup_file = f"backups/main_{tag}_{timestamp}.py"
     res = github_commit_file(DEFAULT_REPO, backup_file, current_code, f"Create Golden State backup: {tag}")
-    return f"Golden State backup result: {res}"
+    return f"BACKUP COMPLETE: Created {backup_file}. Commit status: {res}"
 
 def web_search_research(query: str) -> str:
     try:
         url = "https://html.duckduckgo.com/html/"
         res = requests.post(url, data={"q": query}, headers={"User-Agent": "Mozilla/5.0"}, timeout=10)
-        return res.text[:2500]
+        return res.text[:2000]
     except Exception as e:
         return f"Search error: {str(e)}"
 
@@ -182,18 +181,31 @@ ALL_TOOLS_LIST = [
 ]
 
 SYSTEM_INSTRUCTION = """You are Chintu, an autonomous HMAS AI Engineer.
-You have tools to read/commit code to your GitHub repo, run isolated code in a microVM sandbox, query Supabase memory, create Golden State backups, and perform web research.
-Always verify code with AST before committing, never break FastAPI or Render endpoints, and use your tools proactively."""
+When the user asks you to take an action (e.g., create a backup, read a file, run code), call the appropriate tool ONCE.
+Once the tool returns its result, IMMEDIATELY summarize the outcome and confirm completion to the user. DO NOT call duplicate tools in a loop."""
 
 def _sync_chat_call(model_name: str, message: str) -> str:
     config = types.GenerateContentConfig(
         system_instruction=SYSTEM_INSTRUCTION,
         tools=ALL_TOOLS_LIST,
-        temperature=0.3
+        temperature=0.2
     )
     chat = gemini_client.chats.create(model=model_name, config=config)
     resp = chat.send_message(message)
-    return resp.text or "Completed with no text output."
+    
+    if resp.text:
+        return resp.text
+        
+    # Extract output from candidate parts if text field is empty
+    if resp.candidates:
+        parts_out = []
+        for part in resp.candidates[0].content.parts:
+            if getattr(part, "text", None):
+                parts_out.append(part.text)
+        if parts_out:
+            return "".join(parts_out)
+            
+    return "Action completed successfully."
 
 async def generate_reasoning_response(user_message: str) -> str:
     if not gemini_client:
@@ -205,18 +217,17 @@ async def generate_reasoning_response(user_message: str) -> str:
     last_error = ""
     for model_name in ACTIVE_GEMINI_MODELS:
         try:
-            logger.info(f"[Reasoning] Querying model in thread pool: {model_name}")
-            # Run in separate thread with 25s timeout to protect the async event loop
+            logger.info(f"[Reasoning] Dispatching to: {model_name}")
             reply = await asyncio.wait_for(
                 asyncio.to_thread(_sync_chat_call, model_name, user_message),
-                timeout=25.0
+                timeout=35.0
             )
             if reply:
-                logger.info(f"[Reasoning] Reply successfully returned from: {model_name}")
+                logger.info(f"[Reasoning] Response received from: {model_name}")
                 return reply
         except asyncio.TimeoutError:
-            logger.warning(f"[Timeout] Model {model_name} took longer than 25s. Cascading down.")
-            last_error = f"{model_name}: Request timed out (25s)"
+            logger.warning(f"[Timeout] Model {model_name} exceeded 35s. Trying next model.")
+            last_error = f"{model_name}: Timed out"
             continue
         except Exception as e:
             err_str = str(e)
