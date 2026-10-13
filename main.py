@@ -1,4 +1,6 @@
 import ast
+import base64
+import ast
 import os
 import sys
 import json
@@ -182,8 +184,12 @@ ALL_TOOLS_LIST = [
 ]
 
 SYSTEM_INSTRUCTION = """You are Chintu, an autonomous HMAS AI Engineer.
-When the user asks you to take an action (e.g., create a backup, read a file, run code), call the appropriate tool ONCE.
-Once the tool returns its result, IMMEDIATELY summarize the outcome and confirm completion to the user. DO NOT call duplicate tools in a loop."""
+You have tools to read/commit code to your GitHub repo, run isolated code in a microVM sandbox, query Supabase memory, create Golden State backups, and perform web research.
+Self-Healing & Problem Solving Protocol:
+- When an action or tool fails (e.g. missing import, syntax error, or API rejection), analyze the error immediately.
+- Use your tools (such as github_read_file and github_commit_file) to inspect the code, correct the bug, and re-attempt execution.
+- Maintain persistent execution until the goal succeeds or an unrecoverable external dependency blocks progress.
+- Once verified, confirm the final resolution and details to the user."""
 
 def _sync_chat_call(model_name: str, message: str) -> str:
     config = types.GenerateContentConfig(
