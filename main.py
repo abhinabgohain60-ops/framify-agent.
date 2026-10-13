@@ -25,6 +25,16 @@ logger = logging.getLogger("chintu-agent")
 
 PORT = int(os.environ.get("PORT", 10000))
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN", "")
+SUPABASE_URL = os.environ.get("SUPABASE_URL", "")
+SUPABASE_KEY = os.environ.get("SUPABASE_KEY", "")
+HF_TOKEN = os.environ.get("HF_TOKEN", "")
+E2B_API_KEY = os.environ.get("E2B_API_KEY", "")
+COMPOSIO_API_KEY = os.environ.get("COMPOSIO_API_KEY", "")
+RENDER_API_KEY = os.environ.get("RENDER_API_KEY", "")
+RENDER_SERVICE_ID = os.environ.get("RENDER_SERVICE_ID", "")
+DEFAULT_REPO = os.environ.get("DEFAULT_REPO", "abhinabgohain60-ops/framify-agent.")
+
 GEMINI_API_KEYS = [k for k in [
     os.environ.get("GEMINI_API_KEY", ""),
     os.environ.get("GEMINI_API_KEY_2", ""),
