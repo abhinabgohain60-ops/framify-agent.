@@ -416,12 +416,16 @@ def render_progress_bar(percent: int) -> str:
     return f"Task/Project Progress\n[{bar}] {percent}%"
 
 def _sync_chat_call(model_name: str, message: str) -> str:
+    global gemini_client
     config = types.GenerateContentConfig(
         system_instruction=SYSTEM_INSTRUCTION,
         tools=ALL_TOOLS_LIST,
         temperature=0.2
     )
-    chat = gemini_client.chats.create(model=model_name, config=config)
+    client = get_current_gemini_client()
+    if not client:
+        raise RuntimeError("No Gemini API client configured.")
+    chat = client.chats.create(model=model_name, config=config)
     resp = chat.send_message(message)
     
     if resp.text:
@@ -437,35 +441,73 @@ def _sync_chat_call(model_name: str, message: str) -> str:
             
     return "Action completed successfully."
 
+# Dedicated 3-series list for code and heavy reasoning
+CODE_SPECIALIZED_3_MODELS: List[str] = [
+    "gemini-3.7-flash",
+    "gemini-3.5-flash",
+    "gemini-3.1-pro-preview",
+    "gemini-3.1-flash-lite",
+    "gemini-3.1-flash-lite-preview"
+]
+
+# Standard 2-series workhorses
+STANDARD_2_SERIES_MODELS: List[str] = [
+    "gemini-2.5-pro",
+    "gemini-2.5-flash",
+    "gemini-2.0-flash",
+    "gemini-2.0-flash-lite",
+    "gemini-1.5-pro",
+    "gemini-1.5-flash"
+]
+
 async def generate_reasoning_response(user_message: str) -> str:
-    if not gemini_client:
+    global current_key_index
+    if not GEMINI_API_KEYS:
         return "Gemini API client not initialized. Verify GEMINI_API_KEY."
 
-    if not ACTIVE_GEMINI_MODELS:
-        discover_available_models()
+    is_code_task = any(kw in user_message.lower() for kw in [
+        "code", "python", "script", "ast", "github", "bug", "syntax", "refactor",
+        "patch", "function", "compile", "execute_in_cloud_microvm", "diagnose_and_heal",
+        "sql", "table", "schema"
+    ])
+
+    if is_code_task:
+        selected_cascade = CODE_SPECIALIZED_3_MODELS + STANDARD_2_SERIES_MODELS
+        logger.info("[Routing] Code-focused task detected: 3-series prioritized.")
+    else:
+        selected_cascade = STANDARD_2_SERIES_MODELS + CODE_SPECIALIZED_3_MODELS
 
     last_error = ""
-    for model_name in ACTIVE_GEMINI_MODELS:
-        try:
-            logger.info(f"[Reasoning] Dispatching to: {model_name}")
-            reply = await asyncio.wait_for(
-                asyncio.to_thread(_sync_chat_call, model_name, user_message),
-                timeout=45.0
-            )
-            if reply:
-                logger.info(f"[Reasoning] Response received from: {model_name}")
-                return reply
-        except asyncio.TimeoutError:
-            logger.warning(f"[Timeout] Model {model_name} exceeded 45s. Trying next model.")
-            last_error = f"{model_name}: Timed out"
-            continue
-        except Exception as e:
-            err_str = str(e)
-            last_error = f"{model_name}: {err_str}"
-            logger.warning(f"[Model Failed] {model_name}: {err_str}")
-            continue
+    for model_name in selected_cascade:
+        attempts_per_model = len(GEMINI_API_KEYS) if GEMINI_API_KEYS else 1
+        for _ in range(attempts_per_model):
+            try:
+                logger.info(f"[Reasoning] Dispatching to: {model_name} (Key #{current_key_index + 1})")
+                reply = await asyncio.wait_for(
+                    asyncio.to_thread(_sync_chat_call, model_name, user_message),
+                    timeout=45.0
+                )
+                if reply:
+                    logger.info(f"[Reasoning] Response received from: {model_name}")
+                    return reply
+            except asyncio.TimeoutError:
+                logger.warning(f"[Timeout] Model {model_name} exceeded 45s. Trying next model.")
+                last_error = f"{model_name}: Timed out"
+                break
+            except Exception as e:
+                err_str = str(e)
+                last_error = f"{model_name}: {err_str}"
+                logger.warning(f"[Model Failed] {model_name} (Key #{current_key_index + 1}): {err_str}")
+                
+                # Auto-switch to next key if 429 / quota limit is hit
+                if "429" in err_str or "RESOURCE_EXHAUSTED" in err_str:
+                    rotated = rotate_to_next_gemini_key()
+                    if rotated:
+                        continue  # Retry with next key
+                break  # If other error, step to next model in cascade
 
-    return f"All models failed in cascade. Details:\n{last_error}"
+    return f"All models and API keys failed in cascade. Details:\n{last_error}"
+
 
 api = FastAPI(title="Chintu HMAS AI Engineer")
 
