@@ -1217,3 +1217,8 @@ if __name__ == "__main__":
     import uvicorn
     port = int(os.getenv("PORT", "8000"))
     uvicorn.run("main:api", host="0.0.0.0", port=port)
+
+
+@api.get("/health")
+def render_health_ping():
+    return {"status": "ok", "service": "framify-agent"}
