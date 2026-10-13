@@ -50,73 +50,24 @@ def rotate_to_next_gemini_key():
 
 gemini_client = get_current_gemini_client()
 
-# Full cascade: Retains all previous models + adds 3-series models
+# Strictly verified multitasking & function-calling models from live Google AI Studio API
 ACTIVE_GEMINI_MODELS: List[str] = [
     "gemini-3.7-flash",
     "gemini-3.5-flash",
-    "gemini-3.1-pro-preview",
+    "gemini-3.6-flash",
+    "gemini-3.8-flash",
+    "gemini-flash-latest",
+    "gemini-flash-lite-latest",
+    "gemini-pro-latest",
+    "gemini-3.5-flash-lite",
     "gemini-3.1-flash-lite",
-    "gemini-3.1-flash-lite-preview",
-    "gemini-2.5-pro",
-    "gemini-2.5-flash",
-    "gemini-2.0-flash-thinking-exp",
-    "gemini-2.0-pro-exp-02-05",
-    "gemini-2.0-flash",
-    "gemini-2.0-flash-lite",
-    "gemini-1.5-pro-latest",
-    "gemini-1.5-pro",
-    "gemini-1.5-flash-latest",
-    "gemini-1.5-flash",
-    "gemini-1.5-flash-8b",
-    "gemini-flash-lite-latest"
+    "gemini-3.1-pro-preview"
 ]
 
 def discover_available_models():
+    # Locked to active verified models
     global ACTIVE_GEMINI_MODELS
-    priority_order = [
-        "gemini-3.7-flash",
-        "gemini-3.5-flash",
-        "gemini-3.1-pro-preview",
-        "gemini-3.1-flash-lite",
-        "gemini-3.1-flash-lite-preview",
-        "gemini-2.5-pro",
-        "gemini-2.5-flash",
-        "gemini-2.0-flash-thinking-exp",
-        "gemini-2.0-pro-exp-02-05",
-        "gemini-2.0-flash",
-        "gemini-2.0-flash-lite",
-        "gemini-1.5-pro-latest",
-        "gemini-1.5-pro",
-        "gemini-1.5-flash-latest",
-        "gemini-1.5-flash",
-        "gemini-1.5-flash-8b",
-        "gemini-flash-lite-latest"
-    ]
-    discovered = []
-    client = get_current_gemini_client()
-    if client:
-        try:
-            for m in client.models.list():
-                m_name = getattr(m, "name", "").replace("models/", "")
-                # Only exclude non-text media or invalid tool callers
-                if any(bad in m_name for bad in [
-                    "live", "bidi", "translate", "transcribe", "computer-use",
-                    "banana", "imagen", "veo", "tts", "image", "audio", "embed"
-                ]):
-                    continue
-                if "gemini" in m_name:
-                    discovered.append(m_name)
-            logger.info(f"[Model Discovery] Candidates available: {discovered}")
-        except Exception as e:
-            logger.warning(f"[Model Discovery] Discovery bypass: {e}")
-
-    ordered = [m for m in priority_order if m in discovered]
-    for m in discovered:
-        if m not in ordered:
-            ordered.append(m)
-
-    ACTIVE_GEMINI_MODELS = ordered if ordered else priority_order
-    logger.info(f"[Active Expanded Cascade]: {ACTIVE_GEMINI_MODELS}")
+    logger.info(f"[Active Verified Models]: {ACTIVE_GEMINI_MODELS}")
 
 def github_read_file(repo_name: str, file_path: str) -> str:
     token = GITHUB_TOKEN or ""
@@ -416,7 +367,6 @@ def render_progress_bar(percent: int) -> str:
     return f"Task/Project Progress\n[{bar}] {percent}%"
 
 def _sync_chat_call(model_name: str, message: str) -> str:
-    global gemini_client
     config = types.GenerateContentConfig(
         system_instruction=SYSTEM_INSTRUCTION,
         tools=ALL_TOOLS_LIST,
@@ -441,46 +391,15 @@ def _sync_chat_call(model_name: str, message: str) -> str:
             
     return "Action completed successfully."
 
-# Dedicated 3-series list for code and heavy reasoning
-CODE_SPECIALIZED_3_MODELS: List[str] = [
-    "gemini-3.7-flash",
-    "gemini-3.5-flash",
-    "gemini-3.1-pro-preview",
-    "gemini-3.1-flash-lite",
-    "gemini-3.1-flash-lite-preview"
-]
-
-# Standard 2-series workhorses
-STANDARD_2_SERIES_MODELS: List[str] = [
-    "gemini-2.5-pro",
-    "gemini-2.5-flash",
-    "gemini-2.0-flash",
-    "gemini-2.0-flash-lite",
-    "gemini-1.5-pro",
-    "gemini-1.5-flash"
-]
-
 async def generate_reasoning_response(user_message: str) -> str:
     global current_key_index
     if not GEMINI_API_KEYS:
-        return "Gemini API client not initialized. Verify GEMINI_API_KEY."
-
-    is_code_task = any(kw in user_message.lower() for kw in [
-        "code", "python", "script", "ast", "github", "bug", "syntax", "refactor",
-        "patch", "function", "compile", "execute_in_cloud_microvm", "diagnose_and_heal",
-        "sql", "table", "schema"
-    ])
-
-    if is_code_task:
-        selected_cascade = CODE_SPECIALIZED_3_MODELS + STANDARD_2_SERIES_MODELS
-        logger.info("[Routing] Code-focused task detected: 3-series prioritized.")
-    else:
-        selected_cascade = STANDARD_2_SERIES_MODELS + CODE_SPECIALIZED_3_MODELS
+        return "Gemini API client not initialized. Verify GEMINI_API_KEY in Render."
 
     last_error = ""
-    for model_name in selected_cascade:
-        attempts_per_model = len(GEMINI_API_KEYS) if GEMINI_API_KEYS else 1
-        for _ in range(attempts_per_model):
+    for model_name in ACTIVE_GEMINI_MODELS:
+        attempts = len(GEMINI_API_KEYS) if GEMINI_API_KEYS else 1
+        for _ in range(attempts):
             try:
                 logger.info(f"[Reasoning] Dispatching to: {model_name} (Key #{current_key_index + 1})")
                 reply = await asyncio.wait_for(
@@ -491,7 +410,7 @@ async def generate_reasoning_response(user_message: str) -> str:
                     logger.info(f"[Reasoning] Response received from: {model_name}")
                     return reply
             except asyncio.TimeoutError:
-                logger.warning(f"[Timeout] Model {model_name} exceeded 45s. Trying next model.")
+                logger.warning(f"[Timeout] Model {model_name} timed out (>45s). Trying next.")
                 last_error = f"{model_name}: Timed out"
                 break
             except Exception as e:
@@ -499,14 +418,14 @@ async def generate_reasoning_response(user_message: str) -> str:
                 last_error = f"{model_name}: {err_str}"
                 logger.warning(f"[Model Failed] {model_name} (Key #{current_key_index + 1}): {err_str}")
                 
-                # Auto-switch to next key if 429 / quota limit is hit
+                # Switch key on rate limits/quotas and retry the model
                 if "429" in err_str or "RESOURCE_EXHAUSTED" in err_str:
-                    rotated = rotate_to_next_gemini_key()
-                    if rotated:
-                        continue  # Retry with next key
-                break  # If other error, step to next model in cascade
+                    if rotate_to_next_gemini_key():
+                        continue
+                break  # If other error (e.g. 503/400), step to next model
 
-    return f"All models and API keys failed in cascade. Details:\n{last_error}"
+    return f"All verified models failed in cascade. Details:\n{last_error}"
+
 
 
 api = FastAPI(title="Chintu HMAS AI Engineer")
