@@ -31,9 +31,9 @@ SUPABASE_KEY = os.environ.get("SUPABASE_KEY", "")
 DEFAULT_REPO = os.environ.get("DEFAULT_REPO", "abhinabgohain60-ops/framify-agent.")
 
 GEMINI_MODELS_CASCADE = [
-    "gemini-2.5-pro",
-    "gemini-2.5-flash",
-    "gemini-1.5-flash"
+    "gemini-3.0-flash",
+    "gemini-3.1-pro-preview",
+    "gemini-2.0-flash"
 ]
 
 # Client Initializations
@@ -165,7 +165,7 @@ async def generate_reasoning_response(user_message: str) -> str:
         try:
             if groq_client:
                 comp = groq_client.chat.completions.create(
-                    model="llama-3.3-70b-versatile",
+                    model="llama-3.1-8b-instant",
                     messages=[
                         {"role": "system", "content": SYSTEM_INSTRUCTION},
                         {"role": "user", "content": user_message}
