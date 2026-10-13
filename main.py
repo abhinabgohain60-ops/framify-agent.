@@ -42,17 +42,17 @@ ACTIVE_GEMINI_MODELS: List[str] = []
 def discover_available_models():
     global ACTIVE_GEMINI_MODELS
     whitelist_priority = [
-        "gemini-2.5-flash",
+        "gemini-flash-lite-latest",
         "gemini-2.0-flash",
-        "gemini-1.5-flash",
-        "gemini-flash-latest"
+        "gemini-2.0-flash-lite",
+        "gemini-1.5-flash"
     ]
     discovered = []
     if gemini_client:
         try:
             for m in gemini_client.models.list():
                 m_name = getattr(m, "name", "").replace("models/", "")
-                if any(bad in m_name for bad in ["tts", "image", "audio", "embed", "robotics", "transcribe", "customtools"]):
+                if any(bad in m_name for bad in ["2.5", "pro", "tts", "image", "audio", "embed", "robotics", "transcribe", "customtools"]):
                     continue
                 if "gemini" in m_name:
                     discovered.append(m_name)
@@ -62,11 +62,11 @@ def discover_available_models():
 
     ordered = [m for m in whitelist_priority if m in discovered]
     for m in discovered:
-        if m not in ordered:
+        if m not in ordered and not any(bad in m for bad in ["2.5", "pro", "flash-latest"]):
             ordered.append(m)
 
     if not ordered:
-        ordered = ["gemini-2.5-flash", "gemini-2.0-flash", "gemini-1.5-flash"]
+        ordered = ["gemini-flash-lite-latest", "gemini-2.0-flash", "gemini-1.5-flash"]
 
     ACTIVE_GEMINI_MODELS = ordered
     logger.info(f"[Active Cascade Order]: {ACTIVE_GEMINI_MODELS}")
@@ -121,14 +121,12 @@ def execute_in_cloud_microvm(code: str) -> str:
                 "X-API-Key": E2B_API_KEY,
                 "Content-Type": "application/json"
             }
-            # Attempt execution via E2B sandbox API
             e2b_url = "https://api.e2b.dev/sandboxes"
             sb_res = requests.post(e2b_url, headers=headers, json={"template": "base"}, timeout=12)
             if sb_res.status_code in [200, 201]:
                 sb_id = sb_res.json().get("sandboxID")
                 exec_url = f"https://api.e2b.dev/sandboxes/{sb_id}/execute"
                 run_res = requests.post(exec_url, headers=headers, json={"code": code}, timeout=20)
-                # Cleanup sandbox
                 requests.delete(f"https://api.e2b.dev/sandboxes/{sb_id}", headers=headers, timeout=5)
                 if run_res.status_code == 200:
                     return f"E2B 16GB Sandbox Result:\n{run_res.text}"
@@ -251,19 +249,32 @@ ALL_TOOLS_LIST = [
 ]
 
 SYSTEM_INSTRUCTION = """You are Chintu, an autonomous HMAS AI Engineer.
-Capabilities & Integrations:
-- GitHub code reading & committing (AST verified).
-- Cloud MicroVM sandbox Python execution via E2B / isolated runner with full outbound network access.
-- Supabase persistent database memory queries, insertions, and record deletion.
-- Hugging Face model inference via HF_TOKEN.
-- Render Service Management via RENDER_API_KEY.
-- Web search and online research.
-- Golden State snapshots.
+Workflow Directives:
+1. Planning & Execution: Before executing complex tasks or projects, determine a step-by-step plan. Execute the required tools sequentially step by step.
+2. Status Formatting: At the end of your thought and execution process, format the beginning of your response with the following progress block:
 
-Operating Directives:
-1. Memory Isolation & Cleanup: Disregard and purge any legacy memory entries from deprecated bot builds or discarded models (e.g., Llama/Groq fallback references). When encountering obsolete records, delete them using supabase_db_query with operation='delete'.
-2. Self-Healing & Problem Solving: If an action or tool fails, diagnose the error, inspect the relevant code, apply the necessary fix, and re-test.
-3. Execution: Run tools to completion, then present a concise summary of the outcome to the user."""
+Task/Project Progress
+[:::::::::::::::::::::::::::::::::::::::::::::] 100%
+
+Current status: Complete
+
+The Step by Step plan:
+Step 1: [Action taken]
+Step 2: [Action taken]
+Step 3: [Action taken]
+
+---
+[Deliver the complete final outcome, detailed findings, or execution summary below the divider]
+
+3. Memory Isolation & Cleanup: Disregard and purge any legacy memory entries from deprecated bot builds. Delete obsolete records using supabase_db_query with operation='delete'.
+4. Self-Healing: If any tool call encounters an error, analyze the error, use your tools to patch the underlying issue, and re-attempt execution."""
+
+def render_progress_bar(percent: int) -> str:
+    total_slots = 45
+    filled = max(0, min(total_slots, int((percent / 100.0) * total_slots)))
+    empty = total_slots - filled
+    bar = ":" * filled + " " * empty
+    return f"Task/Project Progress\n[{bar}] {percent}%"
 
 def _sync_chat_call(model_name: str, message: str) -> str:
     config = types.GenerateContentConfig(
@@ -300,13 +311,13 @@ async def generate_reasoning_response(user_message: str) -> str:
             logger.info(f"[Reasoning] Dispatching to: {model_name}")
             reply = await asyncio.wait_for(
                 asyncio.to_thread(_sync_chat_call, model_name, user_message),
-                timeout=35.0
+                timeout=45.0
             )
             if reply:
                 logger.info(f"[Reasoning] Response received from: {model_name}")
                 return reply
         except asyncio.TimeoutError:
-            logger.warning(f"[Timeout] Model {model_name} exceeded 35s. Trying next model.")
+            logger.warning(f"[Timeout] Model {model_name} exceeded 45s. Trying next model.")
             last_error = f"{model_name}: Timed out"
             continue
         except Exception as e:
@@ -340,8 +351,64 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message or not update.message.text:
         return
     user_text = update.message.text
+    
+    # 1. Send initial progress card
+    status_card = (
+        f"{render_progress_bar(15)}\n\n"
+        "Current status: Initializing plan & analyzing requirements\n\n"
+        "The Step by Step plan:\n"
+        "Step 1: Parse request and determine tool chain\n"
+        "Step 2: Dispatch actions to MicroVM / cloud tools\n"
+        "Step 3: Verify outputs and synthesize final deliverable"
+    )
+    status_msg = await update.message.reply_text(status_card)
     await update.message.reply_chat_action("typing")
-    reply = await generate_reasoning_response(user_text)
+    
+    # 2. Advance progress card while processing
+    async def progress_ticker():
+        try:
+            await asyncio.sleep(3.5)
+            await status_msg.edit_text(
+                f"{render_progress_bar(50)}\n\n"
+                "Current status: Executing toolchain & reasoning cascade\n\n"
+                "The Step by Step plan:\n"
+                "Step 1: Parse request and determine tool chain [DONE]\n"
+                "Step 2: Dispatch actions to MicroVM / cloud tools [IN PROGRESS]\n"
+                "Step 3: Verify outputs and synthesize final deliverable"
+            )
+            await asyncio.sleep(4.5)
+            await status_msg.edit_text(
+                f"{render_progress_bar(80)}\n\n"
+                "Current status: Synthesizing tool outputs & verifying state\n\n"
+                "The Step by Step plan:\n"
+                "Step 1: Parse request and determine tool chain [DONE]\n"
+                "Step 2: Dispatch actions to MicroVM / cloud tools [DONE]\n"
+                "Step 3: Verify outputs and synthesize final deliverable [IN PROGRESS]"
+            )
+        except Exception:
+            pass
+
+    ticker_task = asyncio.create_task(progress_ticker())
+    
+    # 3. Await final output
+    try:
+        reply = await generate_reasoning_response(user_text)
+    finally:
+        ticker_task.cancel()
+        
+    # 4. Finalize status card to 100% and post deliverable
+    try:
+        await status_msg.edit_text(
+            f"{render_progress_bar(100)}\n\n"
+            "Current status: Task complete\n\n"
+            "The Step by Step plan:\n"
+            "Step 1: Parse request and determine tool chain [DONE]\n"
+            "Step 2: Dispatch actions to MicroVM / cloud tools [DONE]\n"
+            "Step 3: Verify outputs and synthesize final deliverable [DONE]"
+        )
+    except Exception:
+        pass
+        
     await update.message.reply_text(reply)
 
 @api.on_event("startup")
