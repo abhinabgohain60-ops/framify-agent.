@@ -71,10 +71,10 @@ def github_read_file(repo_name: str, file_path: str) -> str:
     encoded_repo = repo_name.replace(".", "%2E") if repo_name.endswith(".") else repo_name
     url = f"https://api.github.com/repos/{encoded_repo}/contents/{file_path}"
     try:
-        res = requests.get(url, headers=headers, timeout=15)
+        res = requests.get(url, headers=headers, timeout=10)
         if res.status_code == 200:
             dl_url = res.json().get("download_url")
-            return requests.get(dl_url, timeout=15).text
+            return requests.get(dl_url, timeout=10).text
         return f"GitHub Read Error ({res.status_code}): {res.text}"
     except Exception as e:
         return f"Error reading GitHub file: {str(e)}"
@@ -92,7 +92,7 @@ def github_commit_file(repo_name: str, file_path: str, content: str, commit_mess
     url = f"https://api.github.com/repos/{encoded_repo}/contents/{file_path}"
     try:
         sha = None
-        get_res = requests.get(url, headers=headers, timeout=15)
+        get_res = requests.get(url, headers=headers, timeout=10)
         if get_res.status_code == 200:
             sha = get_res.json().get("sha")
         
@@ -101,7 +101,7 @@ def github_commit_file(repo_name: str, file_path: str, content: str, commit_mess
         if sha:
             payload["sha"] = sha
             
-        put_res = requests.put(url, headers=headers, json=payload, timeout=20)
+        put_res = requests.put(url, headers=headers, json=payload, timeout=15)
         if put_res.status_code in [200, 201]:
             return f"Successfully committed {file_path} to {repo_name}."
         return f"Commit failed ({put_res.status_code}): {put_res.text}"
@@ -185,6 +185,16 @@ SYSTEM_INSTRUCTION = """You are Chintu, an autonomous HMAS AI Engineer.
 You have tools to read/commit code to your GitHub repo, run isolated code in a microVM sandbox, query Supabase memory, create Golden State backups, and perform web research.
 Always verify code with AST before committing, never break FastAPI or Render endpoints, and use your tools proactively."""
 
+def _sync_chat_call(model_name: str, message: str) -> str:
+    config = types.GenerateContentConfig(
+        system_instruction=SYSTEM_INSTRUCTION,
+        tools=ALL_TOOLS_LIST,
+        temperature=0.3
+    )
+    chat = gemini_client.chats.create(model=model_name, config=config)
+    resp = chat.send_message(message)
+    return resp.text or "Completed with no text output."
+
 async def generate_reasoning_response(user_message: str) -> str:
     if not gemini_client:
         return "Gemini API client not initialized. Verify GEMINI_API_KEY."
@@ -195,18 +205,19 @@ async def generate_reasoning_response(user_message: str) -> str:
     last_error = ""
     for model_name in ACTIVE_GEMINI_MODELS:
         try:
-            logger.info(f"[Reasoning] Querying model: {model_name}")
-            config = types.GenerateContentConfig(
-                system_instruction=SYSTEM_INSTRUCTION,
-                tools=ALL_TOOLS_LIST,
-                temperature=0.3
+            logger.info(f"[Reasoning] Querying model in thread pool: {model_name}")
+            # Run in separate thread with 25s timeout to protect the async event loop
+            reply = await asyncio.wait_for(
+                asyncio.to_thread(_sync_chat_call, model_name, user_message),
+                timeout=25.0
             )
-            chat = gemini_client.chats.create(model=model_name, config=config)
-            response = chat.send_message(user_message)
-            
-            if response.text:
-                logger.info(f"[Reasoning] Response received from: {model_name}")
-                return response.text
+            if reply:
+                logger.info(f"[Reasoning] Reply successfully returned from: {model_name}")
+                return reply
+        except asyncio.TimeoutError:
+            logger.warning(f"[Timeout] Model {model_name} took longer than 25s. Cascading down.")
+            last_error = f"{model_name}: Request timed out (25s)"
+            continue
         except Exception as e:
             err_str = str(e)
             last_error = f"{model_name}: {err_str}"
