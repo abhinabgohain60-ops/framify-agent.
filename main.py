@@ -25,21 +25,38 @@ logger = logging.getLogger("chintu-agent")
 
 PORT = int(os.environ.get("PORT", 10000))
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
-GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
-GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN", "")
-SUPABASE_URL = os.environ.get("SUPABASE_URL", "")
-SUPABASE_KEY = os.environ.get("SUPABASE_KEY", "")
-HF_TOKEN = os.environ.get("HF_TOKEN", "")
-E2B_API_KEY = os.environ.get("E2B_API_KEY", "")
-COMPOSIO_API_KEY = os.environ.get("COMPOSIO_API_KEY", os.environ.get("COMPOSIO_API_", ""))
-RENDER_API_KEY = os.environ.get("RENDER_API_KEY", "")
-RENDER_SERVICE_ID = os.environ.get("RENDER_SERVICE_ID", os.environ.get("RENDER_SERVIC...", "srv-db497mfk1mc73f9l6tg"))
-DEFAULT_REPO = os.environ.get("DEFAULT_REPO", "abhinabgohain60-ops/framify-agent.")
+GEMINI_API_KEYS = [k for k in [
+    os.environ.get("GEMINI_API_KEY", ""),
+    os.environ.get("GEMINI_API_KEY_2", ""),
+    os.environ.get("GEMINI_API_KEY_3", "")
+] if k]
 
-gemini_client = genai.Client(api_key=GEMINI_API_KEY) if GEMINI_API_KEY else None
+current_key_index = 0
 
-# Strictly filtered standard text-generation models
+def get_current_gemini_client():
+    global current_key_index
+    if not GEMINI_API_KEYS:
+        return None
+    key = GEMINI_API_KEYS[current_key_index % len(GEMINI_API_KEYS)]
+    return genai.Client(api_key=key)
+
+def rotate_to_next_gemini_key():
+    global current_key_index
+    if len(GEMINI_API_KEYS) > 1:
+        current_key_index = (current_key_index + 1) % len(GEMINI_API_KEYS)
+        logger.info(f"[Key Rotator] Switched to API key slot #{current_key_index + 1} of {len(GEMINI_API_KEYS)}")
+        return True
+    return False
+
+gemini_client = get_current_gemini_client()
+
+# Full cascade: Retains all previous models + adds 3-series models
 ACTIVE_GEMINI_MODELS: List[str] = [
+    "gemini-3.7-flash",
+    "gemini-3.5-flash",
+    "gemini-3.1-pro-preview",
+    "gemini-3.1-flash-lite",
+    "gemini-3.1-flash-lite-preview",
     "gemini-2.5-pro",
     "gemini-2.5-flash",
     "gemini-2.0-flash-thinking-exp",
@@ -57,6 +74,11 @@ ACTIVE_GEMINI_MODELS: List[str] = [
 def discover_available_models():
     global ACTIVE_GEMINI_MODELS
     priority_order = [
+        "gemini-3.7-flash",
+        "gemini-3.5-flash",
+        "gemini-3.1-pro-preview",
+        "gemini-3.1-flash-lite",
+        "gemini-3.1-flash-lite-preview",
         "gemini-2.5-pro",
         "gemini-2.5-flash",
         "gemini-2.0-flash-thinking-exp",
@@ -71,21 +93,22 @@ def discover_available_models():
         "gemini-flash-lite-latest"
     ]
     discovered = []
-    if gemini_client:
+    client = get_current_gemini_client()
+    if client:
         try:
-            for m in gemini_client.models.list():
+            for m in client.models.list():
                 m_name = getattr(m, "name", "").replace("models/", "")
-                # Exclude media generation, speech, and WebSocket-only endpoints
+                # Only exclude non-text media or invalid tool callers
                 if any(bad in m_name for bad in [
-                    "live", "bidi", "translate", "banana", "imagen", "veo",
-                    "tts", "image", "audio", "embed", "robotics", "customtools"
+                    "live", "bidi", "translate", "transcribe", "computer-use",
+                    "banana", "imagen", "veo", "tts", "image", "audio", "embed"
                 ]):
                     continue
                 if "gemini" in m_name:
                     discovered.append(m_name)
-            logger.info(f"[Model Discovery] Found reasoning/coding candidates: {discovered}")
+            logger.info(f"[Model Discovery] Candidates available: {discovered}")
         except Exception as e:
-            logger.warning(f"[Model Discovery] List bypass: {e}")
+            logger.warning(f"[Model Discovery] Discovery bypass: {e}")
 
     ordered = [m for m in priority_order if m in discovered]
     for m in discovered:
