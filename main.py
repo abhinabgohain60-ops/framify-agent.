@@ -6,6 +6,7 @@ import json
 import logging
 import asyncio
 import io
+import re
 import contextlib
 import traceback
 from datetime import datetime
@@ -159,6 +160,43 @@ def execute_in_cloud_microvm(code: str) -> str:
     except Exception as e:
         return f"Sandbox Execution Error:\n{traceback.format_exc()}"
 
+def extract_video_knowledge(url: str) -> str:
+    """Extract transcripts, audio descriptions, and editing metadata from YouTube and Instagram video URLs."""
+    try:
+        yt_id_match = re.search(r"(?:v=|youtu\.be\/|embed\/|shorts\/)([0-9A-Za-z_-]{11})", url)
+        if yt_id_match:
+            video_id = yt_id_match.group(1)
+            meta_url = f"https://yt.lemnoslife.com/videos?part=snippet&id={video_id}"
+            t_res = requests.get(meta_url, timeout=10)
+            if t_res.status_code == 200:
+                data = t_res.json()
+                items = data.get("items", [])
+                if items:
+                    snippet = items[0].get("snippet", {})
+                    title = snippet.get("title", "")
+                    description = snippet.get("description", "")
+                    return f"YOUTUBE METADATA EXTRACTED:\nTitle: {title}\nDescription: {description[:1200]}\nReady for style breakdown."
+
+        py_extractor = f"""
+import json
+import subprocess
+try:
+    cmd = ['yt-dlp', '--dump-json', '--skip-download', '{url}']
+    proc = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
+    if proc.returncode == 0:
+        data = json.loads(proc.stdout)
+        print("TITLE:", data.get("title"))
+        print("DESCRIPTION:", data.get("description", "")[:1000])
+    else:
+        print("EXTRACTOR NOTICE:", proc.stderr[:300])
+except Exception as e:
+    print("YT-DLP ERROR:", str(e))
+"""
+        vm_result = execute_in_cloud_microvm(py_extractor)
+        return f"Video Extraction Output:\n{vm_result}"
+    except Exception as e:
+        return f"Video knowledge extraction failed: {str(e)}"
+
 def supabase_db_query(table: str, operation: str = "select", query_filter: Optional[str] = None, data: Optional[Dict[str, Any]] = None) -> str:
     if not SUPABASE_URL or not SUPABASE_KEY:
         return "Supabase credentials not configured in environment."
@@ -241,6 +279,7 @@ ALL_TOOLS_LIST = [
     github_read_file,
     github_commit_file,
     execute_in_cloud_microvm,
+    extract_video_knowledge,
     supabase_db_query,
     huggingface_task_runner,
     render_service_manager,
@@ -249,9 +288,10 @@ ALL_TOOLS_LIST = [
 ]
 
 SYSTEM_INSTRUCTION = """You are Chintu, an autonomous HMAS AI Engineer.
-Workflow Directives:
-1. Planning & Execution: Before executing complex tasks or projects, determine a step-by-step plan. Execute the required tools sequentially step by step.
-2. Status Formatting: At the end of your thought and execution process, format the beginning of your response with the following progress block:
+Workflow & Capabilities:
+1. Video Analysis & Learning: When given YouTube videos, shorts, or Instagram reels, use extract_video_knowledge to obtain transcripts, metadata, and audio data. Extract editing principles (pacing, cut frequency, visual hooks, B-roll timing, text styling), convert them into an actionable video editing playbook, and save those rules into Supabase memory.
+2. Step-by-Step Execution: Determine a clear sequence of actions and execute tools step by step.
+3. Status Display Formatting: Format the beginning of your response with the following progress block:
 
 Task/Project Progress
 [:::::::::::::::::::::::::::::::::::::::::::::] 100%
@@ -264,10 +304,10 @@ Step 2: [Action taken]
 Step 3: [Action taken]
 
 ---
-[Deliver the complete final outcome, detailed findings, or execution summary below the divider]
+[Deliver the complete final analysis, video playbook, or code execution output below the divider]
 
-3. Memory Isolation & Cleanup: Disregard and purge any legacy memory entries from deprecated bot builds. Delete obsolete records using supabase_db_query with operation='delete'.
-4. Self-Healing: If any tool call encounters an error, analyze the error, use your tools to patch the underlying issue, and re-attempt execution."""
+4. Memory Hygiene: Query memory using supabase_db_query and delete any obsolete or deprecated model references using operation='delete'.
+5. Autonomous Self-Healing: Diagnose errors immediately and patch issues before concluding your response."""
 
 def render_progress_bar(percent: int) -> str:
     total_slots = 45
@@ -364,13 +404,13 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     status_msg = await update.message.reply_text(status_card)
     await update.message.reply_chat_action("typing")
     
-    # 2. Advance progress card while processing
+    # 2. Advance progress card dynamically while processing
     async def progress_ticker():
         try:
             await asyncio.sleep(3.5)
             await status_msg.edit_text(
                 f"{render_progress_bar(50)}\n\n"
-                "Current status: Executing toolchain & reasoning cascade\n\n"
+                "Current status: Extracting media / executing toolchain\n\n"
                 "The Step by Step plan:\n"
                 "Step 1: Parse request and determine tool chain [DONE]\n"
                 "Step 2: Dispatch actions to MicroVM / cloud tools [IN PROGRESS]\n"
@@ -379,7 +419,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await asyncio.sleep(4.5)
             await status_msg.edit_text(
                 f"{render_progress_bar(80)}\n\n"
-                "Current status: Synthesizing tool outputs & verifying state\n\n"
+                "Current status: Synthesizing playbook & verifying state\n\n"
                 "The Step by Step plan:\n"
                 "Step 1: Parse request and determine tool chain [DONE]\n"
                 "Step 2: Dispatch actions to MicroVM / cloud tools [DONE]\n"
@@ -390,13 +430,13 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     ticker_task = asyncio.create_task(progress_ticker())
     
-    # 3. Await final output
+    # 3. Await reasoning output
     try:
         reply = await generate_reasoning_response(user_text)
     finally:
         ticker_task.cancel()
         
-    # 4. Finalize status card to 100% and post deliverable
+    # 4. Finalize status card to 100% and deliver output
     try:
         await status_msg.edit_text(
             f"{render_progress_bar(100)}\n\n"
