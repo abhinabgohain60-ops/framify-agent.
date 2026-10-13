@@ -40,34 +40,60 @@ gemini_client = genai.Client(api_key=GEMINI_API_KEY) if GEMINI_API_KEY else None
 
 # Strictly filtered standard text-generation models
 ACTIVE_GEMINI_MODELS: List[str] = [
-    "gemini-flash-lite-latest",
+    "gemini-2.5-pro",
+    "gemini-2.5-flash",
+    "gemini-2.0-flash-thinking-exp",
+    "gemini-2.0-pro-exp-02-05",
     "gemini-2.0-flash",
-    "gemini-1.5-flash"
+    "gemini-2.0-flash-lite",
+    "gemini-1.5-pro-latest",
+    "gemini-1.5-pro",
+    "gemini-1.5-flash-latest",
+    "gemini-1.5-flash",
+    "gemini-1.5-flash-8b",
+    "gemini-flash-lite-latest"
 ]
 
 def discover_available_models():
     global ACTIVE_GEMINI_MODELS
-    # Strict whitelist to eliminate live, bidi WebSocket, and non-standard endpoints
-    whitelist = ["gemini-flash-lite-latest", "gemini-2.0-flash", "gemini-1.5-flash"]
+    priority_order = [
+        "gemini-2.5-pro",
+        "gemini-2.5-flash",
+        "gemini-2.0-flash-thinking-exp",
+        "gemini-2.0-pro-exp-02-05",
+        "gemini-2.0-flash",
+        "gemini-2.0-flash-lite",
+        "gemini-1.5-pro-latest",
+        "gemini-1.5-pro",
+        "gemini-1.5-flash-latest",
+        "gemini-1.5-flash",
+        "gemini-1.5-flash-8b",
+        "gemini-flash-lite-latest"
+    ]
     discovered = []
     if gemini_client:
         try:
             for m in gemini_client.models.list():
                 m_name = getattr(m, "name", "").replace("models/", "")
-                # Exclude all non-generateContent models
+                # Exclude media generation, speech, and WebSocket-only endpoints
                 if any(bad in m_name for bad in [
-                    "live", "bidi", "translate", "banana", "omni", "thinking",
-                    "preview", "tts", "image", "audio", "embed", "robotics", "customtools"
+                    "live", "bidi", "translate", "banana", "imagen", "veo",
+                    "tts", "image", "audio", "embed", "robotics", "customtools"
                 ]):
                     continue
-                if m_name in whitelist:
+                if "gemini" in m_name:
                     discovered.append(m_name)
+            logger.info(f"[Model Discovery] Found reasoning/coding candidates: {discovered}")
         except Exception as e:
-            logger.warning(f"[Model Discovery] Discovery bypass: {e}")
+            logger.warning(f"[Model Discovery] List bypass: {e}")
 
-    ordered = [m for m in whitelist if m in discovered]
-    ACTIVE_GEMINI_MODELS = ordered if ordered else whitelist
-    logger.info(f"[Active Valid Text Models]: {ACTIVE_GEMINI_MODELS}")
+    ordered = [m for m in priority_order if m in discovered]
+    for m in discovered:
+        if m not in ordered:
+            ordered.append(m)
+
+    ACTIVE_GEMINI_MODELS = ordered if ordered else priority_order
+    logger.info(f"[Active Expanded Cascade]: {ACTIVE_GEMINI_MODELS}")
 
 def github_read_file(repo_name: str, file_path: str) -> str:
     token = GITHUB_TOKEN or ""
