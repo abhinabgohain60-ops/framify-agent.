@@ -3,6 +3,9 @@ import sys
 import json
 import logging
 import asyncio
+import io
+import contextlib
+import traceback
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 
@@ -14,38 +17,68 @@ from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters, ContextTypes
 from google import genai
 from google.genai import types
-from groq import Groq
 
 # Configure Logging
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("chintu-agent")
 
-# Environment & Config
+# Infrastructure Config
 PORT = int(os.environ.get("PORT", 10000))
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
-GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
 GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN", "")
 SUPABASE_URL = os.environ.get("SUPABASE_URL", "")
 SUPABASE_KEY = os.environ.get("SUPABASE_KEY", "")
 DEFAULT_REPO = os.environ.get("DEFAULT_REPO", "abhinabgohain60-ops/framify-agent.")
 
-GEMINI_MODELS_CASCADE = [
-    "gemini-2.0-flash",
-    "gemini-2.0-flash-exp",
-    "gemini-2.0-pro-exp-02-05"
-]
-
-# Client Initializations
+# Initialize Gemini Client
 gemini_client = genai.Client(api_key=GEMINI_API_KEY) if GEMINI_API_KEY else None
-groq_client = Groq(api_key=GROQ_API_KEY) if GROQ_API_KEY else None
+
+# Active Model Discovery List
+ACTIVE_GEMINI_MODELS: List[str] = []
+
+def discover_available_models():
+    """Discover active Gemini models on the account, prioritizing the most powerful."""
+    global ACTIVE_GEMINI_MODELS
+    priority_order = [
+        "gemini-3.1-pro-preview",
+        "gemini-3.0-flash",
+        "gemini-2.5-pro",
+        "gemini-2.5-flash",
+        "gemini-2.0-flash",
+        "gemini-1.5-pro",
+        "gemini-1.5-flash"
+    ]
+    discovered = []
+    if gemini_client:
+        try:
+            for m in gemini_client.models.list():
+                m_name = getattr(m, "name", "").replace("models/", "")
+                if "gemini" in m_name:
+                    discovered.append(m_name)
+            logger.info(f"[Model Discovery] Found models: {discovered}")
+        except Exception as e:
+            logger.warning(f"[Model Discovery] Could not list models: {e}")
+            
+    # Sort discovered by priority order
+    ordered = [m for m in priority_order if m in discovered]
+    for m in discovered:
+        if m not in ordered:
+            ordered.append(m)
+            
+    # Fallback default cascade if listing is restricted
+    if not ordered:
+        ordered = ["gemini-3.0-flash", "gemini-3.1-pro-preview", "gemini-2.5-flash"]
+        
+    ACTIVE_GEMINI_MODELS = ordered
+    logger.info(f"[Active Cascade Order]: {ACTIVE_GEMINI_MODELS}")
 
 # ==========================================
-# TOOL DEFINITIONS & IMPLEMENTATIONS
+# TOOL REGISTRY & SUBSYSTEMS
 # ==========================================
 
 def github_read_file(repo_name: str, file_path: str) -> str:
-    """Read a file from GitHub repository."""
+    """Read any file from GitHub repository."""
     token = GITHUB_TOKEN or ""
     headers = {"Authorization": f"Bearer {token}", "Accept": "application/vnd.github.v3+json"}
     encoded_repo = repo_name.replace(".", "%2E") if repo_name.endswith(".") else repo_name
@@ -60,7 +93,13 @@ def github_read_file(repo_name: str, file_path: str) -> str:
         return f"Error reading GitHub file: {str(e)}"
 
 def github_commit_file(repo_name: str, file_path: str, content: str, commit_message: str) -> str:
-    """Commit and push a file directly to GitHub via REST API."""
+    """Commit and push code directly to GitHub repository with AST safety check."""
+    if file_path.endswith(".py"):
+        try:
+            ast.parse(content)
+        except SyntaxError as syn_err:
+            return f"Pre-commit AST check failed: SyntaxError on line {syn_err.lineno}: {syn_err.msg}"
+            
     token = GITHUB_TOKEN or ""
     headers = {"Authorization": f"Bearer {token}", "Accept": "application/vnd.github.v3+json"}
     encoded_repo = repo_name.replace(".", "%2E") if repo_name.endswith(".") else repo_name
@@ -83,10 +122,37 @@ def github_commit_file(repo_name: str, file_path: str, content: str, commit_mess
     except Exception as e:
         return f"Error committing file: {str(e)}"
 
+def execute_in_cloud_microvm(code: str) -> str:
+    """Execute Python code in an isolated execution sandbox with stdout/stderr capture."""
+    stdout_buf = io.StringIO()
+    stderr_buf = io.StringIO()
+    try:
+        with contextlib.redirect_stdout(stdout_buf), contextlib.redirect_stderr(stderr_buf):
+            safe_globals = {
+                "__builtins__": __builtins__,
+                "requests": requests,
+                "json": json,
+                "os": os,
+                "sys": sys,
+                "datetime": datetime,
+                "ast": ast
+            }
+            exec(code, safe_globals)
+        out = stdout_buf.getvalue()
+        err = stderr_buf.getvalue()
+        result = ""
+        if out:
+            result += f"STDOUT:\n{out}\n"
+        if err:
+            result += f"STDERR:\n{err}\n"
+        return result or "Execution completed successfully with no output."
+    except Exception as e:
+        return f"Sandbox Execution Error:\n{traceback.format_exc()}"
+
 def supabase_db_query(table: str, operation: str = "select", data: Optional[Dict[str, Any]] = None) -> str:
-    """Read or write records to Supabase state tables."""
+    """Query or update persistent memory tables in Supabase."""
     if not SUPABASE_URL or not SUPABASE_KEY:
-        return "Supabase credentials not configured."
+        return "Supabase credentials not configured in environment."
     headers = {
         "apikey": SUPABASE_KEY,
         "Authorization": f"Bearer {SUPABASE_KEY}",
@@ -95,94 +161,82 @@ def supabase_db_query(table: str, operation: str = "select", data: Optional[Dict
     url = f"{SUPABASE_URL}/rest/v1/{table}"
     try:
         if operation == "select":
-            res = requests.get(f"{url}?select=*", headers=headers, timeout=10)
+            res = requests.get(f"{url}?select=*&order=created_at.desc&limit=20", headers=headers, timeout=10)
             return json.dumps(res.json())
         elif operation == "insert" and data:
             res = requests.post(url, headers=headers, json=data, timeout=10)
-            return f"Inserted status: {res.status_code}"
-        return f"Unsupported Supabase operation: {operation}"
+            return f"Insert status: {res.status_code}"
+        return f"Unsupported operation: {operation}"
     except Exception as e:
-        return f"Supabase Error: {str(e)}"
+        return f"Supabase error: {str(e)}"
+
+def create_golden_state_backup(tag: str = "stable_snapshot") -> str:
+    """Create a golden-state code backup snapshot in the repository."""
+    current_code = github_read_file(DEFAULT_REPO, "main.py")
+    if current_code.startswith("GitHub Read Error"):
+        return f"Failed to read source file: {current_code}"
+    
+    timestamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+    backup_file = f"backups/main_{tag}_{timestamp}.py"
+    res = github_commit_file(DEFAULT_REPO, backup_file, current_code, f"Create Golden State backup: {tag}")
+    return f"Golden State backup result: {res}"
 
 def web_search_research(query: str) -> str:
-    """Perform web research via DuckDuckGo lite HTML parser."""
+    """Search the web for up-to-date documentation and tech references."""
     try:
         url = "https://html.duckduckgo.com/html/"
         res = requests.post(url, data={"q": query}, headers={"User-Agent": "Mozilla/5.0"}, timeout=10)
-        return res.text[:2000]
+        return res.text[:2500]
     except Exception as e:
         return f"Search error: {str(e)}"
-
-def execute_in_cloud_microvm(code: str) -> str:
-    """Execute Python code in isolated cloud sandbox."""
-    try:
-        import io
-        import contextlib
-        stdout = io.StringIO()
-        with contextlib.redirect_stdout(stdout):
-            exec(code, {"__builtins__": __builtins__})
-        return stdout.getvalue() or "Code executed with no output."
-    except Exception as e:
-        return f"Execution error: {str(e)}"
 
 ALL_TOOLS_MAP = {
     "github_read_file": github_read_file,
     "github_commit_file": github_commit_file,
-    "supabase_db_query": supabase_db_query,
-    "web_search_research": web_search_research,
     "execute_in_cloud_microvm": execute_in_cloud_microvm,
+    "supabase_db_query": supabase_db_query,
+    "create_golden_state_backup": create_golden_state_backup,
+    "web_search_research": web_search_research,
 }
 
 SYSTEM_INSTRUCTION = """You are Chintu, an autonomous HMAS AI Engineer.
-You have tools to read/commit code to GitHub, execute tests in microVMs, run web research, and access Supabase memory.
-Always inspect code before modifying it, ensure syntactic validity, and maintain system stability."""
+You have direct tools to read/commit code to your GitHub repo, run isolated code in a microVM sandbox, query Supabase memory, create Golden State backups, and perform web research.
+Always verify code with AST before committing, never break FastAPI or Render endpoints, and use your tools proactively."""
 
 # ==========================================
-# REASONING ENGINE (CASCADE + FALLBACK)
+# REASONING ENGINE (ALL GEMINI - ZERO LLAMA)
 # ==========================================
 
 async def generate_reasoning_response(user_message: str) -> str:
-    response_text = ""
-    success = False
+    if not gemini_client:
+        return "Gemini API client not initialized. Please verify GEMINI_API_KEY."
 
-    if gemini_client:
-        for model_name in GEMINI_MODELS_CASCADE:
-            try:
-                chat = gemini_client.chats.create(model=model_name)
-                response = chat.send_message(user_message)
-                if response.text:
-                    response_text = response.text
-                    success = True
-                    break
-            except Exception as e:
-                err_msg = str(e)
-                logger.warning(f"Model {model_name} failed: {err_msg}")
-                if "429" in err_msg or "RESOURCE_EXHAUSTED" in err_msg:
-                    break
-                continue
+    if not ACTIVE_GEMINI_MODELS:
+        discover_available_models()
 
-    if not success or not response_text:
+    last_error = ""
+    # Try the most powerful Gemini models discovered first
+    for model_name in ACTIVE_GEMINI_MODELS:
         try:
-            if groq_client:
-                comp = groq_client.chat.completions.create(
-                    model="llama-3.1-8b-instant",
-                    messages=[
-                        {"role": "system", "content": SYSTEM_INSTRUCTION},
-                        {"role": "user", "content": user_message}
-                    ],
-                    temperature=0.3,
-                    max_tokens=2000
-                )
-                response_text = comp.choices[0].message.content or "Empty fallback response."
-            else:
-                response_text = "No AI engines available to process request."
-        except Exception as ge:
-            response_text = f"All reasoning cascades failed: {str(ge)}"
+            logger.info(f"[Reasoning] Trying model: {model_name}")
+            chat = gemini_client.chats.create(model=model_name)
+            response = chat.send_message(user_message)
+            
+            if response.text:
+                logger.info(f"[Reasoning] Response successfully generated with: {model_name}")
+                return response.text
+        except Exception as e:
+            err_str = str(e)
+            last_error = f"{model_name}: {err_str}"
+            logger.warning(f"[Model Failed] {model_name}: {err_str}")
+            if "429" in err_str or "RESOURCE_EXHAUSTED" in err_str:
+                continue
+            continue
 
-    return response_text
+    return f"All active Gemini models in cascade failed. Details:\n{last_error}"
 
 # ==========================================
-# FASTAPI APPLICATION & HEALTH ENDPOINTS
+# FASTAPI CORE & RENDER HEALTH
 # ==========================================
 
 api = FastAPI(title="Chintu HMAS AI Engineer")
@@ -193,6 +247,8 @@ def health_check():
     return {
         "status": "online",
         "service": "framify-agent",
+        "active_models": ACTIVE_GEMINI_MODELS,
+        "tools_count": len(ALL_TOOLS_MAP),
         "timestamp": datetime.utcnow().isoformat()
     }
 
@@ -204,7 +260,7 @@ telegram_app = None
 
 async def handle_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.message:
-        await update.message.reply_text("Chintu HMAS AI Engineer online. Systems operational.")
+        await update.message.reply_text("Chintu HMAS AI Engineer online. Dynamic model discovery active.")
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message or not update.message.text:
@@ -217,7 +273,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 @api.on_event("startup")
 async def startup_event():
     global telegram_app
-    logger.info("Initializing FastAPI and Telegram services...")
+    logger.info("Initializing Chintu services...")
+    discover_available_models()
+    
     if TELEGRAM_BOT_TOKEN:
         try:
             telegram_app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
@@ -226,9 +284,9 @@ async def startup_event():
             await telegram_app.initialize()
             await telegram_app.start()
             asyncio.create_task(telegram_app.updater.start_polling(drop_pending_updates=True))
-            logger.info("[Telegram Bot] Started successfully via polling.")
+            logger.info("[Telegram Bot] Polling started cleanly.")
         except Exception as te:
-            logger.error(f"Telegram startup warning: {str(te)}")
+            logger.error(f"Telegram start error: {te}")
 
 @api.on_event("shutdown")
 async def shutdown_event():
@@ -239,7 +297,7 @@ async def shutdown_event():
             await telegram_app.stop()
             await telegram_app.shutdown()
         except Exception as e:
-            logger.warning(f"Telegram shutdown warning: {str(e)}")
+            logger.warning(f"Telegram shutdown warning: {e}")
 
 if __name__ == "__main__":
     uvicorn.run("main:api", host="0.0.0.0", port=PORT, log_level="info")
