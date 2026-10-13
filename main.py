@@ -69,9 +69,7 @@ ACTIVE_GEMINI_MODELS: List[str] = [
     "gemini-flash-latest",
     "gemini-flash-lite-latest",
     "gemini-pro-latest",
-    "gemini-3.5-flash-lite",
-    "gemini-3.1-flash-lite",
-    "gemini-3.1-pro-preview"
+    "gemini-3.1-flash-lite"
 ]
 
 def discover_available_models():
