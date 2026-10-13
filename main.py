@@ -17,11 +17,9 @@ from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, fil
 from google import genai
 from google.genai import types
 
-# Configure Logging
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("chintu-agent")
 
-# Infrastructure Config
 PORT = int(os.environ.get("PORT", 10000))
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
@@ -40,7 +38,6 @@ ACTIVE_GEMINI_MODELS: List[str] = [
 ]
 
 def discover_available_models():
-    """Discover active Gemini models on the account, prioritizing powerful models."""
     global ACTIVE_GEMINI_MODELS
     priority_order = [
         "gemini-3.8-flash",
@@ -68,12 +65,7 @@ def discover_available_models():
         ACTIVE_GEMINI_MODELS = ordered
     logger.info(f"[Active Cascade Order]: {ACTIVE_GEMINI_MODELS}")
 
-# ==========================================
-# TOOL REGISTRY & SUBSYSTEMS
-# ==========================================
-
 def github_read_file(repo_name: str, file_path: str) -> str:
-    """Read any file from GitHub repository."""
     token = GITHUB_TOKEN or ""
     headers = {"Authorization": f"Bearer {token}", "Accept": "application/vnd.github.v3+json"}
     encoded_repo = repo_name.replace(".", "%2E") if repo_name.endswith(".") else repo_name
@@ -88,7 +80,6 @@ def github_read_file(repo_name: str, file_path: str) -> str:
         return f"Error reading GitHub file: {str(e)}"
 
 def github_commit_file(repo_name: str, file_path: str, content: str, commit_message: str) -> str:
-    """Commit and push code directly to GitHub repository with AST safety check."""
     if file_path.endswith(".py"):
         try:
             ast.parse(content)
@@ -118,7 +109,6 @@ def github_commit_file(repo_name: str, file_path: str, content: str, commit_mess
         return f"Error committing file: {str(e)}"
 
 def execute_in_cloud_microvm(code: str) -> str:
-    """Execute Python code in an isolated execution sandbox with stdout/stderr capture."""
     stdout_buf = io.StringIO()
     stderr_buf = io.StringIO()
     try:
@@ -145,7 +135,6 @@ def execute_in_cloud_microvm(code: str) -> str:
         return f"Sandbox Execution Error:\n{traceback.format_exc()}"
 
 def supabase_db_query(table: str, operation: str = "select", data: Optional[Dict[str, Any]] = None) -> str:
-    """Query or update persistent memory tables in Supabase."""
     if not SUPABASE_URL or not SUPABASE_KEY:
         return "Supabase credentials not configured in environment."
     headers = {
@@ -166,7 +155,6 @@ def supabase_db_query(table: str, operation: str = "select", data: Optional[Dict
         return f"Supabase error: {str(e)}"
 
 def create_golden_state_backup(tag: str = "stable_snapshot") -> str:
-    """Create a golden-state code backup snapshot in the repository."""
     current_code = github_read_file(DEFAULT_REPO, "main.py")
     if current_code.startswith("GitHub Read Error"):
         return f"Failed to read source file: {current_code}"
@@ -177,7 +165,6 @@ def create_golden_state_backup(tag: str = "stable_snapshot") -> str:
     return f"Golden State backup result: {res}"
 
 def web_search_research(query: str) -> str:
-    """Search the web for up-to-date documentation and tech references."""
     try:
         url = "https://html.duckduckgo.com/html/"
         res = requests.post(url, data={"q": query}, headers={"User-Agent": "Mozilla/5.0"}, timeout=10)
@@ -195,12 +182,8 @@ ALL_TOOLS_LIST = [
 ]
 
 SYSTEM_INSTRUCTION = """You are Chintu, an autonomous HMAS AI Engineer.
-You have direct tools to read/commit code to your GitHub repo, run isolated code in a microVM sandbox, query Supabase memory, create Golden State backups, and perform web research.
+You have tools to read/commit code to your GitHub repo, run isolated code in a microVM sandbox, query Supabase memory, create Golden State backups, and perform web research.
 Always verify code with AST before committing, never break FastAPI or Render endpoints, and use your tools proactively."""
-
-# ==========================================
-# REASONING ENGINE (GEMINI-ONLY CASCADE)
-# ==========================================
 
 async def generate_reasoning_response(user_message: str) -> str:
     if not gemini_client:
@@ -232,10 +215,6 @@ async def generate_reasoning_response(user_message: str) -> str:
 
     return f"All models failed in cascade. Details:\n{last_error}"
 
-# ==========================================
-# FASTAPI CORE & RENDER HEALTH
-# ==========================================
-
 api = FastAPI(title="Chintu HMAS AI Engineer")
 
 @api.get("/")
@@ -248,10 +227,6 @@ def health_check():
         "tools_count": len(ALL_TOOLS_LIST),
         "timestamp": datetime.utcnow().isoformat()
     }
-
-# ==========================================
-# TELEGRAM BOT INTEGRATION
-# ==========================================
 
 telegram_app = None
 
