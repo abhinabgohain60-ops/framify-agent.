@@ -31,9 +31,9 @@ SUPABASE_KEY = os.environ.get("SUPABASE_KEY", "")
 DEFAULT_REPO = os.environ.get("DEFAULT_REPO", "abhinabgohain60-ops/framify-agent.")
 
 GEMINI_MODELS_CASCADE = [
-    "gemini-3.0-flash",
-    "gemini-3.1-pro-preview",
-    "gemini-2.0-flash"
+    "gemini-2.0-flash",
+    "gemini-2.0-flash-exp",
+    "gemini-2.0-pro-exp-02-05"
 ]
 
 # Client Initializations
