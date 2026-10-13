@@ -12,7 +12,6 @@ from typing import Any, Dict, List, Optional
 import requests
 import uvicorn
 from fastapi import FastAPI, BackgroundTasks, Request
-from fastapi.responses import JSONResponse
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters, ContextTypes
 from google import genai
@@ -31,23 +30,23 @@ SUPABASE_URL = os.environ.get("SUPABASE_URL", "")
 SUPABASE_KEY = os.environ.get("SUPABASE_KEY", "")
 DEFAULT_REPO = os.environ.get("DEFAULT_REPO", "abhinabgohain60-ops/framify-agent.")
 
-# Initialize Gemini Client
 gemini_client = genai.Client(api_key=GEMINI_API_KEY) if GEMINI_API_KEY else None
 
-# Active Model Discovery List
-ACTIVE_GEMINI_MODELS: List[str] = []
+ACTIVE_GEMINI_MODELS: List[str] = [
+    "gemini-3.8-flash",
+    "gemini-3.5-flash",
+    "gemini-3.1-pro-preview",
+    "gemini-3.0-flash"
+]
 
 def discover_available_models():
-    """Discover active Gemini models on the account, prioritizing the most powerful."""
+    """Discover active Gemini models on the account, prioritizing powerful models."""
     global ACTIVE_GEMINI_MODELS
     priority_order = [
+        "gemini-3.8-flash",
+        "gemini-3.5-flash",
         "gemini-3.1-pro-preview",
-        "gemini-3.0-flash",
-        "gemini-2.5-pro",
-        "gemini-2.5-flash",
-        "gemini-2.0-flash",
-        "gemini-1.5-pro",
-        "gemini-1.5-flash"
+        "gemini-3.0-flash"
     ]
     discovered = []
     if gemini_client:
@@ -60,17 +59,13 @@ def discover_available_models():
         except Exception as e:
             logger.warning(f"[Model Discovery] Could not list models: {e}")
             
-    # Sort discovered by priority order
     ordered = [m for m in priority_order if m in discovered]
     for m in discovered:
-        if m not in ordered:
+        if m not in ordered and any(v in m for v in ["flash", "pro"]):
             ordered.append(m)
             
-    # Fallback default cascade if listing is restricted
-    if not ordered:
-        ordered = ["gemini-3.0-flash", "gemini-3.1-pro-preview", "gemini-2.5-flash"]
-        
-    ACTIVE_GEMINI_MODELS = ordered
+    if ordered:
+        ACTIVE_GEMINI_MODELS = ordered
     logger.info(f"[Active Cascade Order]: {ACTIVE_GEMINI_MODELS}")
 
 # ==========================================
@@ -190,50 +185,52 @@ def web_search_research(query: str) -> str:
     except Exception as e:
         return f"Search error: {str(e)}"
 
-ALL_TOOLS_MAP = {
-    "github_read_file": github_read_file,
-    "github_commit_file": github_commit_file,
-    "execute_in_cloud_microvm": execute_in_cloud_microvm,
-    "supabase_db_query": supabase_db_query,
-    "create_golden_state_backup": create_golden_state_backup,
-    "web_search_research": web_search_research,
-}
+ALL_TOOLS_LIST = [
+    github_read_file,
+    github_commit_file,
+    execute_in_cloud_microvm,
+    supabase_db_query,
+    create_golden_state_backup,
+    web_search_research,
+]
 
 SYSTEM_INSTRUCTION = """You are Chintu, an autonomous HMAS AI Engineer.
 You have direct tools to read/commit code to your GitHub repo, run isolated code in a microVM sandbox, query Supabase memory, create Golden State backups, and perform web research.
 Always verify code with AST before committing, never break FastAPI or Render endpoints, and use your tools proactively."""
 
 # ==========================================
-# REASONING ENGINE (ALL GEMINI - ZERO LLAMA)
+# REASONING ENGINE (GEMINI-ONLY CASCADE)
 # ==========================================
 
 async def generate_reasoning_response(user_message: str) -> str:
     if not gemini_client:
-        return "Gemini API client not initialized. Please verify GEMINI_API_KEY."
+        return "Gemini API client not initialized. Verify GEMINI_API_KEY."
 
     if not ACTIVE_GEMINI_MODELS:
         discover_available_models()
 
     last_error = ""
-    # Try the most powerful Gemini models discovered first
     for model_name in ACTIVE_GEMINI_MODELS:
         try:
-            logger.info(f"[Reasoning] Trying model: {model_name}")
-            chat = gemini_client.chats.create(model=model_name)
+            logger.info(f"[Reasoning] Querying model: {model_name}")
+            config = types.GenerateContentConfig(
+                system_instruction=SYSTEM_INSTRUCTION,
+                tools=ALL_TOOLS_LIST,
+                temperature=0.3
+            )
+            chat = gemini_client.chats.create(model=model_name, config=config)
             response = chat.send_message(user_message)
             
             if response.text:
-                logger.info(f"[Reasoning] Response successfully generated with: {model_name}")
+                logger.info(f"[Reasoning] Response received from: {model_name}")
                 return response.text
         except Exception as e:
             err_str = str(e)
             last_error = f"{model_name}: {err_str}"
             logger.warning(f"[Model Failed] {model_name}: {err_str}")
-            if "429" in err_str or "RESOURCE_EXHAUSTED" in err_str:
-                continue
             continue
 
-    return f"All active Gemini models in cascade failed. Details:\n{last_error}"
+    return f"All models failed in cascade. Details:\n{last_error}"
 
 # ==========================================
 # FASTAPI CORE & RENDER HEALTH
@@ -248,7 +245,7 @@ def health_check():
         "status": "online",
         "service": "framify-agent",
         "active_models": ACTIVE_GEMINI_MODELS,
-        "tools_count": len(ALL_TOOLS_MAP),
+        "tools_count": len(ALL_TOOLS_LIST),
         "timestamp": datetime.utcnow().isoformat()
     }
 
@@ -260,7 +257,7 @@ telegram_app = None
 
 async def handle_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.message:
-        await update.message.reply_text("Chintu HMAS AI Engineer online. Dynamic model discovery active.")
+        await update.message.reply_text("Chintu HMAS AI Engineer online. Systems operational.")
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message or not update.message.text:
