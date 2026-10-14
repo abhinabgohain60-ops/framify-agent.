@@ -96,36 +96,51 @@ def github_commit_file(repo_name: str, file_path: str, content: str, commit_mess
         return f'Error committing file: {str(e)}'
 
 def execute_in_cloud_microvm(code: str) -> str:
-    if E2B_API_KEY:
-        try:
-            headers = {'X-API-Key': E2B_API_KEY, 'Content-Type': 'application/json'}
-            e2b_url = 'https://api.e2b.dev/sandboxes'
-            sb_res = requests.post(e2b_url, headers=headers, json={'template': 'base'}, timeout=12)
-            if sb_res.status_code in [200, 201]:
-                sb_id = sb_res.json().get('sandboxID')
-                exec_url = f'https://api.e2b.dev/sandboxes/{sb_id}/execute'
-                run_res = requests.post(exec_url, headers=headers, json={'code': code}, timeout=20)
-                requests.delete(f'https://api.e2b.dev/sandboxes/{sb_id}', headers=headers, timeout=5)
-                if run_res.status_code == 200:
-                    return f'E2B 16GB Sandbox Result:\n{run_res.text}'
-        except Exception as e:
-            logger.warning(f'E2B microVM direct dispatch error: {e}. Falling back to internal runner.')
-    stdout_buf = io.StringIO()
-    stderr_buf = io.StringIO()
+    global CURRENT_CHAT_ID, TELEGRAM_BOT_INSTANCE
+    if not E2B_API_KEY:
+        return "Error: E2B_API_KEY is not configured."
     try:
-        with contextlib.redirect_stdout(stdout_buf), contextlib.redirect_stderr(stderr_buf):
-            safe_globals = {'__builtins__': __builtins__, 'requests': requests, 'json': json, 'os': os, 'sys': sys, 'datetime': datetime, 'ast': ast, 'base64': base64}
-            exec(code, safe_globals)
-        out = stdout_buf.getvalue()
-        err = stderr_buf.getvalue()
-        result = ''
-        if out:
-            result += f'STDOUT:\n{out}\n'
-        if err:
-            result += f'STDERR:\n{err}\n'
-        return result or 'Execution completed successfully with no output.'
+        from e2b_code_interpreter import Sandbox
+        import io, asyncio
+
+        logger.info("Starting official E2B Sandbox session...")
+        sbx = Sandbox.create(api_key=E2B_API_KEY)
+        
+        # Write script to file and run it cleanly
+        sbx.files.write("/home/user/run_task.py", code)
+        exec_res = sbx.commands.run("python /home/user/run_task.py")
+        
+        # Video Auto-Delivery: check if any mp4 was created
+        found_video = False
+        try:
+            files = sbx.files.list("/home/user")
+            for f in files:
+                if f.name.endswith(".mp4"):
+                    video_bytes = sbx.files.read(f"/home/user/{f.name}", format="bytes")
+                    if CURRENT_CHAT_ID and TELEGRAM_BOT_INSTANCE:
+                        bio = io.BytesIO(video_bytes)
+                        bio.name = f.name
+                        asyncio.create_task(TELEGRAM_BOT_INSTANCE.send_video(
+                            chat_id=CURRENT_CHAT_ID,
+                            video=bio,
+                            caption=f"🎬 Chintu Video Render: {f.name}"
+                        ))
+                        found_video = True
+                        logger.info(f"Delivered {f.name} to Telegram chat {CURRENT_CHAT_ID}")
+                    break
+        except Exception as vid_err:
+            logger.warning(f"Video file check warning: {vid_err}")
+            
+        sbx.kill()
+        
+        out_msg = f"STDOUT:\n{exec_res.stdout}\nSTDERR:\n{exec_res.stderr}"
+        if found_video:
+            out_msg += "\n\n[SUCCESS] Rendered .mp4 file delivered directly to Telegram!"
+        return out_msg
     except Exception as e:
-        return f'Sandbox Execution Error:\n{traceback.format_exc()}'
+        logger.error(f"E2B Execution error: {e}", exc_info=True)
+        return f"Sandbox Execution Error:\n{traceback.format_exc()}"
+
 
 def extract_video_knowledge(url: str) -> str:
     """Extract transcripts, audio descriptions, and editing metadata from YouTube and Instagram video URLs."""
