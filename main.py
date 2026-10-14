@@ -485,8 +485,69 @@ async def handle_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.message:
         await update.message.reply_text("Chintu HMAS AI Engineer online. Systems operational.")
 
+
+# -------------------------------------------------------------
+# AUTONOMOUS VIDEO RENDERING & TELEGRAM DELIVERY TOOL
+# -------------------------------------------------------------
+CURRENT_CHAT_ID: Optional[int] = None
+TELEGRAM_BOT_INSTANCE = None
+
+async def render_and_send_video(script_code: str, output_filename: str = "intro.mp4") -> str:
+    """Renders a video script inside the 16 GB E2B cloud sandbox using MoviePy/Pillow/ffmpeg and sends the resulting .mp4 directly to the user in Telegram."""
+    global CURRENT_CHAT_ID, TELEGRAM_BOT_INSTANCE
+    if not E2B_API_KEY:
+        return "Error: E2B_API_KEY is not configured in environment."
+    if not CURRENT_CHAT_ID or not TELEGRAM_BOT_INSTANCE:
+        return "Error: Active Telegram chat context not found."
+
+    try:
+        from e2b_code_interpreter import Sandbox
+        import io
+        
+        logger.info(f"Launching E2B Sandbox for video rendering: {output_filename}")
+        sbx = Sandbox.create(api_key=E2B_API_KEY)
+        
+        # Ensure dependencies and write script
+        sbx.commands.run("pip install --quiet pillow numpy moviepy imageio[ffmpeg]")
+        sbx.files.write("/home/user/render.py", script_code)
+        
+        # Execute render in cloud sandbox
+        exec_res = sbx.commands.run("python /home/user/render.py")
+        if exec_res.error:
+            sbx.kill()
+            return f"Video render failed during execution: {exec_res.error}"
+            
+        # Download binary video file
+        target_path = f"/home/user/{output_filename}"
+        if not sbx.files.exists(target_path):
+            target_path = f"/home/user/output_frames/{output_filename}"
+            if not sbx.files.exists(target_path):
+                # Search for any generated mp4
+                files = sbx.files.list("/home/user")
+                mp4s = [f.name for f in files if f.name.endswith(".mp4")]
+                if mp4s:
+                    target_path = f"/home/user/{mp4s[0]}"
+                else:
+                    sbx.kill()
+                    return f"Render script finished but no .mp4 file was produced. Stdout: {exec_res.stdout}"
+                    
+        video_bytes = sbx.files.read(target_path, format="bytes")
+        sbx.kill()
+        
+        # Send video directly to user's Telegram chat
+        bio = io.BytesIO(video_bytes)
+        bio.name = output_filename
+        await TELEGRAM_BOT_INSTANCE.send_video(chat_id=CURRENT_CHAT_ID, video=bio, caption=f"🎬 Chintu Video Render Complete: {output_filename}")
+        return f"SUCCESS: Video rendered and delivered directly to Telegram ({len(video_bytes)} bytes)."
+    except Exception as e:
+        logger.error(f"render_and_send_video failed: {e}", exc_info=True)
+        return f"Error rendering video: {str(e)}"
+
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_msg = update.message.text
+    global CURRENT_CHAT_ID, TELEGRAM_BOT_INSTANCE
+    CURRENT_CHAT_ID = update.message.chat_id
+    TELEGRAM_BOT_INSTANCE = context.bot
     if not user_msg:
         return
     logger.info(f"Incoming message: {user_msg}")
