@@ -32,6 +32,10 @@ E2B_API_KEY = os.environ.get("E2B_API_KEY", "")
 COMPOSIO_API_KEY = os.environ.get("COMPOSIO_API_KEY", "")
 RENDER_API_KEY = os.environ.get("RENDER_API_KEY", "")
 RENDER_SERVICE_ID = os.environ.get("RENDER_SERVICE_ID", "")
+OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "")
+OPENROUTER_BASE_URL = os.environ.get("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1")
+FREEBUFF_API_KEY = os.environ.get("FREEBUFF_API_KEY", "")
+FREEBUFF_BASE_URL = os.environ.get("FREEBUFF_BASE_URL", "https://api.freebuff.com/v1")
 DEFAULT_REPO = os.environ.get("DEFAULT_REPO", "abhinabgohain60-ops/framify-agent.")
 
 GEMINI_API_KEYS = [
