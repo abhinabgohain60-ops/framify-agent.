@@ -1,5 +1,3 @@
-CURRENT_STATUS_MSG_ID = None
-CURRENT_CHAT_ID = None
 import ast
 import base64
 import os
@@ -109,7 +107,7 @@ def execute_in_cloud_microvm(code: str) -> str:
         sbx = Sandbox.create(api_key=E2B_API_KEY)
         
         # Ensure dependencies
-        sbx.commands.run("sudo apt-get update && sudo apt-get install -y ffmpeg && pip install --quiet pillow numpy moviepy imageio[ffmpeg]")
+        sbx.commands.run("pip install --quiet pillow numpy moviepy imageio[ffmpeg]")
         
         # Write script to file and run it cleanly
         sbx.files.write("/home/user/run_task.py", code)
@@ -396,23 +394,9 @@ async def render_and_send_video(script_code: str, output_filename: str='intro.mp
         logger.error(f'render_and_send_video failed: {e}', exc_info=True)
         return f'Error rendering video: {str(e)}'
 
-
-def format_progress_card(pct: int, status_text: str) -> str:
-    filled = int(pct / 100 * 30)
-    bar = "=" * filled + "-" * (30 - filled)
-    return f"Task/Project Progress\n[{bar}] {pct}%\n\nCurrent status: {status_text}"
-
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    global CURRENT_CHAT_ID, CURRENT_STATUS_MSG_ID
-    CURRENT_CHAT_ID = update.message.chat_id
-    try:
-        status_card = await update.message.reply_text(format_progress_card(15, "Initializing cloud sandbox & tool pipeline..."))
-        CURRENT_STATUS_MSG_ID = status_card.message_id
-    except Exception as e:
-        logger.warning(f"Status card dispatch error: {e}")
-        CURRENT_STATUS_MSG_ID = None
+    global CURRENT_CHAT_ID, CURRENT_STATUS_MSG_ID, TELEGRAM_BOT_INSTANCE
     user_msg = update.message.text
-    global CURRENT_CHAT_ID, TELEGRAM_BOT_INSTANCE
     CURRENT_CHAT_ID = update.message.chat_id
     TELEGRAM_BOT_INSTANCE = context.bot
     if not user_msg:
