@@ -62,16 +62,20 @@ def rotate_to_next_gemini_key():
         return True
     return False
 
-# High-RPM production Flash models only (prevents 429 quota deadlocks)
+# Verified, active Gemini endpoints only.
+# NOTE: deprecated IDs (gemini-2.5-flash, gemini-2.0-flash) return HTTP 404 and
+# gemini-pro-latest drains quota (429), so neither is part of the cascade.
 ACTIVE_GEMINI_MODELS: List[str] = [
-    "gemini-2.5-flash",
-    "gemini-2.0-flash",
+    "gemini-2.0-flash-exp",
+    "gemini-1.5-flash",
     "gemini-flash-latest",
     "gemini-flash-lite-latest",
-    "gemini-3.7-flash",
-    "gemini-3.5-flash",
     "gemini-3.1-flash-lite"
 ]
+
+# HTTP statuses that trigger an immediate external-provider failover once every
+# Gemini key slot has also failed.
+RETRYABLE_GEMINI_STATUS = ("429", "500", "503", "RESOURCE_EXHAUSTED", "UNAVAILABLE", "INTERNAL")
 
 def discover_available_models():
     global ACTIVE_GEMINI_MODELS
@@ -121,10 +125,66 @@ CURRENT_CHAT_ID: Optional[int] = None
 CURRENT_STATUS_MSG = None
 TELEGRAM_BOT_INSTANCE = None
 
+# Root-level shell binaries that must never be handed to the Python interpreter raw.
+_ROOT_SHELL_RE = re.compile(
+    r"^\s*(?:\$\s*|>\s*)?(?:sudo\s+)?"
+    r"(cat|curl|wget|ffmpeg|ffprobe|pip3?|apt|apt-get|bash|sh|zsh|ls|mkdir|rmdir|rm|"
+    r"cp|mv|echo|printf|chmod|chown|tar|unzip|gzip|grep|egrep|sed|awk|find|sort|"
+    r"head|tail|wc|git|node|npm|npx|python3?|pytest|make|cmake)\b"
+)
+
+def _is_valid_python(code: str) -> bool:
+    try:
+        ast.parse(code)
+        return True
+    except (SyntaxError, ValueError):
+        return False
+
+def _has_root_shell_command(code: str) -> bool:
+    """True if the first meaningful root-level token is a shell command."""
+    for line in code.splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        return bool(_ROOT_SHELL_RE.match(stripped))
+    return False
+
+def _wrap_shell_as_python(code: str) -> str:
+    """Embed arbitrary shell/syntactically-invalid input in a valid Python wrapper."""
+    return (
+        "import subprocess, sys\n"
+        f"_script = {code!r}\n"
+        "_proc = subprocess.run(['/bin/bash', '-lc', _script], capture_output=True, text=True)\n"
+        "sys.stdout.write(_proc.stdout or '')\n"
+        "sys.stderr.write(_proc.stderr or '')\n"
+        "print(f'[shell_exit_code={_proc.returncode}]')\n"
+    )
+
+def prepare_task_source(code: str) -> str:
+    """Guarantee the source written to run_task.py is 100% valid Python.
+
+    Valid Python is passed through untouched. Anything that fails ``ast.parse``
+    (raw shell commands such as cat/curl/ffmpeg, multiline wrappers or mismatched
+    syntax) is wrapped in a subprocess shim instead of crashing the VM with
+    ``SyntaxError: invalid syntax``.
+    """
+    if not isinstance(code, str):
+        code = "" if code is None else str(code)
+    # Shell detection takes priority: a line like `cat /home/user/x.txt` is a
+    # syntactically-valid Python expression, so ast.parse alone would not catch it.
+    if _has_root_shell_command(code):
+        logger.warning("[E2B Guard] Detected root-level shell command; wrapping task for safe shell execution.")
+        return _wrap_shell_as_python(code)
+    if _is_valid_python(code):
+        return code
+    logger.warning("[E2B Guard] Detected invalid Python syntax; wrapping task for safe shell execution.")
+    return _wrap_shell_as_python(code)
+
 def execute_in_cloud_microvm(code: str) -> str:
     global CURRENT_CHAT_ID
     if not E2B_API_KEY:
         return "Error: E2B_API_KEY is not configured."
+    sbx = None
     try:
         from e2b_code_interpreter import Sandbox
         import requests as req
@@ -132,18 +192,19 @@ def execute_in_cloud_microvm(code: str) -> str:
         logger.info("Starting official E2B Sandbox session...")
         # Lifetime set to 600 seconds
         sbx = Sandbox.create(api_key=E2B_API_KEY, timeout=600)
-        
+
         # Provisioning without command timeout limits (timeout=0)
         setup_cmd = (
             "command -v ffmpeg >/dev/null 2>&1 || (sudo apt-get update -qq && sudo apt-get install -y -qq ffmpeg) && "
             "pip install --quiet --no-cache-dir pillow \"numpy<2\" scipy edge-tts"
         )
         sbx.commands.run(setup_cmd, timeout=0)
-        
-        # Write task script and run with timeout=0
-        sbx.files.write("/home/user/run_task.py", code)
+
+        # Pre-validate/harden the task source before it ever reaches the VM.
+        safe_source = prepare_task_source(code)
+        sbx.files.write("/home/user/run_task.py", safe_source)
         exec_res = sbx.commands.run("python /home/user/run_task.py", timeout=0)
-        
+
         found_video = False
         try:
             files = sbx.files.list("/home/user")
@@ -164,9 +225,7 @@ def execute_in_cloud_microvm(code: str) -> str:
                     break
         except Exception as vid_err:
             logger.warning(f"Video file check warning: {vid_err}")
-            
-        sbx.kill()
-        
+
         out_msg = f"STDOUT:\n{exec_res.stdout}\nSTDERR:\n{exec_res.stderr}"
         if found_video:
             out_msg += "\n\n[SUCCESS] Rendered .mp4 file delivered directly to Telegram!"
@@ -174,6 +233,12 @@ def execute_in_cloud_microvm(code: str) -> str:
     except Exception as e:
         logger.error(f"E2B Execution error: {e}", exc_info=True)
         return f"Sandbox Execution Error:\n{traceback.format_exc()}"
+    finally:
+        if sbx is not None:
+            try:
+                sbx.kill()
+            except Exception as kill_err:
+                logger.warning(f"Sandbox cleanup warning: {kill_err}")
 
 def extract_video_knowledge(url: str) -> str:
     try:
@@ -314,8 +379,9 @@ SYSTEM_INSTRUCTION = """You are Chintu, an autonomous execution assistant.
 STRICT OPERATIONAL DIRECTIVES:
 1. NEVER FAKE OR HALLUCINATE TOOL EXECUTION: Never claim you executed code or modified a file unless you invoked the tool and received a valid tool response.
 2. ACTION-FIRST PRINCIPLE: When asked to execute code, render video, or read/write files, IMMEDIATELY call execute_in_cloud_microvm or the corresponding tool.
-3. VIDEO GENERATION: Never import `moviepy.editor`. Render frames using Pillow/NumPy and stitch them natively using system `ffmpeg` via subprocess.
+3. VIDEO GENERATION: Importing `moviepy.editor` is STRICTLY FORBIDDEN and will break the sandbox. For ANY video task, write a pure Python rendering script: generate frames with Pillow + NumPy, then stitch them into the final `.mp4` natively by calling the system `ffmpeg` binary through `subprocess`.
 4. CONCISE FACTUAL OUTPUT: Report only actual ground truth from tool execution stdout and stderr.
+5. SANDBOX CODE HYGIENE: Submit a single, syntactically valid `run_task.py` (validate it with `ast.parse` before sending). Do not mix root-level shell commands (cat/curl/ffmpeg/...) into Python source; invoke them through `subprocess` when required.
 """
 
 def _sync_chat_call(model_name: str, message: str) -> str:
@@ -340,18 +406,88 @@ def _sync_chat_call(model_name: str, message: str) -> str:
             return "".join(parts_out)
     return "Action completed successfully."
 
+# External provider failover used only after the entire Gemini cascade is exhausted.
+def _sync_external_fallback(message: str) -> str:
+    """Fail over to OpenRouter (claude-3.5-sonnet); Freebuff is a last resort."""
+    payload = {
+        "messages": [
+            {"role": "system", "content": SYSTEM_INSTRUCTION},
+            {"role": "user", "content": message},
+        ],
+        "temperature": 0.2,
+    }
+
+    if OPENROUTER_API_KEY:
+        headers = {
+            "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+            "Content-Type": "application/json",
+            "HTTP-Referer": "https://framify-agent.onrender.com",
+            "X-Title": "framify-agent",
+        }
+        body = dict(payload, model="anthropic/claude-3.5-sonnet")
+        try:
+            res = requests.post(
+                f"{OPENROUTER_BASE_URL.rstrip('/')}/chat/completions",
+                headers=headers,
+                json=body,
+                timeout=120,
+            )
+            if res.status_code == 200:
+                choices = (res.json() or {}).get("choices") or []
+                if choices:
+                    content = (choices[0].get("message") or {}).get("content")
+                    if content:
+                        logger.info("[External Fallback] OpenRouter claude-3.5-sonnet fulfilled request.")
+                        return content
+                raise RuntimeError("OpenRouter returned an empty completion.")
+            raise RuntimeError(f"OpenRouter error ({res.status_code}): {res.text[:500]}")
+        except Exception as or_err:
+            logger.warning(f"[External Fallback] OpenRouter failed: {or_err}")
+
+    if FREEBUFF_API_KEY:
+        headers = {
+            "Authorization": f"Bearer {FREEBUFF_API_KEY}",
+            "Content-Type": "application/json",
+        }
+        body = dict(payload, model="anthropic/claude-3.5-sonnet")
+        res = requests.post(
+            f"{FREEBUFF_BASE_URL.rstrip('/')}/chat/completions",
+            headers=headers,
+            json=body,
+            timeout=120,
+        )
+        if res.status_code == 200:
+            choices = (res.json() or {}).get("choices") or []
+            if choices:
+                content = (choices[0].get("message") or {}).get("content")
+                if content:
+                    logger.info("[External Fallback] Freebuff fulfilled request.")
+                    return content
+        raise RuntimeError(f"Freebuff error ({res.status_code}): {res.text[:500]}")
+
+    raise RuntimeError("No external fallback provider configured (set OPENROUTER_API_KEY).")
+
 # Autonomous code-driven model failover engine
 async def generate_reasoning_response(user_message: str) -> str:
     global current_key_index
     if not GEMINI_API_KEYS:
-        return "Gemini API client not initialized. Verify GEMINI_API_KEY in Render."
-    
+        logger.warning("[Cascade Engine] No Gemini keys configured; using external fallback directly.")
+        try:
+            return await asyncio.wait_for(
+                asyncio.to_thread(_sync_external_fallback, user_message), timeout=600.0
+            )
+        except Exception as ext_err:
+            return f"Gemini API client not initialized and external fallback failed: {ext_err}"
+
     last_error = ""
-    
+    # True once every Gemini key slot failed with an infra/quota status
+    # (429/500/503/UNAVAILABLE/INTERNAL), which mandates external failover.
+    infra_failure = False
+
     # Iterate through models. If a model succeeds, STOP and return immediately.
     for model_name in ACTIVE_GEMINI_MODELS:
         logger.info(f"[Cascade Engine] Attempting model: {model_name}...")
-        
+
         # Try each available API key for the current model
         for key_slot in range(len(GEMINI_API_KEYS)):
             try:
@@ -361,35 +497,51 @@ async def generate_reasoning_response(user_message: str) -> str:
                     asyncio.to_thread(_sync_chat_call, model_name, user_message),
                     timeout=600.0
                 )
-                
+
                 # If the model responds cleanly, we stop switching and return
                 if reply and not any(err_word in reply.lower() for err_word in ["resource_exhausted", "503 unavailable"]):
                     logger.info(f"[Cascade Engine] SUCCESS: Model {model_name} is active and fulfilled request.")
                     return reply
-                else:
-                    logger.warning(f"[Cascade Engine] Model {model_name} returned unserviceable response. Failing over...")
-                    rotate_to_next_gemini_key()
-                    continue
-                    
+
+                logger.warning(f"[Cascade Engine] Model {model_name} returned unserviceable response. Failing over...")
+                last_error = f"{model_name}: unserviceable response"
+                rotate_to_next_gemini_key()
+                continue
+
             except asyncio.TimeoutError:
                 logger.warning(f"[Cascade Engine] Model {model_name} timed out (>600s). Moving to next model.")
                 last_error = f"{model_name}: Execution timed out (>600s)"
                 break  # Move to next model
-                
+
             except Exception as e:
                 err_str = str(e)
                 last_error = f"{model_name}: {err_str}"
                 logger.warning(f"[Cascade Engine] Model {model_name} encountered error: {err_str}")
-                
-                # If rate limited, rotate key and test next slot
+
+                # 429 quota -> rotate key and retry the same model on the next slot
                 if "429" in err_str or "RESOURCE_EXHAUSTED" in err_str:
+                    infra_failure = True
                     rotate_to_next_gemini_key()
                     continue
-                else:
-                    # Unrecoverable model error (503, invalid config, etc.) -> move directly to next model
-                    break
-                    
-    return f"All verified cascade models failed. Details:\n{last_error}"
+
+                # 500/503 and other infra failures -> note and move to the next model
+                if any(code in err_str.upper() for code in RETRYABLE_GEMINI_STATUS):
+                    infra_failure = True
+                break
+
+    # Every Gemini model/key slot failed. If the failures were infra/quota
+    # (503/500/429) fail over immediately to the external provider.
+    logger.warning(
+        f"[Cascade Engine] Gemini cascade exhausted (infra_failure={infra_failure}). "
+        "Failing over to _sync_external_fallback."
+    )
+    try:
+        return await asyncio.wait_for(
+            asyncio.to_thread(_sync_external_fallback, user_message), timeout=600.0
+        )
+    except Exception as ext_err:
+        last_error = f"{last_error}; external fallback: {ext_err}"
+        return f"All verified cascade models and external fallback failed. Details:\n{last_error}"
 
 api = FastAPI(title="Chintu HMAS AI Engineer")
 
