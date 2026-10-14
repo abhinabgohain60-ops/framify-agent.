@@ -107,7 +107,7 @@ def execute_in_cloud_microvm(code: str) -> str:
         sbx = Sandbox.create(api_key=E2B_API_KEY)
         
         # Ensure dependencies
-        sbx.commands.run("pip install --quiet pillow numpy moviepy imageio[ffmpeg]")
+        sbx.commands.run("sudo apt-get update -qq && sudo apt-get install -y -qq ffmpeg && pip install --quiet pillow numpy moviepy imageio[ffmpeg]")
         
         # Write script to file and run it cleanly
         sbx.files.write("/home/user/run_task.py", code)
@@ -394,15 +394,56 @@ async def render_and_send_video(script_code: str, output_filename: str='intro.mp
         logger.error(f'render_and_send_video failed: {e}', exc_info=True)
         return f'Error rendering video: {str(e)}'
 
+
+CURRENT_STATUS_MSG = None
+
+async def update_telegram_status(pct: int, status_text: str):
+    global CURRENT_STATUS_MSG
+    if CURRENT_STATUS_MSG:
+        try:
+            total_slots = 30
+            filled = max(0, min(total_slots, int(pct / 100.0 * total_slots)))
+            bar = "=" * filled + "-" * (total_slots - filled)
+            card = f"Task/Project Progress\n[{bar}] {pct}%\n\nCurrent status: {status_text}"
+            await CURRENT_STATUS_MSG.edit_text(card)
+        except Exception:
+            pass
+
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    global CURRENT_CHAT_ID, CURRENT_STATUS_MSG_ID, TELEGRAM_BOT_INSTANCE
+    global CURRENT_CHAT_ID, CURRENT_STATUS_MSG, TELEGRAM_BOT_INSTANCE
     user_msg = update.message.text
-    CURRENT_CHAT_ID = update.message.chat_id
-    TELEGRAM_BOT_INSTANCE = context.bot
     if not user_msg:
         return
+    CURRENT_CHAT_ID = update.message.chat_id
+    TELEGRAM_BOT_INSTANCE = context.bot
     logger.info(f'Incoming message: {user_msg}')
+    
+    # 1. Dispatch immediate live status card (15%)
+    try:
+        total_slots = 30
+        filled = int(15 / 100.0 * total_slots)
+        init_bar = "=" * filled + "-" * (total_slots - filled)
+        CURRENT_STATUS_MSG = await update.message.reply_text(
+            f"Task/Project Progress\n[{init_bar}] 15%\n\nCurrent status: Initializing reasoning & tool pipeline..."
+        )
+    except Exception as e:
+        logger.warning(f"Could not dispatch initial status card: {e}")
+        CURRENT_STATUS_MSG = None
+
+    # 2. Run execution pipeline
     reply = await generate_reasoning_response(user_msg)
+    
+    # 3. Update status card to 100% Complete
+    if CURRENT_STATUS_MSG:
+        try:
+            full_bar = "=" * 30
+            await CURRENT_STATUS_MSG.edit_text(
+                f"Task/Project Progress\n[{full_bar}] 100%\n\nCurrent status: Complete"
+            )
+        except Exception:
+            pass
+
+    # 4. Deliver full response payload
     if len(reply) <= 4000:
         await update.message.reply_text(reply)
     else:
