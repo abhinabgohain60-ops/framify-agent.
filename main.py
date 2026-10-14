@@ -107,7 +107,7 @@ def execute_in_cloud_microvm(code: str) -> str:
         sbx = Sandbox.create(api_key=E2B_API_KEY)
         
         # Ensure dependencies
-        sbx.commands.run("sudo apt-get update -qq && sudo apt-get install -y -qq ffmpeg && pip install --quiet pillow numpy moviepy imageio[ffmpeg]")
+        sbx.commands.run("sudo apt-get update -qq && sudo apt-get install -y -qq ffmpeg && pip install --quiet pillow \"numpy<2\" scipy edge-tts")
         
         # Write script to file and run it cleanly
         sbx.files.write("/home/user/run_task.py", code)
