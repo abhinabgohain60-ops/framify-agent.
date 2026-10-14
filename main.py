@@ -486,64 +486,33 @@ async def handle_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Chintu HMAS AI Engineer online. Systems operational.")
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not update.message or not update.message.text:
+    user_msg = update.message.text
+    if not user_msg:
         return
-    user_text = update.message.text
+    logger.info(f"Incoming message: {user_msg}")
     
-    status_card = (
-        f"{render_progress_bar(15)}\n\n"
-        "Current status: Initializing plan & analyzing requirements\n\n"
-        "The Step by Step plan:\n"
-        "Step 1: Parse request and determine tool chain\n"
-        "Step 2: Dispatch actions to MicroVM / cloud tools\n"
-        "Step 3: Verify outputs and synthesize final deliverable"
-    )
-    status_msg = await update.message.reply_text(status_card)
-    await update.message.reply_chat_action("typing")
+    reply = await generate_reasoning_response(user_msg)
     
-    async def progress_ticker():
-        try:
-            await asyncio.sleep(3.5)
-            await status_msg.edit_text(
-                f"{render_progress_bar(50)}\n\n"
-                "Current status: Extracting media / executing toolchain\n\n"
-                "The Step by Step plan:\n"
-                "Step 1: Parse request and determine tool chain [DONE]\n"
-                "Step 2: Dispatch actions to MicroVM / cloud tools [IN PROGRESS]\n"
-                "Step 3: Verify outputs and synthesize final deliverable"
-            )
-            await asyncio.sleep(4.5)
-            await status_msg.edit_text(
-                f"{render_progress_bar(80)}\n\n"
-                "Current status: Synthesizing playbook & verifying state\n\n"
-                "The Step by Step plan:\n"
-                "Step 1: Parse request and determine tool chain [DONE]\n"
-                "Step 2: Dispatch actions to MicroVM / cloud tools [DONE]\n"
-                "Step 3: Verify outputs and synthesize final deliverable [IN PROGRESS]"
-            )
-        except Exception:
-            pass
+    # Telegram 4096 character limit safeguard: split into clean chunks
+    if len(reply) <= 4000:
+        await update.message.reply_text(reply)
+    else:
+        # Split message into chunks respecting line breaks where possible
+        chunks = []
+        current = ""
+        for line in reply.splitlines(keepends=True):
+            if len(current) + len(line) > 3900:
+                chunks.append(current)
+                current = line
+            else:
+                current += line
+        if current:
+            chunks.append(current)
+            
+        for chunk in chunks:
+            if chunk.strip():
+                await update.message.reply_text(chunk)
 
-    ticker_task = asyncio.create_task(progress_ticker())
-    
-    try:
-        reply = await generate_reasoning_response(user_text)
-    finally:
-        ticker_task.cancel()
-        
-    try:
-        await status_msg.edit_text(
-            f"{render_progress_bar(100)}\n\n"
-            "Current status: Task complete\n\n"
-            "The Step by Step plan:\n"
-            "Step 1: Parse request and determine tool chain [DONE]\n"
-            "Step 2: Dispatch actions to MicroVM / cloud tools [DONE]\n"
-            "Step 3: Verify outputs and synthesize final deliverable [DONE]"
-        )
-    except Exception:
-        pass
-        
-    await update.message.reply_text(reply)
 
 @api.on_event("startup")
 async def startup_event():
