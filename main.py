@@ -272,7 +272,7 @@ def render_progress_bar(percent: int) -> str:
     return f'Task/Project Progress\n[{bar}] {percent}%'
 
 def _sync_chat_call(model_name: str, message: str) -> str:
-    config = types.GenerateContentConfig(system_instruction=SYSTEM_INSTRUCTION, tools=ALL_TOOLS_LIST, temperature=0.2)
+    config = types.GenerateContentConfig(system_instruction=SYSTEM_INSTRUCTION, tools=ALL_TOOLS_LIST, temperature=0.2, max_remote_calls=25)
     client = get_current_gemini_client()
     if not client:
         raise RuntimeError('No Gemini API client configured.')
@@ -299,12 +299,12 @@ async def generate_reasoning_response(user_message: str) -> str:
         for _ in range(attempts):
             try:
                 logger.info(f'[Reasoning] Dispatching to: {model_name} (Key #{current_key_index + 1})')
-                reply = await asyncio.wait_for(asyncio.to_thread(_sync_chat_call, model_name, user_message), timeout=45.0)
+                reply = await asyncio.wait_for(asyncio.to_thread(_sync_chat_call, model_name, user_message), timeout=300.0)
                 if reply:
                     logger.info(f'[Reasoning] Response received from: {model_name}')
                     return reply
             except asyncio.TimeoutError:
-                logger.warning(f'[Timeout] Model {model_name} timed out (>45s). Trying next.')
+                logger.warning(f'[Timeout] Model {model_name} timed out (>300s). Trying next.')
                 last_error = f'{model_name}: Timed out'
                 break
             except Exception as e:
