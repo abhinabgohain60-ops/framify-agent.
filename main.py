@@ -58,22 +58,20 @@ def rotate_to_next_gemini_key():
         return True
     return False
 
-# High-RPM Flash models prioritized; gemini-pro-latest placed at the bottom
+# High-RPM production Flash models only (prevents 429 quota deadlocks)
 ACTIVE_GEMINI_MODELS: List[str] = [
     "gemini-2.5-flash",
-    "gemini-3.7-flash",
-    "gemini-3.5-flash",
-    "gemini-3.6-flash",
-    "gemini-3.8-flash",
+    "gemini-2.0-flash",
     "gemini-flash-latest",
     "gemini-flash-lite-latest",
-    "gemini-3.1-flash-lite",
-    "gemini-pro-latest"
+    "gemini-3.7-flash",
+    "gemini-3.5-flash",
+    "gemini-3.1-flash-lite"
 ]
 
 def discover_available_models():
     global ACTIVE_GEMINI_MODELS
-    logger.info(f"[Active Verified Models]: {ACTIVE_GEMINI_MODELS}")
+    logger.info(f"[Active Verified Cascade]: {ACTIVE_GEMINI_MODELS}")
 
 def github_read_file(repo_name: str, file_path: str) -> str:
     token = GITHUB_TOKEN or ""
@@ -127,18 +125,18 @@ def execute_in_cloud_microvm(code: str) -> str:
         from e2b_code_interpreter import Sandbox
         import requests as req
 
-        logger.info("Starting E2B microVM session...")
-        # Sandbox lifetime extended to 600s
+        logger.info("Starting official E2B Sandbox session...")
+        # Lifetime set to 600 seconds
         sbx = Sandbox.create(api_key=E2B_API_KEY, timeout=600)
         
-        # Fast, non-blocking provisioning with timeout=0
+        # Provisioning without command timeout limits (timeout=0)
         setup_cmd = (
             "command -v ffmpeg >/dev/null 2>&1 || (sudo apt-get update -qq && sudo apt-get install -y -qq ffmpeg) && "
             "pip install --quiet --no-cache-dir pillow \"numpy<2\" scipy edge-tts"
         )
         sbx.commands.run(setup_cmd, timeout=0)
         
-        # Execute the user script with timeout=0 (unlimited time for rendering)
+        # Write task script and run with timeout=0
         sbx.files.write("/home/user/run_task.py", code)
         exec_res = sbx.commands.run("python /home/user/run_task.py", timeout=0)
         
@@ -156,7 +154,7 @@ def execute_in_cloud_microvm(code: str) -> str:
                         tg_res = req.post(send_url, data=data, files=upload_files, timeout=120)
                         if tg_res.status_code == 200:
                             found_video = True
-                            logger.info(f"Uploaded {f.name} to Telegram via HTTP API.")
+                            logger.info(f"Directly uploaded {f.name} to Telegram via HTTP API!")
                         else:
                             logger.error(f"Telegram upload failed: {tg_res.text}")
                     break
@@ -186,9 +184,9 @@ def extract_video_knowledge(url: str) -> str:
                 if items:
                     snippet = items[0].get("snippet", {})
                     return f"YOUTUBE METADATA EXTRACTED:\nTitle: {snippet.get('title')}\nDescription: {snippet.get('description', '')[:1200]}"
-        return f"Processed URL: {url}. Knowledge extracted."
+        return f"Video extracted from URL: {url}"
     except Exception as e:
-        return f"Video knowledge extraction notice: {str(e)}"
+        return f"Extraction note: {str(e)}"
 
 def supabase_db_query(table: str, operation: str = "select", query_filter: Optional[str] = None, data: Optional[Dict[str, Any]] = None) -> str:
     if not SUPABASE_URL or not SUPABASE_KEY:
@@ -206,7 +204,7 @@ def supabase_db_query(table: str, operation: str = "select", query_filter: Optio
         elif operation == "delete" and query_filter:
             res = requests.delete(f"{url}?{query_filter}", headers=headers, timeout=10)
             return f"Delete status: {res.status_code} (Filter: {query_filter})"
-        return f"Unsupported operation or missing filter/data: {operation}"
+        return f"Unsupported operation: {operation}"
     except Exception as e:
         return f"Supabase error: {str(e)}"
 
@@ -220,7 +218,7 @@ def huggingface_task_runner(model_id: str, inputs: Any) -> str:
         res = requests.post(url, headers=headers, json=payload, timeout=25)
         if res.status_code == 200:
             return json.dumps(res.json())
-        return f"HF Inference Error ({res.status_code}): {res.text}"
+        return f"HF Error ({res.status_code}): {res.text}"
     except Exception as e:
         return f"HuggingFace runner error: {str(e)}"
 
@@ -310,10 +308,10 @@ ALL_TOOLS_LIST = [
 SYSTEM_INSTRUCTION = """You are Chintu, an autonomous execution assistant.
 
 STRICT OPERATIONAL DIRECTIVES:
-1. NEVER FAKE OR HALLUCINATE TOOL EXECUTION: Never claim you executed code, modified a file, or completed a sandbox task unless you invoked the tool and received a valid response.
-2. ACTION-FIRST PRINCIPLE: When asked to execute code, read/write files, or render media, IMMEDIATELY call the appropriate tool (e.g., execute_in_cloud_microvm, github_read_file, github_commit_file).
-3. VIDEO GENERATION: Never import `moviepy.editor`. Always render image frames using Pillow and stitch them with system `ffmpeg` via subprocess.
-4. CONCISE FACTUAL OUTPUT: Keep text concise, factual, and directly related to actual tool outputs. Report only ground truth from execution stdout/stderr.
+1. NEVER FAKE OR HALLUCINATE TOOL EXECUTION: Never claim you executed code or modified a file unless you invoked the tool and received a valid tool response.
+2. ACTION-FIRST PRINCIPLE: When asked to execute code, render video, or read/write files, IMMEDIATELY call execute_in_cloud_microvm or the corresponding tool.
+3. VIDEO GENERATION: Never import `moviepy.editor`. Render frames using Pillow/NumPy and stitch them natively using system `ffmpeg` via subprocess.
+4. CONCISE FACTUAL OUTPUT: Report only actual ground truth from tool execution stdout and stderr.
 """
 
 def _sync_chat_call(model_name: str, message: str) -> str:
@@ -338,56 +336,56 @@ def _sync_chat_call(model_name: str, message: str) -> str:
             return "".join(parts_out)
     return "Action completed successfully."
 
+# Autonomous code-driven model failover engine
 async def generate_reasoning_response(user_message: str) -> str:
     global current_key_index
     if not GEMINI_API_KEYS:
         return "Gemini API client not initialized. Verify GEMINI_API_KEY in Render."
+    
     last_error = ""
+    
+    # Iterate through models. If a model succeeds, STOP and return immediately.
     for model_name in ACTIVE_GEMINI_MODELS:
-        attempts = len(GEMINI_API_KEYS) if GEMINI_API_KEYS else 1
-        for _ in range(attempts):
+        logger.info(f"[Cascade Engine] Attempting model: {model_name}...")
+        
+        # Try each available API key for the current model
+        for key_slot in range(len(GEMINI_API_KEYS)):
             try:
-                logger.info(f"[Reasoning] Dispatching to: {model_name} (Key #{current_key_index + 1})")
+                logger.info(f"[Cascade Engine] Testing {model_name} (API Key #{current_key_index + 1})")
+                # Extended 600s window (10 minutes) for heavy video tasks
                 reply = await asyncio.wait_for(
                     asyncio.to_thread(_sync_chat_call, model_name, user_message),
-                    timeout=300.0
+                    timeout=600.0
                 )
                 
-                # Up to 3 continuation rounds (5 mins each) if a long task is ongoing
-                continuation_rounds = 0
-                while reply and continuation_rounds < 3:
-                    reply_lower = reply.lower()
-                    if any(phrase in reply_lower for phrase in ["in progress", "incomplete", "unfinished", "continuing task", "running next step"]):
-                        logger.info(f"[Continuation] Task ongoing. Granting additional 5-minute window (Round {continuation_rounds + 1}/3)...")
-                        continuation_rounds += 1
-                        followup = f"Previous step result:\n{reply}\n\nPlease continue with the next step until the task is fully finished."
-                        more = await asyncio.wait_for(
-                            asyncio.to_thread(_sync_chat_call, model_name, followup),
-                            timeout=300.0
-                        )
-                        if more:
-                            reply += f"\n\n---\n{more}"
-                        else:
-                            break
-                    else:
-                        break
-
-                if reply:
-                    logger.info(f"[Reasoning] Response received from: {model_name}")
+                # If the model responds cleanly, we stop switching and return
+                if reply and not any(err_word in reply.lower() for err_word in ["resource_exhausted", "503 unavailable"]):
+                    logger.info(f"[Cascade Engine] SUCCESS: Model {model_name} is active and fulfilled request.")
                     return reply
+                else:
+                    logger.warning(f"[Cascade Engine] Model {model_name} returned unserviceable response. Failing over...")
+                    rotate_to_next_gemini_key()
+                    continue
+                    
             except asyncio.TimeoutError:
-                logger.warning(f"[Timeout] Model {model_name} timed out (>300s). Trying next.")
-                last_error = f"{model_name}: Timed out (>300s)"
-                break
+                logger.warning(f"[Cascade Engine] Model {model_name} timed out (>600s). Moving to next model.")
+                last_error = f"{model_name}: Execution timed out (>600s)"
+                break  # Move to next model
+                
             except Exception as e:
                 err_str = str(e)
                 last_error = f"{model_name}: {err_str}"
-                logger.warning(f"[Model Failed] {model_name} (Key #{current_key_index + 1}): {err_str}")
+                logger.warning(f"[Cascade Engine] Model {model_name} encountered error: {err_str}")
+                
+                # If rate limited, rotate key and test next slot
                 if "429" in err_str or "RESOURCE_EXHAUSTED" in err_str:
-                    if rotate_to_next_gemini_key():
-                        continue
-                break
-    return f"All verified models failed in cascade. Details:\n{last_error}"
+                    rotate_to_next_gemini_key()
+                    continue
+                else:
+                    # Unrecoverable model error (503, invalid config, etc.) -> move directly to next model
+                    break
+                    
+    return f"All verified cascade models failed. Details:\n{last_error}"
 
 api = FastAPI(title="Chintu HMAS AI Engineer")
 
@@ -433,18 +431,6 @@ async def handle_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.message:
         await update.message.reply_text("Chintu HMAS AI Engineer online. Systems operational.")
 
-async def update_telegram_status(pct: int, status_text: str):
-    global CURRENT_STATUS_MSG
-    if CURRENT_STATUS_MSG:
-        try:
-            total_slots = 30
-            filled = max(0, min(total_slots, int(pct / 100.0 * total_slots)))
-            bar = "=" * filled + "-" * (total_slots - filled)
-            card = f"Task/Project Progress\n[{bar}] {pct}%\n\nCurrent status: {status_text}"
-            await CURRENT_STATUS_MSG.edit_text(card)
-        except Exception:
-            pass
-
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global CURRENT_CHAT_ID, CURRENT_STATUS_MSG, TELEGRAM_BOT_INSTANCE
     user_msg = update.message.text
@@ -454,7 +440,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     TELEGRAM_BOT_INSTANCE = context.bot
     logger.info(f"Incoming message: {user_msg}")
     
-    # 1. Immediately send live status bar at 15%
+    # 1. Immediately post live progress bar card at 15%
     try:
         total_slots = 30
         filled = int(15 / 100.0 * total_slots)
@@ -466,10 +452,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logger.warning(f"Could not dispatch initial status card: {e}")
         CURRENT_STATUS_MSG = None
 
-    # 2. Execute reasoning cascade
+    # 2. Execute fail-safe code cascade
     reply = await generate_reasoning_response(user_msg)
     
-    # 3. Update status bar to 100% complete
+    # 3. Update status card to 100% complete
     if CURRENT_STATUS_MSG:
         try:
             full_bar = "=" * 30
@@ -479,7 +465,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception:
             pass
 
-    # 4. Deliver response payload
+    # 4. Deliver response text payload
     if len(reply) <= 4000:
         await update.message.reply_text(reply)
     else:
