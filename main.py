@@ -272,7 +272,7 @@ def render_progress_bar(percent: int) -> str:
     return f'Task/Project Progress\n[{bar}] {percent}%'
 
 def _sync_chat_call(model_name: str, message: str) -> str:
-    config = types.GenerateContentConfig(system_instruction=SYSTEM_INSTRUCTION, tools=ALL_TOOLS_LIST, temperature=0.2, max_remote_calls=25)
+    config = types.GenerateContentConfig(system_instruction=SYSTEM_INSTRUCTION, tools=ALL_TOOLS_LIST, temperature=0.2)
     client = get_current_gemini_client()
     if not client:
         raise RuntimeError('No Gemini API client configured.')
