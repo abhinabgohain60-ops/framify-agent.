@@ -104,14 +104,14 @@ def execute_in_cloud_microvm(code: str) -> str:
         import requests as req
 
         logger.info("Starting official E2B Sandbox session...")
-        sbx = Sandbox.create(api_key=E2B_API_KEY)
+        sbx = Sandbox.create(api_key=E2B_API_KEY, timeout=300)
         
-        # Ensure dependencies
-        sbx.commands.run("sudo apt-get update -qq && sudo apt-get install -y -qq ffmpeg && pip install --quiet pillow \"numpy<2\" scipy edge-tts")
+        # Ensure dependencies with proper timeout settings
+        sbx.commands.run("sudo apt-get update -qq && sudo apt-get install -y -qq ffmpeg && pip install --quiet pillow \"numpy<2\" scipy edge-tts", timeout=120)
         
-        # Write script to file and run it cleanly
+        # Write script to file and run it cleanly with generous timeout (240 seconds)
         sbx.files.write("/home/user/run_task.py", code)
-        exec_res = sbx.commands.run("python /home/user/run_task.py")
+        exec_res = sbx.commands.run("python /home/user/run_task.py", timeout=240)
         
         found_video = False
         try:
@@ -143,8 +143,6 @@ def execute_in_cloud_microvm(code: str) -> str:
     except Exception as e:
         logger.error(f"E2B Execution error: {e}", exc_info=True)
         return f"Sandbox Execution Error:\n{traceback.format_exc()}"
-
-
 
 def extract_video_knowledge(url: str) -> str:
     """Extract transcripts, audio descriptions, and editing metadata from YouTube and Instagram video URLs."""
@@ -366,10 +364,10 @@ async def render_and_send_video(script_code: str, output_filename: str='intro.mp
         from e2b_code_interpreter import Sandbox
         import io
         logger.info(f'Launching E2B Sandbox for video rendering: {output_filename}')
-        sbx = Sandbox.create(api_key=E2B_API_KEY)
-        sbx.commands.run('pip install --quiet pillow numpy moviepy imageio[ffmpeg]')
+        sbx = Sandbox.create(api_key=E2B_API_KEY, timeout=300)
+        sbx.commands.run('pip install --quiet pillow numpy moviepy imageio[ffmpeg]', timeout=120)
         sbx.files.write('/home/user/render.py', script_code)
-        exec_res = sbx.commands.run('python /home/user/render.py')
+        exec_res = sbx.commands.run('python /home/user/render.py', timeout=240)
         if exec_res.error:
             sbx.kill()
             return f'Video render failed during execution: {exec_res.error}'
@@ -394,7 +392,6 @@ async def render_and_send_video(script_code: str, output_filename: str='intro.mp
         logger.error(f'render_and_send_video failed: {e}', exc_info=True)
         return f'Error rendering video: {str(e)}'
 
-
 CURRENT_STATUS_MSG = None
 
 async def update_telegram_status(pct: int, status_text: str):
@@ -418,7 +415,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     TELEGRAM_BOT_INSTANCE = context.bot
     logger.info(f'Incoming message: {user_msg}')
     
-    # 1. Dispatch immediate live status card (15%)
     try:
         total_slots = 30
         filled = int(15 / 100.0 * total_slots)
@@ -430,10 +426,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logger.warning(f"Could not dispatch initial status card: {e}")
         CURRENT_STATUS_MSG = None
 
-    # 2. Run execution pipeline
     reply = await generate_reasoning_response(user_msg)
     
-    # 3. Update status card to 100% Complete
     if CURRENT_STATUS_MSG:
         try:
             full_bar = "=" * 30
@@ -443,7 +437,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception:
             pass
 
-    # 4. Deliver full response payload
     if len(reply) <= 4000:
         await update.message.reply_text(reply)
     else:
