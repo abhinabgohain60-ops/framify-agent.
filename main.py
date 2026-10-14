@@ -388,8 +388,37 @@ async def render_and_send_video(script_code: str, output_filename: str='intro.mp
         logger.error(f'render_and_send_video failed: {e}', exc_info=True)
         return f'Error rendering video: {str(e)}'
 
+
+# -------------------------------------------------------------
+# LIVE TELEGRAM STATUS BAR ENGINE
+# -------------------------------------------------------------
+CURRENT_STATUS_MSG = None
+
+def get_progress_bar(pct: int) -> str:
+    filled = int(pct / 100 * 30)
+    bar = "=" * filled + "-" * (30 - filled)
+    return f"Task/Project Progress\n[{bar}] {pct}%"
+
+async def update_live_status(text: str, pct: int = 50):
+    global CURRENT_STATUS_MSG
+    if CURRENT_STATUS_MSG:
+        try:
+            bar_text = f"{get_progress_bar(pct)}\n\nCurrent status: {text}"
+            await CURRENT_STATUS_MSG.edit_text(bar_text)
+        except Exception:
+            pass
+
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_msg = update.message.text
+    global CURRENT_CHAT_ID, CURRENT_STATUS_MSG
+    CURRENT_CHAT_ID = update.message.chat_id
+    try:
+        CURRENT_STATUS_MSG = await update.message.reply_text(
+            f"{get_progress_bar(15)}\n\nCurrent status: Initializing reasoning & tool pipeline..."
+        )
+    except Exception as e:
+        logger.warning(f"Failed to post initial status card: {e}")
+        CURRENT_STATUS_MSG = None
     global CURRENT_CHAT_ID, TELEGRAM_BOT_INSTANCE
     CURRENT_CHAT_ID = update.message.chat_id
     TELEGRAM_BOT_INSTANCE = context.bot
