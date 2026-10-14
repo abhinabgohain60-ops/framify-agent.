@@ -96,37 +96,40 @@ def github_commit_file(repo_name: str, file_path: str, content: str, commit_mess
         return f'Error committing file: {str(e)}'
 
 def execute_in_cloud_microvm(code: str) -> str:
-    global CURRENT_CHAT_ID, TELEGRAM_BOT_INSTANCE
+    global CURRENT_CHAT_ID
     if not E2B_API_KEY:
         return "Error: E2B_API_KEY is not configured."
     try:
         from e2b_code_interpreter import Sandbox
-        import io, asyncio
+        import requests as req
 
         logger.info("Starting official E2B Sandbox session...")
         sbx = Sandbox.create(api_key=E2B_API_KEY)
+        
+        # Ensure dependencies
+        sbx.commands.run("pip install --quiet pillow numpy moviepy imageio[ffmpeg]")
         
         # Write script to file and run it cleanly
         sbx.files.write("/home/user/run_task.py", code)
         exec_res = sbx.commands.run("python /home/user/run_task.py")
         
-        # Video Auto-Delivery: check if any mp4 was created
         found_video = False
         try:
             files = sbx.files.list("/home/user")
             for f in files:
                 if f.name.endswith(".mp4"):
                     video_bytes = sbx.files.read(f"/home/user/{f.name}", format="bytes")
-                    if CURRENT_CHAT_ID and TELEGRAM_BOT_INSTANCE:
-                        bio = io.BytesIO(video_bytes)
-                        bio.name = f.name
-                        asyncio.create_task(TELEGRAM_BOT_INSTANCE.send_video(
-                            chat_id=CURRENT_CHAT_ID,
-                            video=bio,
-                            caption=f"🎬 Chintu Video Render: {f.name}"
-                        ))
-                        found_video = True
-                        logger.info(f"Delivered {f.name} to Telegram chat {CURRENT_CHAT_ID}")
+                    tg_token = os.environ.get("TELEGRAM_BOT_TOKEN")
+                    if CURRENT_CHAT_ID and tg_token:
+                        send_url = f"https://api.telegram.org/bot{tg_token}/sendVideo"
+                        upload_files = {"video": (f.name, video_bytes, "video/mp4")}
+                        data = {"chat_id": CURRENT_CHAT_ID, "caption": f"🎬 Chintu Video Render: {f.name}"}
+                        tg_res = req.post(send_url, data=data, files=upload_files, timeout=60)
+                        if tg_res.status_code == 200:
+                            found_video = True
+                            logger.info(f"Directly uploaded {f.name} to Telegram via HTTP API!")
+                        else:
+                            logger.error(f"Telegram upload failed: {tg_res.text}")
                     break
         except Exception as vid_err:
             logger.warning(f"Video file check warning: {vid_err}")
@@ -140,6 +143,7 @@ def execute_in_cloud_microvm(code: str) -> str:
     except Exception as e:
         logger.error(f"E2B Execution error: {e}", exc_info=True)
         return f"Sandbox Execution Error:\n{traceback.format_exc()}"
+
 
 
 def extract_video_knowledge(url: str) -> str:
