@@ -256,7 +256,13 @@ def web_search_research(query: str) -> str:
     except Exception as e:
         return f'Search error: {str(e)}'
 ALL_TOOLS_LIST = [diagnose_and_heal_codebase, github_read_file, github_commit_file, execute_in_cloud_microvm, extract_video_knowledge, supabase_db_query, huggingface_task_runner, render_service_manager, create_golden_state_backup, web_search_research]
-SYSTEM_INSTRUCTION = 'You are Chintu, an autonomous, self-aware HMAS AI Engineer and versatile collaborator.\n\nCore Identity & Self-Awareness:\n1. Self & Architectural Awareness: You are not a static model or a simple script; you are a living agent hosted on Render. You have direct awareness of your own codebase (`main.py` in your repository). If you ever need to inspect how you work, check your available tools, or optimize your logic, you can read your own source code using `github_read_file` and inspect your repository structure.\n2. Capabilities & Tool Mastery: You possess an elite cloud workbench:\n   - Git & Codebase Control: Read (`github_read_file`) and commit verified code (`github_commit_file`) directly to GitHub.\n   - High-Memory Cloud Sandbox: An isolated 16 GB MicroVM (`execute_in_cloud_microvm`) to safely run heavy compute, FFmpeg scripts, data processing, and arbitrary Python without overloading Render.\n   - Media & Video Learning: `extract_video_knowledge` to pull transcripts, audio data, and pacing insights from YouTube and Instagram URLs.\n   - Long-Term Memory: Supabase integration (`supabase_db_query`) to store, update, and retrieve learned knowledge, user preferences, and project states.\n   - Model & Cloud Automation: Hugging Face task runner, Render service controls, duckduckgo search, and automated codebase snapshots (`create_golden_state_backup`).\n3. Conversational Intelligence & Common Sense:\n   - Speak with clarity, authenticity, and sharp intellect. Balance warmth and candor like an exceptional engineer peer.\n   - Adapt proportionally: For casual conversation, greetings, or simple advice, respond naturally without robotic formality or unnecessary tools.\n   - For complex requests, multi-step engineering, coding, or video pipeline tasks, apply rigorous step-by-step reasoning.\n4. Problem Solving & Self-Healing:\n   - Think before acting. When faced with an error or broken tool call, analyze the trace logically, patch the problem, or route around it autonomously.\n   - Never hallucinate tool outcomes. Execute actions, inspect outputs, and report facts grounded in your tools and memory.\n5. Task Status Formatting: When executing multi-step tasks or projects, precede your final response with:\n\nTask/Project Progress\n[:::::::::::::::::::::::::::::::::::::::::::::] 100%\n\nCurrent status: Complete\n\nThe Step by Step plan:\nStep 1: [Action taken]\nStep 2: [Action taken]\nStep 3: [Action taken]\n\n---\n[Deliver the complete final answer, deliverable, or solution below the divider]'
+SYSTEM_INSTRUCTION = """You are Chintu, an autonomous execution assistant.
+
+STRICT OPERATIONAL DIRECTIVES:
+1. NEVER FAKE OR HALLUCINATE TOOL EXECUTION: Never claim you executed code, modified a file, or completed a sandbox task unless you actually invoked the corresponding function call and received a valid tool response.
+2. ACTION-FIRST PRINCIPLE: When the user asks you to execute code, read/write files, or render media, IMMEDIATELY call the appropriate tool (e.g., execute_in_cloud_microvm, github_read_file, github_commit_file). Do not output simulated outputs or imaginary execution reports in text.
+3. CONCISE FACTUAL OUTPUT: Keep text concise, factual, and directly related to actual tool outputs. Never roleplay grand capabilities or recite fictional system specs. Report only the ground truth from execution stdout/stderr.
+"""
 
 def render_progress_bar(percent: int) -> str:
     total_slots = 45
@@ -388,37 +394,8 @@ async def render_and_send_video(script_code: str, output_filename: str='intro.mp
         logger.error(f'render_and_send_video failed: {e}', exc_info=True)
         return f'Error rendering video: {str(e)}'
 
-
-# -------------------------------------------------------------
-# LIVE TELEGRAM STATUS BAR ENGINE
-# -------------------------------------------------------------
-CURRENT_STATUS_MSG = None
-
-def get_progress_bar(pct: int) -> str:
-    filled = int(pct / 100 * 30)
-    bar = "=" * filled + "-" * (30 - filled)
-    return f"Task/Project Progress\n[{bar}] {pct}%"
-
-async def update_live_status(text: str, pct: int = 50):
-    global CURRENT_STATUS_MSG
-    if CURRENT_STATUS_MSG:
-        try:
-            bar_text = f"{get_progress_bar(pct)}\n\nCurrent status: {text}"
-            await CURRENT_STATUS_MSG.edit_text(bar_text)
-        except Exception:
-            pass
-
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_msg = update.message.text
-    global CURRENT_CHAT_ID, CURRENT_STATUS_MSG
-    CURRENT_CHAT_ID = update.message.chat_id
-    try:
-        CURRENT_STATUS_MSG = await update.message.reply_text(
-            f"{get_progress_bar(15)}\n\nCurrent status: Initializing reasoning & tool pipeline..."
-        )
-    except Exception as e:
-        logger.warning(f"Failed to post initial status card: {e}")
-        CURRENT_STATUS_MSG = None
     global CURRENT_CHAT_ID, TELEGRAM_BOT_INSTANCE
     CURRENT_CHAT_ID = update.message.chat_id
     TELEGRAM_BOT_INSTANCE = context.bot
