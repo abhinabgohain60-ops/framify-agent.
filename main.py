@@ -81,15 +81,42 @@ def discover_available_models():
     global ACTIVE_GEMINI_MODELS
     logger.info(f"[Active Verified Cascade]: {ACTIVE_GEMINI_MODELS}")
 
+def _github_headers() -> Dict[str, str]:
+    """Build GitHub API headers, omitting Authorization when no token is set.
+
+    GitHub rejects `Authorization: Bearer ` (empty token) with HTTP 401 Bad
+    credentials, so an unconditional header silently broke every read on
+    deployments without GITHUB_TOKEN. Public repos work anonymously.
+    """
+    headers = {"Accept": "application/vnd.github.v3+json"}
+    if GITHUB_TOKEN:
+        headers["Authorization"] = f"Bearer {GITHUB_TOKEN}"
+    return headers
+
 def github_read_file(repo_name: str, file_path: str) -> str:
-    token = GITHUB_TOKEN or ""
-    headers = {"Authorization": f"Bearer {token}", "Accept": "application/vnd.github.v3+json"}
+    headers = _github_headers()
     encoded_repo = repo_name.replace(".", "%2E") if repo_name.endswith(".") else repo_name
     url = f"https://api.github.com/repos/{encoded_repo}/contents/{file_path}"
     try:
         res = requests.get(url, headers=headers, timeout=10)
         if res.status_code == 200:
-            dl_url = res.json().get("download_url")
+            payload = res.json()
+            # The contents API returns a JSON array for directories (a bare
+            # .get() here would raise AttributeError on a list), and files that
+            # are binary blobs expose no download_url (fetching None raises
+            # MissingSchema). Handle both without killing the tool call.
+            if isinstance(payload, list):
+                names = [str(i.get("name")) for i in payload[:40] if isinstance(i, dict)]
+                return (
+                    f"GitHub Read Error: '{file_path}' in {repo_name} is a directory, not a file. "
+                    f"Entries: {', '.join(names)}"
+                )
+            dl_url = payload.get("download_url") if isinstance(payload, dict) else None
+            if not dl_url:
+                return (
+                    f"GitHub Read Error: '{file_path}' in {repo_name} has no downloadable "
+                    "content (binary blob or empty response)."
+                )
             return requests.get(dl_url, timeout=10).text
         return f"GitHub Read Error ({res.status_code}): {res.text}"
     except Exception as e:
@@ -101,8 +128,9 @@ def github_commit_file(repo_name: str, file_path: str, content: str, commit_mess
             ast.parse(content)
         except SyntaxError as syn_err:
             return f"Pre-commit AST check failed: SyntaxError on line {syn_err.lineno}: {syn_err.msg}"
-    token = GITHUB_TOKEN or ""
-    headers = {"Authorization": f"Bearer {token}", "Accept": "application/vnd.github.v3+json"}
+    if not GITHUB_TOKEN:
+        return "Commit aborted: GITHUB_TOKEN is not configured (GitHub rejects anonymous writes with 401)."
+    headers = _github_headers()
     encoded_repo = repo_name.replace(".", "%2E") if repo_name.endswith(".") else repo_name
     url = f"https://api.github.com/repos/{encoded_repo}/contents/{file_path}"
     try:
@@ -120,6 +148,60 @@ def github_commit_file(repo_name: str, file_path: str, content: str, commit_mess
         return f"Commit failed ({put_res.status_code}): {put_res.text}"
     except Exception as e:
         return f"Error committing file: {str(e)}"
+
+# ---------------------------------------------------------------------------
+# SKILL / KNOWLEDGE REGISTRY
+# Curated external repositories that teach Chintu to produce high-quality motion
+# graphics. The agent pulls the real docs at task time via `load_skill` instead
+# of guessing an API surface. Every slug is verified to exist on GitHub.
+# ---------------------------------------------------------------------------
+SKILL_REGISTRY: Dict[str, Dict[str, str]] = {
+    "hyperframes": {
+        "repo": "heygen-com/hyperframes",
+        "role": "primary_renderer",
+        "entrypoint": "README.md",
+        "summary": (
+            "Author HTML/CSS/GSAP compositions and render deterministic MP4 through a "
+            "headless browser plus FFmpeg. Purpose-built for agents."
+        ),
+    },
+    "gsap": {
+        "repo": "greensock/GSAP",
+        "role": "timeline_animation",
+        "entrypoint": "README.md",
+        "summary": (
+            "JavaScript timeline animation engine used to author seekable animation "
+            "inside HyperFrames compositions."
+        ),
+    },
+    "whisper": {
+        "repo": "openai/whisper",
+        "role": "audio_transcription",
+        "entrypoint": "README.md",
+        "summary": (
+            "Speech recognition for transcribing narration so captions and voice-over "
+            "timing can be generated."
+        ),
+    },
+    "motion_graphics_prompts": {
+        "repo": "songguoxs/awesome-video-prompts",
+        "role": "prompt_library",
+        "entrypoint": "README.md",
+        "summary": (
+            "Curated high-quality video/motion-graphics prompts (Veo/Kling/Hailuo) for "
+            "shot, camera, motion and style direction."
+        ),
+    },
+    "motion_skills": {
+        "repo": "iart-ai/motion-skills",
+        "role": "skill_library",
+        "entrypoint": "README.md",
+        "summary": (
+            "Open-source motion-design skills for coding agents: kinetic typography, "
+            "explainers, data visualization, short-form video and WebGL."
+        ),
+    },
+}
 
 CURRENT_CHAT_ID: Optional[int] = None
 CURRENT_STATUS_MSG = None
@@ -180,6 +262,17 @@ def prepare_task_source(code: str) -> str:
     logger.warning("[E2B Guard] Detected invalid Python syntax; wrapping task for safe shell execution.")
     return _wrap_shell_as_python(code)
 
+def _find_rendered_video(sbx: Any, directory: str) -> Optional[str]:
+    """Return the sandbox path of the first ``.mp4`` in ``directory``, else None."""
+    try:
+        for entry in sbx.files.list(directory):
+            name = getattr(entry, "name", "") or ""
+            if name.lower().endswith(".mp4"):
+                return f"{directory.rstrip('/')}/{name}"
+    except Exception:
+        return None
+    return None
+
 def execute_in_cloud_microvm(code: str) -> str:
     global CURRENT_CHAT_ID
     if not E2B_API_KEY:
@@ -207,22 +300,25 @@ def execute_in_cloud_microvm(code: str) -> str:
 
         found_video = False
         try:
-            files = sbx.files.list("/home/user")
-            for f in files:
-                if f.name.endswith(".mp4"):
-                    video_bytes = sbx.files.read(f"/home/user/{f.name}", format="bytes")
-                    tg_token = os.environ.get("TELEGRAM_BOT_TOKEN")
-                    if CURRENT_CHAT_ID and tg_token:
-                        send_url = f"https://api.telegram.org/bot{tg_token}/sendVideo"
-                        upload_files = {"video": (f.name, video_bytes, "video/mp4")}
-                        data = {"chat_id": CURRENT_CHAT_ID, "caption": f"🎬 Chintu Video Render: {f.name}"}
-                        tg_res = req.post(send_url, data=data, files=upload_files, timeout=120)
-                        if tg_res.status_code == 200:
-                            found_video = True
-                            logger.info(f"Directly uploaded {f.name} to Telegram via HTTP API!")
-                        else:
-                            logger.error(f"Telegram upload failed: {tg_res.text}")
-                    break
+            tg_token = os.environ.get("TELEGRAM_BOT_TOKEN")
+            # Renders frequently land in an output/ subdir, so scan both roots.
+            for scan_dir in ("/home/user", "/home/user/output"):
+                video_path = _find_rendered_video(sbx, scan_dir)
+                if not video_path:
+                    continue
+                video_bytes = sbx.files.read(video_path, format="bytes")
+                if CURRENT_CHAT_ID and tg_token:
+                    file_name = video_path.rsplit("/", 1)[-1]
+                    send_url = f"https://api.telegram.org/bot{tg_token}/sendVideo"
+                    upload_files = {"video": (file_name, video_bytes, "video/mp4")}
+                    data = {"chat_id": CURRENT_CHAT_ID, "caption": f"🎬 Chintu Video Render: {file_name}"}
+                    tg_res = req.post(send_url, data=data, files=upload_files, timeout=120)
+                    if tg_res.status_code == 200:
+                        found_video = True
+                        logger.info(f"Directly uploaded {file_name} to Telegram via HTTP API!")
+                    else:
+                        logger.error(f"Telegram upload failed: {tg_res.text}")
+                break
         except Exception as vid_err:
             logger.warning(f"Video file check warning: {vid_err}")
 
@@ -353,13 +449,56 @@ def create_golden_state_backup(tag: str = "stable_snapshot") -> str:
     res = github_commit_file(DEFAULT_REPO, backup_file, current_code, f"Create Golden State backup: {tag}")
     return f"BACKUP COMPLETE: Created {backup_file}. Commit status: {res}"
 
+_HTML_BLOCK_RE = re.compile(r"(?is)<(script|style|head|noscript)[^>]*>.*?</\1>")
+_HTML_TAG_RE = re.compile(r"<[^>]+>")
+_HTML_GAP_RE = re.compile(r"\n{3,}")
+
+def _strip_html(raw: str, limit: int = 2000) -> str:
+    """Reduce a scraped HTML page to readable text so it cannot flood model context."""
+    text = _HTML_BLOCK_RE.sub(" ", raw or "")
+    text = _HTML_TAG_RE.sub(" ", text)
+    for entity, char in (("&nbsp;", " "), ("&amp;", "&"), ("&quot;", '"'), ("&#x27;", "'"), ("&#39;", "'"), ("&lt;", "<"), ("&gt;", ">")):
+        text = text.replace(entity, char)
+    text = re.sub(r"[ \t]+", " ", text)
+    text = _HTML_GAP_RE.sub("\n\n", text).strip()
+    return text[:limit]
+
 def web_search_research(query: str) -> str:
+    """Search the web and return readable text (HTML is stripped from the result)."""
     try:
         url = "https://html.duckduckgo.com/html/"
         res = requests.post(url, data={"q": query}, headers={"User-Agent": "Mozilla/5.0"}, timeout=10)
-        return res.text[:2000]
+        if res.status_code != 200:
+            return f"Search error: HTTP {res.status_code} returned by DuckDuckGo."
+        return _strip_html(res.text)
     except Exception as e:
         return f"Search error: {str(e)}"
+
+def list_skills() -> str:
+    """List every external skill/knowledge repository Chintu can draw on."""
+    lines = [
+        f"- {name} [{meta['role']}] -> {meta['repo']}\n  {meta['summary']}"
+        for name, meta in SKILL_REGISTRY.items()
+    ]
+    return "AVAILABLE SKILLS:\n" + "\n".join(lines)
+
+def load_skill(skill_name: str, file_path: str = "") -> str:
+    """Read documentation or source from one registered skill repository.
+
+    Args:
+        skill_name: Registry key, e.g. 'hyperframes', 'gsap', 'whisper',
+            'motion_graphics_prompts' or 'motion_skills'.
+        file_path: Optional repo-relative path. Defaults to the skill's entrypoint.
+    """
+    key = (skill_name or "").strip().lower().replace("-", "_").replace(" ", "_")
+    meta = SKILL_REGISTRY.get(key)
+    if not meta:
+        return f"Unknown skill '{skill_name}'. Available skills: {', '.join(SKILL_REGISTRY)}"
+    target = (file_path or meta.get("entrypoint") or "README.md").strip().strip("/")
+    content = github_read_file(meta["repo"], target)
+    if len(content) > 6000:
+        content = content[:6000] + "\n...[truncated by load_skill]"
+    return f"SKILL '{key}' :: {meta['repo']} :: {target}\n{content}"
 
 ALL_TOOLS_LIST = [
     diagnose_and_heal_codebase,
@@ -371,7 +510,9 @@ ALL_TOOLS_LIST = [
     huggingface_task_runner,
     render_service_manager,
     create_golden_state_backup,
-    web_search_research
+    web_search_research,
+    list_skills,
+    load_skill
 ]
 
 SYSTEM_INSTRUCTION = """You are Chintu, an autonomous execution assistant.
@@ -382,6 +523,8 @@ STRICT OPERATIONAL DIRECTIVES:
 3. VIDEO GENERATION: Importing `moviepy.editor` is STRICTLY FORBIDDEN and will break the sandbox. For ANY video task, write a pure Python rendering script: generate frames with Pillow + NumPy, then stitch them into the final `.mp4` natively by calling the system `ffmpeg` binary through `subprocess`.
 4. CONCISE FACTUAL OUTPUT: Report only actual ground truth from tool execution stdout and stderr.
 5. SANDBOX CODE HYGIENE: Submit a single, syntactically valid `run_task.py` (validate it with `ast.parse` before sending). Do not mix root-level shell commands (cat/curl/ffmpeg/...) into Python source; invoke them through `subprocess` when required.
+6. SKILL LIBRARY: You ship with a curated skill library. Call `list_skills` to enumerate it and `load_skill` to read the real documentation before writing code in an unfamiliar domain. For ANY motion-graphics or animated-video request, load `hyperframes`, `gsap` and `motion_graphics_prompts` FIRST, then follow the APIs you actually read instead of inventing signatures.
+7. MOTION GRAPHICS PIPELINE: Prefer authoring motion graphics as HTML/CSS with GSAP timelines in HyperFrames and pull the exact render/CLI steps from the loaded `hyperframes` docs. Keep directive 3 as the fallback path (pure Python + Pillow/NumPy frames stitched by system `ffmpeg`). Use `whisper` only when audio must be transcribed for captions or voice-over timing.
 """
 
 def _sync_chat_call(model_name: str, message: str) -> str:
@@ -416,6 +559,7 @@ def _sync_external_fallback(message: str) -> str:
         ],
         "temperature": 0.2,
     }
+    or_error = ""
 
     if OPENROUTER_API_KEY:
         headers = {
@@ -442,6 +586,7 @@ def _sync_external_fallback(message: str) -> str:
                 raise RuntimeError("OpenRouter returned an empty completion.")
             raise RuntimeError(f"OpenRouter error ({res.status_code}): {res.text[:500]}")
         except Exception as or_err:
+            or_error = str(or_err)
             logger.warning(f"[External Fallback] OpenRouter failed: {or_err}")
 
     if FREEBUFF_API_KEY:
@@ -465,6 +610,10 @@ def _sync_external_fallback(message: str) -> str:
                     return content
         raise RuntimeError(f"Freebuff error ({res.status_code}): {res.text[:500]}")
 
+    # Distinguish "OpenRouter was configured but broke" from "nothing configured",
+    # so the cascade error message points at the real cause.
+    if or_error:
+        raise RuntimeError(f"OpenRouter failed ({or_error}) and no usable Freebuff fallback is configured.")
     raise RuntimeError("No external fallback provider configured (set OPENROUTER_API_KEY).")
 
 # Autonomous code-driven model failover engine
@@ -553,6 +702,8 @@ def health_check():
         "service": "framify-agent",
         "active_models": ACTIVE_GEMINI_MODELS,
         "tools_count": len(ALL_TOOLS_LIST),
+        "skills": list(SKILL_REGISTRY.keys()),
+        "skills_count": len(SKILL_REGISTRY),
         "timestamp": datetime.utcnow().isoformat()
     }
 
