@@ -93,7 +93,29 @@ def _github_headers() -> Dict[str, str]:
         headers["Authorization"] = f"Bearer {GITHUB_TOKEN}"
     return headers
 
+# Unauthenticated GitHub allows only 60 requests/hour, and one skill load costs
+# two (contents + raw download), so a handful of motion-graphics turns would
+# exhaust it. Cache successful reads in-process with a TTL.
+GITHUB_CACHE_TTL_SECONDS = 900
+_GITHUB_RAW_CACHE: Dict[str, Any] = {}
+
+def _cache_get(repo_name: str, file_path: str) -> Optional[str]:
+    entry = _GITHUB_RAW_CACHE.get(f"{repo_name}/{file_path}")
+    if not entry:
+        return None
+    cached_at, text = entry
+    if (datetime.utcnow() - cached_at).total_seconds() > GITHUB_CACHE_TTL_SECONDS:
+        _GITHUB_RAW_CACHE.pop(f"{repo_name}/{file_path}", None)
+        return None
+    return text
+
+def _cache_put(repo_name: str, file_path: str, text: str) -> None:
+    _GITHUB_RAW_CACHE[f"{repo_name}/{file_path}"] = (datetime.utcnow(), text)
+
 def github_read_file(repo_name: str, file_path: str) -> str:
+    cached = _cache_get(repo_name, file_path)
+    if cached is not None:
+        return cached
     headers = _github_headers()
     encoded_repo = repo_name.replace(".", "%2E") if repo_name.endswith(".") else repo_name
     url = f"https://api.github.com/repos/{encoded_repo}/contents/{file_path}"
@@ -117,8 +139,17 @@ def github_read_file(repo_name: str, file_path: str) -> str:
                     f"GitHub Read Error: '{file_path}' in {repo_name} has no downloadable "
                     "content (binary blob or empty response)."
                 )
-            return requests.get(dl_url, timeout=10).text
-        return f"GitHub Read Error ({res.status_code}): {res.text}"
+            text = requests.get(dl_url, timeout=10).text
+            _cache_put(repo_name, file_path, text)
+            return text
+        # Anonymous rate limiting returns an HTML error page; surfacing that raw
+        # body buries the actual cause, so name it and say how to fix it.
+        if res.status_code == 403 and "rate limit" in res.text.lower():
+            return (
+                "GitHub Read Error (403): unauthenticated rate limit reached (60 req/hour). "
+                "Set GITHUB_TOKEN to lift this to 5,000 req/hour; already-loaded docs stay cached."
+            )
+        return f"GitHub Read Error ({res.status_code}): {res.text[:400]}"
     except Exception as e:
         return f"Error reading GitHub file: {str(e)}"
 
@@ -155,29 +186,52 @@ def github_commit_file(repo_name: str, file_path: str, content: str, commit_mess
 # graphics. The agent pulls the real docs at task time via `load_skill` instead
 # of guessing an API surface. Every slug is verified to exist on GitHub.
 # ---------------------------------------------------------------------------
-SKILL_REGISTRY: Dict[str, Dict[str, str]] = {
+# `docs` lists the REAL documentation files (skill routers, contracts and
+# references) rather than the repo landing README: a README explains what a
+# project *is*, the SKILL.md files explain how to author with it. Pointing
+# `load_skill` at README.md returned marketing copy and never the render loop.
+# Every slug and path below was verified to exist on GitHub.
+DEFAULT_SKILL_MAX_CHARS = 24000
+
+SKILL_REGISTRY: Dict[str, Dict[str, Any]] = {
     "hyperframes": {
         "repo": "heygen-com/hyperframes",
         "role": "primary_renderer",
-        "entrypoint": "README.md",
+        "entrypoint": "skills/hyperframes/SKILL.md",
+        "docs": [
+            "skills/hyperframes/SKILL.md",
+            "skills/hyperframes-core/SKILL.md",
+            "skills/hyperframes-core/references/minimal-composition.md",
+            "skills/hyperframes-core/references/sub-compositions.md",
+            "skills/hyperframes-cli/SKILL.md",
+            "skills/hyperframes-cli/references/preview-render.md",
+            "skills/motion-graphics/SKILL.md",
+        ],
+        "max_chars": 24000,
         "summary": (
             "Author HTML/CSS/GSAP compositions and render deterministic MP4 through a "
-            "headless browser plus FFmpeg. Purpose-built for agents."
+            "headless browser plus FFmpeg. 'docs' carries the router, the composition "
+            "contract (data-* timing, class=clip, one paused GSAP timeline) and the CLI."
         ),
     },
     "gsap": {
         "repo": "greensock/GSAP",
         "role": "timeline_animation",
         "entrypoint": "README.md",
+        "docs": ["README.md"],
+        "max_chars": 14000,
         "summary": (
             "JavaScript timeline animation engine used to author seekable animation "
-            "inside HyperFrames compositions."
+            "inside HyperFrames compositions. Use fromTo/stagger/ease, never CSS "
+            "transforms on a node you also tween."
         ),
     },
     "whisper": {
         "repo": "openai/whisper",
         "role": "audio_transcription",
         "entrypoint": "README.md",
+        "docs": ["README.md"],
+        "max_chars": 14000,
         "summary": (
             "Speech recognition for transcribing narration so captions and voice-over "
             "timing can be generated."
@@ -187,15 +241,20 @@ SKILL_REGISTRY: Dict[str, Dict[str, str]] = {
         "repo": "songguoxs/awesome-video-prompts",
         "role": "prompt_library",
         "entrypoint": "README.md",
+        "docs": ["README.md"],
+        "max_chars": 40000,
         "summary": (
-            "Curated high-quality video/motion-graphics prompts (Veo/Kling/Hailuo) for "
-            "shot, camera, motion and style direction."
+            "Curated shot/camera/motion/style prompts (Veo/Kling/Hailuo). The single "
+            "README is ~91k chars, so page it with load_skill(..., offset=...) instead "
+            "of assuming the first block is all of it."
         ),
     },
     "motion_skills": {
         "repo": "iart-ai/motion-skills",
         "role": "skill_library",
         "entrypoint": "README.md",
+        "docs": ["README.md"],
+        "max_chars": 18000,
         "summary": (
             "Open-source motion-design skills for coding agents: kinetic typography, "
             "explainers, data visualization, short-form video and WebGL."
@@ -273,6 +332,181 @@ def _find_rendered_video(sbx: Any, directory: str) -> Optional[str]:
         return None
     return None
 
+SANDBOX_TIMEOUT_SECONDS = int(os.environ.get("E2B_SANDBOX_TIMEOUT", "900"))
+HYPERFRAMES_VERSION = os.environ.get("HYPERFRAMES_VERSION", "0.8.160")
+HYPERFRAMES_SKILL = os.environ.get("HYPERFRAMES_SKILL", "motion-graphics")
+
+# Renders land here; a HyperFrames project writes into its own renders/ subdir.
+SANDBOX_VIDEO_SCAN_DIRS = ("/home/user", "/home/user/output", "/home/user/videos")
+
+# chrome-headless-shell links against these. Without them it dies instantly with
+# `error while loading shared libraries: libnspr4.so`, so the HyperFrames path is
+# unreachable on a bare sandbox image even when Node itself is present.
+CHROME_RUNTIME_PACKAGES = (
+    "libnspr4 libnss3 libatk1.0-0 libatk-bridge2.0-0 libcups2 libdrm2 "
+    "libxkbcommon0 libxcomposite1 libxdamage1 libxfixes3 libxrandr2 "
+    "libgbm1 libasound2 libpango-1.0-0 libcairo2 libatspi2.0-0 fonts-liberation"
+)
+
+# Mirrors `hyperframes init --example=blank` so the CLI finds a project without
+# an interactive scaffold step.
+HYPERFRAMES_PROJECT_CONFIG: Dict[str, Any] = {
+    "$schema": "https://hyperframes.heygen.com/schema/hyperframes.json",
+    "registry": "https://raw.githubusercontent.com/heygen-com/hyperframes/main/registry",
+    "paths": {
+        "blocks": "compositions",
+        "components": "compositions/components",
+        "assets": "assets",
+    },
+    "media": {"autoProxy": True},
+    "authoringSkill": HYPERFRAMES_SKILL,
+}
+
+def _deliver_rendered_video(sbx: Any, extra_dirs: Any = ()) -> bool:
+    """Upload the first rendered .mp4 found in the sandbox straight to Telegram."""
+    if not (CURRENT_CHAT_ID and TELEGRAM_BOT_TOKEN):
+        return False
+    for scan_dir in tuple(extra_dirs) + SANDBOX_VIDEO_SCAN_DIRS:
+        video_path = _find_rendered_video(sbx, scan_dir)
+        if not video_path:
+            continue
+        try:
+            video_bytes = sbx.files.read(video_path, format="bytes")
+            file_name = video_path.rsplit("/", 1)[-1]
+            send_url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendVideo"
+            upload_files = {"video": (file_name, video_bytes, "video/mp4")}
+            data = {"chat_id": CURRENT_CHAT_ID, "caption": f"🎬 Chintu Video Render: {file_name}"}
+            res = requests.post(send_url, data=data, files=upload_files, timeout=120)
+            if res.status_code == 200:
+                logger.info(f"Directly uploaded {file_name} to Telegram via HTTP API!")
+                return True
+            logger.error(f"Telegram upload failed: {res.text[:300]}")
+        except Exception as vid_err:
+            logger.warning(f"Video delivery warning: {vid_err}")
+    return False
+
+def _provision_render_toolchain(sbx: Any, want_browser: bool = False) -> str:
+    """Install the ffmpeg/frame stack, plus Node + Chrome when HyperFrames must render."""
+    base = (
+        "command -v ffmpeg >/dev/null 2>&1 || "
+        "(sudo apt-get update -qq && sudo apt-get install -y -qq ffmpeg) ; "
+        "pip install --quiet --no-cache-dir pillow \"numpy<2\" scipy edge-tts"
+    )
+    sbx.commands.run(base, timeout=0)
+    if not want_browser:
+        return "ffmpeg + python frame stack ready"
+    # Node is only needed for the HyperFrames renderer, so it is installed on
+    # this path alone rather than on every sandbox session.
+    browser_cmd = (
+        "sudo apt-get update -qq ; "
+        f"sudo apt-get install -y -qq {CHROME_RUNTIME_PACKAGES} curl ca-certificates ; "
+        "if ! command -v node >/dev/null 2>&1 || [ \"$(node -v | tr -d 'v' | cut -d. -f1)\" -lt 22 ]; then "
+        "curl -fsSL https://deb.nodesource.com/setup_22.x | sudo -E bash - >/dev/null 2>&1 ; "
+        "sudo apt-get install -y -qq nodejs ; fi ; "
+        f"npx --yes hyperframes@{HYPERFRAMES_VERSION} browser ensure"
+    )
+    res = sbx.commands.run(browser_cmd, timeout=0)
+    exit_code = getattr(res, "exit_code", "unknown")
+    logger.info(f"[HyperFrames] browser toolchain provisioning exit={exit_code}")
+    return f"browser toolchain exit={exit_code}"
+
+def _validate_composition_html(html: str) -> Optional[str]:
+    """Return an error string when `html` cannot be a renderable HyperFrames composition."""
+    if not isinstance(html, str) or not html.strip():
+        return "the composition HTML is empty."
+    if "data-composition-id" not in html:
+        return (
+            "no element carries data-composition-id, so HyperFrames has no composition "
+            "to mount. See the contract in load_skill('hyperframes')."
+        )
+    if "__timelines" not in html:
+        return (
+            "no timeline is registered. Register exactly one paused timeline with "
+            'window.__timelines["<data-composition-id>"] = gsap.timeline({paused: true}).'
+        )
+    if "moviepy" in html:
+        return "the composition references moviepy, which is forbidden in this pipeline."
+    return None
+
+def render_html_video(
+    html: str,
+    project_name: str = "chintu-motion",
+    fps: int = 30,
+    quality: str = "looks",
+) -> str:
+    """Render a HyperFrames HTML/GSAP composition to MP4 in the cloud VM and deliver it.
+
+    This is the executable form of directive 7: the composition is linted and then
+    rendered by the real `hyperframes` CLI (chrome-headless-shell + system ffmpeg),
+    so seekable GSAP timelines and deterministic frame capture stay the framework's
+    job instead of being hand-rolled.
+
+    Args:
+        html: The full composition document (root carries data-composition-id and
+            registers window.__timelines["<id>"] as one paused GSAP timeline).
+        project_name: Kebab-case project directory name under /home/user/videos.
+        fps: Frame rate recorded on the render (24-240; 30 typical).
+        quality: draft (fast iteration), looks (default) or delivery (final).
+    """
+    if not E2B_API_KEY:
+        return "Error: E2B_API_KEY is not configured."
+    problem = _validate_composition_html(html)
+    if problem:
+        return f"Composition rejected before render: {problem}"
+    slug = re.sub(r"[^a-z0-9-]+", "-", (project_name or "chintu-motion").lower()).strip("-")
+    slug = slug or "chintu-motion"
+    project_dir = f"/home/user/videos/{slug}"
+    sbx = None
+    try:
+        from e2b_code_interpreter import Sandbox
+
+        logger.info(f"Starting E2B sandbox for HyperFrames render of '{slug}'...")
+        sbx = Sandbox.create(api_key=E2B_API_KEY, timeout=SANDBOX_TIMEOUT_SECONDS)
+        provisioning = _provision_render_toolchain(sbx, want_browser=True)
+        sbx.commands.run(f"mkdir -p {project_dir}/renders", timeout=0)
+        sbx.files.write(f"{project_dir}/index.html", html)
+        sbx.files.write(
+            f"{project_dir}/hyperframes.json",
+            json.dumps(HYPERFRAMES_PROJECT_CONFIG, indent=2),
+        )
+
+        hf = f"npx --yes hyperframes@{HYPERFRAMES_VERSION}"
+        lint = sbx.commands.run(f"cd {project_dir} && {hf} lint .", timeout=0)
+        logger.info(f"[HyperFrames] lint exit={getattr(lint, 'exit_code', 'unknown')}")
+        render = sbx.commands.run(
+            f"cd {project_dir} && {hf} render . --skill={HYPERFRAMES_SKILL} "
+            f"-f {int(fps)} -q {quality} -o ./renders/video.mp4",
+            timeout=0,
+        )
+
+        delivered = _deliver_rendered_video(sbx, extra_dirs=(f"{project_dir}/renders",))
+        rendered_path = _find_rendered_video(sbx, f"{project_dir}/renders")
+        report = (
+            f"HyperFrames render :: {slug}\n"
+            f"provisioning: {provisioning}\n"
+            f"lint exit: {getattr(lint, 'exit_code', 'unknown')}\n"
+            f"lint output:\n{(getattr(lint, 'stdout', '') or '')[-1200:]}\n"
+            f"render exit: {getattr(render, 'exit_code', 'unknown')}\n"
+            f"render output:\n{(getattr(render, 'stdout', '') or '')[-2000:]}\n"
+        )
+        if getattr(render, "stderr", None):
+            report += f"render stderr:\n{render.stderr[-1200:]}\n"
+        if rendered_path:
+            report += f"[SUCCESS] MP4 written to {rendered_path}"
+            report += " and delivered to Telegram." if delivered else " (no Telegram chat bound)."
+        else:
+            report += "[FAILED] No .mp4 produced; read the render output above before retrying."
+        return report
+    except Exception as e:
+        logger.error(f"HyperFrames render error: {e}", exc_info=True)
+        return f"HyperFrames render error:\n{traceback.format_exc()}"
+    finally:
+        if sbx is not None:
+            try:
+                sbx.kill()
+            except Exception as kill_err:
+                logger.warning(f"Sandbox cleanup warning: {kill_err}")
+
 def execute_in_cloud_microvm(code: str) -> str:
     global CURRENT_CHAT_ID
     if not E2B_API_KEY:
@@ -280,47 +514,20 @@ def execute_in_cloud_microvm(code: str) -> str:
     sbx = None
     try:
         from e2b_code_interpreter import Sandbox
-        import requests as req
 
         logger.info("Starting official E2B Sandbox session...")
-        # Lifetime set to 600 seconds
-        sbx = Sandbox.create(api_key=E2B_API_KEY, timeout=600)
+        # Lifetime honours E2B_SANDBOX_TIMEOUT so long renders are not cut off mid-encode.
+        sbx = Sandbox.create(api_key=E2B_API_KEY, timeout=SANDBOX_TIMEOUT_SECONDS)
 
         # Provisioning without command timeout limits (timeout=0)
-        setup_cmd = (
-            "command -v ffmpeg >/dev/null 2>&1 || (sudo apt-get update -qq && sudo apt-get install -y -qq ffmpeg) && "
-            "pip install --quiet --no-cache-dir pillow \"numpy<2\" scipy edge-tts"
-        )
-        sbx.commands.run(setup_cmd, timeout=0)
+        _provision_render_toolchain(sbx, want_browser=False)
 
         # Pre-validate/harden the task source before it ever reaches the VM.
         safe_source = prepare_task_source(code)
         sbx.files.write("/home/user/run_task.py", safe_source)
         exec_res = sbx.commands.run("python /home/user/run_task.py", timeout=0)
 
-        found_video = False
-        try:
-            tg_token = os.environ.get("TELEGRAM_BOT_TOKEN")
-            # Renders frequently land in an output/ subdir, so scan both roots.
-            for scan_dir in ("/home/user", "/home/user/output"):
-                video_path = _find_rendered_video(sbx, scan_dir)
-                if not video_path:
-                    continue
-                video_bytes = sbx.files.read(video_path, format="bytes")
-                if CURRENT_CHAT_ID and tg_token:
-                    file_name = video_path.rsplit("/", 1)[-1]
-                    send_url = f"https://api.telegram.org/bot{tg_token}/sendVideo"
-                    upload_files = {"video": (file_name, video_bytes, "video/mp4")}
-                    data = {"chat_id": CURRENT_CHAT_ID, "caption": f"🎬 Chintu Video Render: {file_name}"}
-                    tg_res = req.post(send_url, data=data, files=upload_files, timeout=120)
-                    if tg_res.status_code == 200:
-                        found_video = True
-                        logger.info(f"Directly uploaded {file_name} to Telegram via HTTP API!")
-                    else:
-                        logger.error(f"Telegram upload failed: {tg_res.text}")
-                break
-        except Exception as vid_err:
-            logger.warning(f"Video file check warning: {vid_err}")
+        found_video = _deliver_rendered_video(sbx)
 
         out_msg = f"STDOUT:\n{exec_res.stdout}\nSTDERR:\n{exec_res.stderr}"
         if found_video:
@@ -476,19 +683,36 @@ def web_search_research(query: str) -> str:
 
 def list_skills() -> str:
     """List every external skill/knowledge repository Chintu can draw on."""
-    lines = [
-        f"- {name} [{meta['role']}] -> {meta['repo']}\n  {meta['summary']}"
-        for name, meta in SKILL_REGISTRY.items()
-    ]
+    lines = []
+    for name, meta in SKILL_REGISTRY.items():
+        docs = meta.get("docs") or [meta.get("entrypoint", "README.md")]
+        lines.append(
+            f"- {name} [{meta['role']}] -> {meta['repo']}\n"
+            f"  {meta['summary']}\n"
+            f"  docs: {', '.join(docs)}"
+        )
     return "AVAILABLE SKILLS:\n" + "\n".join(lines)
 
-def load_skill(skill_name: str, file_path: str = "") -> str:
+def load_skill(
+    skill_name: str,
+    file_path: str = "",
+    offset: int = 0,
+    max_chars: int = 0,
+) -> str:
     """Read documentation or source from one registered skill repository.
+
+    Long documents are returned in explicit, self-describing pages: the response
+    states the total length and the exact `offset` to pass for the next slice, so
+    a large file (the HyperFrames CLI skill is ~26k chars, the prompt library's
+    README ~91k) is never silently cut off mid-sentence.
 
     Args:
         skill_name: Registry key, e.g. 'hyperframes', 'gsap', 'whisper',
             'motion_graphics_prompts' or 'motion_skills'.
-        file_path: Optional repo-relative path. Defaults to the skill's entrypoint.
+        file_path: Optional repo-relative path. Defaults to the skill's entrypoint;
+            a trailing '/' lists that directory.
+        offset: Character offset to start from, for paging through a long file.
+        max_chars: Slice size for this call. Defaults to the skill's max_chars.
     """
     key = (skill_name or "").strip().lower().replace("-", "_").replace(" ", "_")
     meta = SKILL_REGISTRY.get(key)
@@ -496,9 +720,36 @@ def load_skill(skill_name: str, file_path: str = "") -> str:
         return f"Unknown skill '{skill_name}'. Available skills: {', '.join(SKILL_REGISTRY)}"
     target = (file_path or meta.get("entrypoint") or "README.md").strip().strip("/")
     content = github_read_file(meta["repo"], target)
-    if len(content) > 6000:
-        content = content[:6000] + "\n...[truncated by load_skill]"
-    return f"SKILL '{key}' :: {meta['repo']} :: {target}\n{content}"
+    if content.startswith("GitHub Read Error") or content.startswith("Error reading"):
+        return content
+    try:
+        offset = max(0, int(offset))
+    except (TypeError, ValueError):
+        offset = 0
+    # Per-skill budget first (the prompt library needs far more than a SKILL.md),
+    # then the explicit per-call override, then the global default.
+    try:
+        skill_budget = int(meta.get("max_chars") or DEFAULT_SKILL_MAX_CHARS)
+    except (TypeError, ValueError):
+        skill_budget = DEFAULT_SKILL_MAX_CHARS
+    try:
+        limit = int(max_chars) if max_chars else skill_budget
+    except (TypeError, ValueError):
+        limit = skill_budget
+    limit = limit if limit > 0 else DEFAULT_SKILL_MAX_CHARS
+    total = len(content)
+    window = content[offset:offset + limit]
+    header = f"SKILL '{key}' :: {meta['repo']} :: {target}\n"
+    if offset == 0 and total <= limit:
+        return f"{header}{window}"
+    shown_end = min(offset + limit, total)
+    header += f"[chars {offset}-{shown_end} of {total}]\n"
+    if shown_end < total:
+        header += (
+            f"[TRUNCATED — continue with load_skill('{key}', '{target}', "
+            f"offset={shown_end}, max_chars={limit})]\n"
+        )
+    return f"{header}{window}"
 
 ALL_TOOLS_LIST = [
     diagnose_and_heal_codebase,
@@ -512,7 +763,8 @@ ALL_TOOLS_LIST = [
     create_golden_state_backup,
     web_search_research,
     list_skills,
-    load_skill
+    load_skill,
+    render_html_video
 ]
 
 SYSTEM_INSTRUCTION = """You are Chintu, an autonomous execution assistant.
@@ -523,8 +775,8 @@ STRICT OPERATIONAL DIRECTIVES:
 3. VIDEO GENERATION: Importing `moviepy.editor` is STRICTLY FORBIDDEN and will break the sandbox. For ANY video task, write a pure Python rendering script: generate frames with Pillow + NumPy, then stitch them into the final `.mp4` natively by calling the system `ffmpeg` binary through `subprocess`.
 4. CONCISE FACTUAL OUTPUT: Report only actual ground truth from tool execution stdout and stderr.
 5. SANDBOX CODE HYGIENE: Submit a single, syntactically valid `run_task.py` (validate it with `ast.parse` before sending). Do not mix root-level shell commands (cat/curl/ffmpeg/...) into Python source; invoke them through `subprocess` when required.
-6. SKILL LIBRARY: You ship with a curated skill library. Call `list_skills` to enumerate it and `load_skill` to read the real documentation before writing code in an unfamiliar domain. For ANY motion-graphics or animated-video request, load `hyperframes`, `gsap` and `motion_graphics_prompts` FIRST, then follow the APIs you actually read instead of inventing signatures.
-7. MOTION GRAPHICS PIPELINE: Prefer authoring motion graphics as HTML/CSS with GSAP timelines in HyperFrames and pull the exact render/CLI steps from the loaded `hyperframes` docs. Keep directive 3 as the fallback path (pure Python + Pillow/NumPy frames stitched by system `ffmpeg`). Use `whisper` only when audio must be transcribed for captions or voice-over timing.
+6. SKILL LIBRARY: You ship with a curated skill library. Call `list_skills` to enumerate it and `load_skill` to read the real documentation before writing code in an unfamiliar domain. For ANY motion-graphics or animated-video request, load `hyperframes` FIRST (its router, composition contract and CLI docs), then `motion_graphics_prompts` for direction, then follow the APIs you actually read instead of inventing signatures. Long docs are paged: when a response says TRUNCATED, keep going with `load_skill(name, path, offset=<shown_end>)` until you have the section you need.
+7. MOTION GRAPHICS PIPELINE: Author motion graphics as HTML/CSS with a single paused GSAP timeline, then render them with `render_html_video` — it lints and renders inside the cloud VM through the real hyperframes CLI (chrome-headless-shell + ffmpeg), which installs Node and the Chrome runtime libraries on that path. Keep the pure-Python route (Pillow + NumPy frames stitched by system `ffmpeg`) only as the fallback when `render_html_video` reports the toolchain could not be provisioned. An 8-second 30fps 1080p render takes roughly a minute of capture time, so keep short-form pieces short and use `quality="draft"` while iterating. Use `whisper` only when audio must be transcribed for captions or voice-over timing.
 """
 
 def _sync_chat_call(model_name: str, message: str) -> str:

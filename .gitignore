@@ -1,0 +1,13 @@
+# Local scratch / toolchains (never committed)
+.tools/
+.chintu_skill_docs/
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Rendered video output
+renders/
+*.mp4

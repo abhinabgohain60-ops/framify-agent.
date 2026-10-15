@@ -1,0 +1,78 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="UTF-8" />
+  </head>
+  <body>
+    <template>
+      <style>
+        #root {
+          position: absolute;
+          inset: 0;
+          display: flex;
+          flex-direction: column;
+          align-items: center;
+          justify-content: center;
+          font-family: sans-serif;
+          color: #f8fafc;
+        }
+        #wordmark {
+          display: flex;
+          font-size: 208px;
+          font-weight: 800;
+          letter-spacing: -0.045em;
+          line-height: 1;
+        }
+        #wordmark span { display: block; }
+        #wordmark span.accent { color: #22d3ee; }
+        #rule {
+          display: block;
+          width: 720px;
+          height: 8px;
+          margin-top: 40px;
+          border-radius: 8px;
+          background: linear-gradient(90deg, #22d3ee, #a78bfa);
+          transform-origin: 0% 50%;
+        }
+        #tagline {
+          display: block;
+          margin-top: 34px;
+          font-size: 42px;
+          font-weight: 500;
+          letter-spacing: 0.44em;
+          color: #94a3b8;
+          text-transform: uppercase;
+        }
+      </style>
+
+      <div id="root" data-composition-id="scene-brand" data-width="1920" data-height="1080">
+        <div id="wordmark">
+          <span>F</span><span>R</span><span>A</span><span>M</span><span>I</span
+          ><span>F</span><span class="accent">Y</span>
+        </div>
+        <span id="rule"></span>
+        <span id="tagline">AI Motion Engine</span>
+      </div>
+
+      <script>
+        const tl = gsap.timeline({ paused: true });
+        tl.fromTo(
+          "#wordmark span",
+          { y: 110, opacity: 0, rotate: 4 },
+          { y: 0, opacity: 1, rotate: 0, duration: 0.62, ease: "power3.out", stagger: 0.07 },
+          0.15
+        );
+        tl.fromTo("#rule", { scaleX: 0 }, { scaleX: 1, duration: 0.75, ease: "power3.inOut" }, 0.8);
+        tl.fromTo(
+          "#tagline",
+          { y: 22, opacity: 0 },
+          { y: 0, opacity: 1, duration: 0.55, ease: "power2.out" },
+          1.05
+        );
+        tl.to("#wordmark, #rule, #tagline", { opacity: 0, duration: 0.35 }, 2.05);
+        window.__timelines["scene-brand"] = tl;
+        tl.seek(0);
+      </script>
+    </template>
+  </body>
+</html>

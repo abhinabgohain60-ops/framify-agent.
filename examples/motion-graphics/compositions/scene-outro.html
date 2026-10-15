@@ -1,0 +1,78 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="UTF-8" />
+  </head>
+  <body>
+    <template>
+      <style>
+        #root {
+          position: absolute;
+          inset: 0;
+          display: flex;
+          flex-direction: column;
+          align-items: center;
+          justify-content: center;
+          font-family: sans-serif;
+          color: #f8fafc;
+        }
+        #lockup {
+          display: flex;
+          align-items: center;
+          font-size: 150px;
+          font-weight: 800;
+          letter-spacing: -0.04em;
+        }
+        #dot {
+          display: block;
+          width: 34px;
+          height: 34px;
+          margin-left: 26px;
+          border-radius: 50%;
+          background: #22d3ee;
+        }
+        #credit {
+          display: block;
+          margin-top: 40px;
+          font-family: monospace;
+          font-size: 32px;
+          letter-spacing: 0.3em;
+          color: #94a3b8;
+          text-transform: uppercase;
+        }
+      </style>
+
+      <div id="root" data-composition-id="scene-outro" data-width="1920" data-height="1080">
+        <div id="lockup">
+          <span>FRAMIFY</span>
+          <span id="dot"></span>
+        </div>
+        <span id="credit">rendered by chintu</span>
+      </div>
+
+      <script>
+        const tl = gsap.timeline({ paused: true });
+        tl.fromTo(
+          "#lockup",
+          { scale: 0.92, opacity: 0 },
+          { scale: 1, opacity: 1, duration: 0.6, ease: "power3.out" },
+          0.15
+        );
+        tl.fromTo(
+          "#credit",
+          { y: 16, opacity: 0 },
+          { y: 0, opacity: 1, duration: 0.5, ease: "power2.out" },
+          0.4
+        );
+        tl.fromTo(
+          "#dot",
+          { scale: 1, opacity: 1 },
+          { scale: 1.45, opacity: 0.55, duration: 0.42, ease: "sine.inOut", repeat: 1, yoyo: true },
+          0.95
+        );
+        window.__timelines["scene-outro"] = tl;
+        tl.seek(0);
+      </script>
+    </template>
+  </body>
+</html>
