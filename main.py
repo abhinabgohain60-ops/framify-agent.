@@ -95,8 +95,12 @@ def _github_headers() -> Dict[str, str]:
 
 # Unauthenticated GitHub allows only 60 requests/hour, and one skill load costs
 # two (contents + raw download), so a handful of motion-graphics turns would
-# exhaust it. Cache successful reads in-process with a TTL.
+# exhaust it. Two mitigations: read files from GitHub's raw CDN, which is not the
+# REST API and therefore costs no quota (verified returning 200 with the API
+# budget fully exhausted), and cache successful reads in-process with a TTL.
 GITHUB_CACHE_TTL_SECONDS = 900
+GITHUB_RAW_HOST = "https://raw.githubusercontent.com"
+GITHUB_RAW_BRANCHES = ("main", "master")
 _GITHUB_RAW_CACHE: Dict[str, Any] = {}
 
 def _cache_get(repo_name: str, file_path: str) -> Optional[str]:
@@ -112,10 +116,40 @@ def _cache_get(repo_name: str, file_path: str) -> Optional[str]:
 def _cache_put(repo_name: str, file_path: str, text: str) -> None:
     _GITHUB_RAW_CACHE[f"{repo_name}/{file_path}"] = (datetime.utcnow(), text)
 
+def _github_cdn_read(repo_name: str, file_path: str) -> Optional[str]:
+    """Fetch a repo file straight from GitHub's raw CDN, bypassing the REST API.
+
+    Returns None when the path is not fetchable this way: a directory, a binary
+    blob, a private repo without a token, or a repo whose default branch is
+    neither ``main`` nor ``master``. The caller then falls back to the contents
+    API, which can also list directories and report real HTTP errors.
+    """
+    if not file_path or file_path.endswith("/"):
+        return None
+    repo = repo_name.rstrip(".")
+    headers = {}
+    if GITHUB_TOKEN:
+        headers["Authorization"] = f"Bearer {GITHUB_TOKEN}"
+    for branch in GITHUB_RAW_BRANCHES:
+        try:
+            res = requests.get(
+                f"{GITHUB_RAW_HOST}/{repo}/{branch}/{file_path}", headers=headers, timeout=15
+            )
+        except Exception:
+            return None
+        if res.status_code == 200 and res.text:
+            return res.text
+    return None
+
 def github_read_file(repo_name: str, file_path: str) -> str:
     cached = _cache_get(repo_name, file_path)
     if cached is not None:
         return cached
+    # CDN first: one request instead of two, and no API quota consumed.
+    cdn_text = _github_cdn_read(repo_name, file_path)
+    if cdn_text is not None:
+        _cache_put(repo_name, file_path, cdn_text)
+        return cdn_text
     headers = _github_headers()
     encoded_repo = repo_name.replace(".", "%2E") if repo_name.endswith(".") else repo_name
     url = f"https://api.github.com/repos/{encoded_repo}/contents/{file_path}"
@@ -206,6 +240,10 @@ SKILL_REGISTRY: Dict[str, Dict[str, Any]] = {
             "skills/hyperframes-cli/SKILL.md",
             "skills/hyperframes-cli/references/preview-render.md",
             "skills/motion-graphics/SKILL.md",
+            "skills/motion-graphics/references/builder-contract.md",
+            "skills/motion-graphics/references/motion-vocabulary.md",
+            "skills/motion-graphics/categories/kinetic-type/module.md",
+            "skills/hyperframes-creative/references/motion-principles.md",
         ],
         "max_chars": 24000,
         "summary": (
@@ -244,9 +282,13 @@ SKILL_REGISTRY: Dict[str, Dict[str, Any]] = {
         "docs": ["README.md"],
         "max_chars": 40000,
         "summary": (
-            "Curated shot/camera/motion/style prompts (Veo/Kling/Hailuo). The single "
-            "README is ~91k chars, so page it with load_skill(..., offset=...) instead "
-            "of assuming the first block is all of it."
+            "Curated shot/camera prompts for live-action video models (Veo/Kling/Hailuo): "
+            "50 cases, 26 of them ASMR and 11 product/ unboxing. Use it for lighting, "
+            "lens and camera-move vocabulary, NOT for motion-graphics design — it contains "
+            "no typography, chart or kinetic-type material. Get design direction from "
+            "'hyperframes' (motion-vocabulary, motion-principles, the category modules) "
+            "and 'motion_skills' instead. The single README is ~91k chars, so page it with "
+            "load_skill(..., offset=...)."
         ),
     },
     "motion_skills": {
