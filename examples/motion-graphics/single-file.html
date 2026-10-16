@@ -1,0 +1,172 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=1920, height=1080" />
+    <title>Chintu · single-file kinetic type</title>
+    <script src="https://cdn.jsdelivr.net/npm/gsap@3.14.2/dist/gsap.min.js"></script>
+    <style>
+      /* Palette discipline: every colour lives here, nothing inline in the markup. */
+      :root {
+        --bg: #05070d;
+        --bg-mid: #0a1020;
+        --ink: #f8fafc;
+        --muted: #94a3b8;
+        --accent: #22d3ee;
+        --accent-2: #a78bfa;
+        --rule: rgba(148, 163, 184, 0.16);
+      }
+      * { margin: 0; padding: 0; box-sizing: border-box; }
+      html, body { margin: 0; width: 1920px; height: 1080px; overflow: hidden; background: var(--bg); }
+      #root {
+        /* Root must be sized or flex children collapse to the top-left. */
+        position: relative;
+        width: 1920px;
+        height: 1080px;
+        font-family: sans-serif;
+        color: var(--ink);
+        overflow: hidden;
+      }
+      .decor { position: absolute; inset: 0; }
+      #bg {
+        background:
+          radial-gradient(1200px 700px at 16% 20%, rgba(34, 211, 238, 0.20), transparent 60%),
+          radial-gradient(1000px 640px at 84% 80%, rgba(167, 139, 250, 0.22), transparent 62%),
+          linear-gradient(160deg, var(--bg) 0%, var(--bg-mid) 55%, #060810 100%);
+      }
+      #grid {
+        background-image:
+          linear-gradient(var(--rule) 1px, transparent 1px),
+          linear-gradient(90deg, var(--rule) 1px, transparent 1px);
+        background-size: 96px 96px;
+        transform-origin: 50% 50%;
+      }
+      /* One full-duration clip; the timeline owns everything inside it. */
+      #stage { position: absolute; inset: 0; }
+      .group {
+        position: absolute;
+        inset: 0;
+        display: flex;
+        flex-direction: column;
+        justify-content: center;
+        padding: 120px 160px;
+        gap: 28px;
+      }
+      .kicker { font-size: 30px; letter-spacing: 0.42em; text-transform: uppercase; color: var(--muted); }
+      .hero { font-size: 152px; line-height: 1.02; font-weight: 800; letter-spacing: -0.03em; }
+      .hero .word { display: inline-block; margin-right: 34px; }
+      .em { color: var(--accent); }
+      .row { display: flex; align-items: center; gap: 44px; }
+      .row .idx { font-size: 34px; font-weight: 700; color: var(--accent-2); width: 74px; }
+      .row .label { font-size: 68px; font-weight: 700; letter-spacing: -0.02em; }
+      .row .stack { flex: 1; }
+      .rule { height: 6px; width: 100%; background: linear-gradient(90deg, var(--accent), var(--accent-2)); transform-origin: left center; }
+      .punch { font-size: 116px; font-weight: 800; letter-spacing: -0.025em; line-height: 1.08; }
+      .mark { font-size: 132px; font-weight: 800; }
+      /* Glyphs are separate boxes so the spread is animated on transforms (x), never
+         on letterSpacing — a layout property that snaps to integer device pixels
+         and stutters under the seek-by-frame capture engine. */
+      .mark .glyph { display: inline-block; letter-spacing: 0; padding: 0 0.075em; }
+      .sub { font-size: 38px; letter-spacing: 0.22em; text-transform: uppercase; color: var(--muted); }
+      #scene-hook, #scene-build, #scene-punch, #scene-resolve { visibility: hidden; }
+    </style>
+  </head>
+  <body>
+    <div
+      id="root"
+      data-composition-id="main"
+      data-start="0"
+      data-duration="9"
+      data-width="1920"
+      data-height="1080"
+    >
+      <div id="bg" class="decor"></div>
+      <div id="grid" class="decor"></div>
+
+      <!-- No `.clip` wrapper: a timed element containing inline markup is not the
+           sub-composition shape. The root's data-duration is the length source and the
+           single registered timeline drives everything inside it. -->
+      <section id="stage">
+        <div id="scene-hook" class="group">
+          <div class="kicker" id="hook-kicker">Chintu · motion graphics</div>
+          <h1 class="hero">
+            <span class="word" data-hook>Your</span>
+            <span class="word em" data-hook>ideas</span>
+            <span class="word" data-hook>move</span>
+            <span class="word" data-hook>fast.</span>
+          </h1>
+        </div>
+
+        <div id="scene-build" class="group">
+          <div class="kicker" data-build>What runs behind it</div>
+          <div class="row" data-build>
+            <div class="idx">01</div>
+            <div class="stack"><div class="label">HTML and GSAP in</div><div class="rule" data-rule></div></div>
+          </div>
+          <div class="row" data-build>
+            <div class="idx">02</div>
+            <div class="stack"><div class="label">Deterministic frames out</div><div class="rule" data-rule></div></div>
+          </div>
+          <div class="row" data-build>
+            <div class="idx">03</div>
+            <div class="stack"><div class="label">16 GB of cloud RAM behind it</div><div class="rule" data-rule></div></div>
+          </div>
+        </div>
+
+        <div id="scene-punch" class="group">
+          <h2 class="punch">
+            <span class="word" data-punch>Rendered</span>
+            <span class="word em" data-punch id="punch-em">on Hugging Face</span>
+          </h2>
+        </div>
+
+        <div id="scene-resolve" class="group" style="align-items: center; text-align: center">
+          <div class="mark" id="resolve-mark"><span class="glyph">C</span><span class="glyph">H</span><span class="glyph">I</span><span class="glyph">N</span><span class="glyph">T</span><span class="glyph">U</span></div>
+          <div class="sub" id="resolve-sub">motion graphics · rendered in the cloud</div>
+        </div>
+      </section>
+    </div>
+
+    <script>
+      // ONE paused, seekable timeline registered under the root composition id.
+      const tl = gsap.timeline({ paused: true });
+
+      // Shared backdrop.
+      tl.fromTo("#bg", { autoAlpha: 0 }, { autoAlpha: 1, duration: 0.7, ease: "power2.out" }, 0);
+      tl.fromTo("#grid", { autoAlpha: 0, scale: 1.14 }, { autoAlpha: 0.55, scale: 1, duration: 1.8, ease: "power2.out" }, 0.1);
+
+      // Scene 01 — Hook: word_reveal, one motif, hold.
+      const hookWords = gsap.utils.toArray("[data-hook]");
+      tl.set("#scene-hook", { autoAlpha: 1 }, 0);
+      tl.fromTo(hookWords, { autoAlpha: 0, y: 90 }, { autoAlpha: 1, y: 0, duration: 0.62, ease: "power4.out", stagger: 0.09 }, 0.35);
+      tl.fromTo("#hook-kicker", { autoAlpha: 0, x: -46 }, { autoAlpha: 1, x: 0, duration: 0.5, ease: "power2.out" }, 0.16);
+      tl.to("#scene-hook", { autoAlpha: 0, y: -64, duration: 0.4, ease: "power2.in" }, 2.25);
+
+      // Scene 02 — Build: slide_bottom per row, underline_sweep on each rule.
+      // Each scene's exit completes before the next entrance starts, so no two text
+      // blocks ever share the frame (the layout audit samples transitions too).
+      tl.set("#scene-build", { autoAlpha: 1 }, 2.66);
+      tl.fromTo("#scene-build .kicker", { autoAlpha: 0, y: 42 }, { autoAlpha: 1, y: 0, duration: 0.5, ease: "power3.out" }, 2.72);
+      tl.fromTo("#scene-build .row", { autoAlpha: 0, y: 150 }, { autoAlpha: 1, y: 0, duration: 0.66, ease: "power4.out", stagger: 0.26 }, 2.9);
+      tl.fromTo("[data-rule]", { scaleX: 0 }, { scaleX: 1, duration: 0.5, ease: "power2.out", stagger: 0.26 }, 3.2);
+      tl.to("#scene-build", { autoAlpha: 0, y: -64, duration: 0.4, ease: "power2.in" }, 5.28);
+
+      // Scene 03 — Punch: scale_punch entrance, glow on the emphasis word.
+      tl.set("#scene-punch", { autoAlpha: 1 }, 5.7);
+      tl.fromTo("[data-punch]", { autoAlpha: 0, scale: 0.62 }, { autoAlpha: 1, scale: 1, duration: 0.7, ease: "back.out(2.2)", stagger: 0.14 }, 5.78);
+      tl.to("#punch-em", { textShadow: "0 0 46px rgba(34, 211, 238, 0.95)", duration: 0.45, yoyo: true, repeat: 1, ease: "sine.inOut" }, 6.75);
+      tl.to("#scene-punch", { autoAlpha: 0, y: -64, duration: 0.4, ease: "power2.in" }, 7.28);
+
+      // Scene 04 — Resolve: the only scene that animates its elements out.
+      tl.set("#scene-resolve", { autoAlpha: 1 }, 7.7);
+      // Spread assembled per glyph: transform-only, so it stays sub-pixel smooth.
+      tl.fromTo("#resolve-mark", { autoAlpha: 0, scale: 0.72 }, { autoAlpha: 1, scale: 1, duration: 0.9, ease: "power2.out" }, 7.78);
+      tl.fromTo("#resolve-mark .glyph", { x: 34, autoAlpha: 0 }, { x: 0, autoAlpha: 1, duration: 0.55, ease: "power3.out", stagger: 0.055 }, 7.78);
+      tl.fromTo("#resolve-sub", { autoAlpha: 0, filter: "blur(14px)" }, { autoAlpha: 1, filter: "blur(0px)", duration: 0.7, ease: "power2.out" }, 8.15);
+      tl.to("#scene-resolve", { scale: 1.06, autoAlpha: 0, duration: 0.5, ease: "power2.in" }, 8.5);
+
+      window.__timelines["main"] = tl;
+      tl.seek(0);
+    </script>
+  </body>
+</html>

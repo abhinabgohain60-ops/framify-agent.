@@ -404,6 +404,124 @@ HYPERFRAMES_PROJECT_CONFIG: Dict[str, Any] = {
     "authoringSkill": HYPERFRAMES_SKILL,
 }
 
+# ------------------------------------------------- Hugging Face Jobs renderer
+# The point of this backend is the hardware: Hugging Face's `cpu-basic` flavor is
+# 2 vCPU / 16 GB RAM / 50 GB disk at $0.01 per hour, billed per minute. HyperFrames
+# switches to a single-worker screenshot profile below 8 GB of RAM (its render log
+# prints `totalMemMb` next to `thresholdMb: 8192`), which is what the smaller render
+# VM hits, so a Job both fits the composition in memory and is cheap enough to
+# treat as a per-render utility. System tools are installed inside the Job because
+# a Job image must already exist: `node:22-bookworm` is a public Docker Hub image
+# that satisfies HyperFrames' Node >= 22 floor and lets apt install the rest.
+HF_RENDER_FLAVOR = os.environ.get("HF_RENDER_FLAVOR", "cpu-basic")
+HF_RENDER_IMAGE = os.environ.get("HF_RENDER_IMAGE", "node:22-bookworm")
+HF_RENDER_TIMEOUT = os.environ.get("HF_RENDER_TIMEOUT", "20m")
+HF_RENDER_JOB_NAME = os.environ.get("HF_RENDER_JOB_NAME", "chintu-motion-render")
+HF_ARTIFACT_REPO = os.environ.get("HF_ARTIFACT_REPO", "")
+HF_ARTIFACT_REPO_NAME = os.environ.get("HF_ARTIFACT_REPO_NAME", "chintu-renders")
+HF_RENDER_WAIT_SECONDS = int(os.environ.get("HF_RENDER_WAIT_SECONDS", "300"))
+HF_ENDPOINT = os.environ.get("HF_ENDPOINT", "https://huggingface.co").rstrip("/")
+
+# Runs INSIDE the Job. Kept here rather than in a separate file so the deployed
+# process is the single source of truth for what the remote container executes.
+# Set HF_JOB_INSTALL=0 for an image that already ships the toolchain.
+HF_RENDER_JOB_SCRIPT = r"""
+set -euo pipefail
+echo "[hf-render] boot node=$(node -v 2>/dev/null || echo missing) cpus=$(nproc 2>/dev/null || echo '?') mem=$(free -m 2>/dev/null | awk '/^Mem:/{print $2" MB"}' || echo '?')"
+: "${COMPOSITION_B64:?COMPOSITION_B64 payload is missing}"
+: "${PROJECT_SLUG:=chintu-motion}"
+: "${RENDER_FPS:=30}"
+: "${RENDER_QUALITY:=looks}"
+: "${HYPERFRAMES_VERSION:=0.8.160}"
+: "${HF_ENDPOINT:=https://huggingface.co}"
+
+if [ "${HF_JOB_INSTALL:-1}" = "1" ] && command -v apt-get >/dev/null 2>&1; then
+  export DEBIAN_FRONTEND=noninteractive
+  apt-get update -qq || echo "[hf-render] WARN apt-get update reported errors"
+  apt-get install -y -qq --no-install-recommends ffmpeg curl ca-certificates fonts-liberation fonts-dejavu-core \
+    || echo "[hf-render] WARN base toolchain install reported errors"
+  # One package at a time so a single missing name cannot abort the whole install.
+  for pkg in libnss3 libnspr4 libatk1.0-0 libatk-bridge2.0-0 libcups2 libdrm2 libxkbcommon0 \
+             libxcomposite1 libxdamage1 libxfixes3 libxrandr2 libgbm1 libasound2 \
+             libpango-1.0-0 libcairo2 libatspi2.0-0; do
+    apt-get install -y -qq --no-install-recommends "$pkg" >/dev/null 2>&1 \
+      || echo "[hf-render] WARN could not install $pkg"
+  done
+fi
+command -v ffmpeg >/dev/null 2>&1 || { echo "[hf-render] FAILED ffmpeg is not on PATH"; exit 1; }
+ldconfig -p 2>/dev/null | grep -q libnspr4 || echo "[hf-render] WARN libnspr4 absent from the linker cache; Chrome may not start"
+
+PROJECT_DIR="/tmp/chintu-render/$PROJECT_SLUG"
+mkdir -p "$PROJECT_DIR/renders"
+printf '%s' "$COMPOSITION_B64" | base64 -d > "$PROJECT_DIR/index.html"
+if [ -n "${HYPERFRAMES_JSON_B64:-}" ]; then
+  printf '%s' "$HYPERFRAMES_JSON_B64" | base64 -d > "$PROJECT_DIR/hyperframes.json"
+fi
+cd "$PROJECT_DIR"
+echo "[hf-render] staged $(wc -c < index.html) bytes of composition in $PROJECT_DIR"
+
+HF="npx --yes hyperframes@$HYPERFRAMES_VERSION"
+$HF doctor --json 2>&1 | tail -40 || echo "[hf-render] WARN doctor reported problems"
+$HF browser ensure || { echo "[hf-render] FAILED could not ensure the pinned Chrome"; exit 1; }
+$HF lint . || echo "[hf-render] WARN lint reported issues; rendering anyway"
+$HF render . --skill=motion-graphics -f "$RENDER_FPS" -q "$RENDER_QUALITY" -o ./renders/video.mp4
+
+VIDEO="$PROJECT_DIR/renders/video.mp4"
+[ -s "$VIDEO" ] || { echo "[hf-render] FAILED no MP4 written to $VIDEO"; exit 1; }
+echo "[hf-render] ffprobe:"
+ffprobe -v error -select_streams v:0 -count_frames \
+  -show_entries stream=width,height,r_frame_rate,nb_read_frames \
+  -show_entries format=duration,size -of default=noprint_wrappers=1 "$VIDEO" || true
+echo "[hf-render] RENDER_VERIFIED $VIDEO $(wc -c < "$VIDEO") bytes"
+
+if [ -n "${HF_ARTIFACT_REPO:-}" ] && [ -n "${HF_TOKEN:-}" ]; then
+  # One request, no client library: the Hub's commit API takes NDJSON with the
+  # file base64-encoded. base64 goes through a file, never argv (a multi-MB
+  # argument would blow past the kernel's per-argument limit).
+  base64 -w 0 "$VIDEO" > /tmp/artifact.b64
+  {
+    printf '{"key":"header","value":{"summary":"chintu render: %s"}}\n' "$HF_ARTIFACT_PATH"
+    printf '{"key":"file","value":{"path":"%s","encoding":"base64","content":"' "$HF_ARTIFACT_PATH"
+    cat /tmp/artifact.b64
+    printf '"}}\n'
+  } > /tmp/commit.ndjson
+  code=$(curl -sS -o /tmp/commit.out -w '%{http_code}' -X POST \
+    -H "Authorization: Bearer $HF_TOKEN" \
+    -H "Content-Type: application/x-ndjson" \
+    --data-binary @/tmp/commit.ndjson \
+    "$HF_ENDPOINT/api/datasets/$HF_ARTIFACT_REPO/commit/main")
+  echo "[hf-render] artifact upload http=$code body=$(head -c 300 /tmp/commit.out)"
+  if [ "$code" = "200" ]; then
+    echo "[hf-render] ARTIFACT_URL $HF_ENDPOINT/datasets/$HF_ARTIFACT_REPO/resolve/main/$HF_ARTIFACT_PATH"
+  else
+    echo "[hf-render] FAILED artifact upload (HTTP $code)"
+    exit 1
+  fi
+else
+  echo "[hf-render] WARN no HF_ARTIFACT_REPO/HF_TOKEN; the MP4 stays inside the Job"
+fi
+echo "[hf-render] DONE"
+"""
+
+_hf_namespace_cache: Dict[str, str] = {}
+
+def _telegram_send_video(video_bytes: bytes, file_name: str, caption: str = "") -> bool:
+    """Post MP4 bytes to the bound Telegram chat. Returns True only on HTTP 200."""
+    if not (CURRENT_CHAT_ID and TELEGRAM_BOT_TOKEN):
+        return False
+    try:
+        send_url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendVideo"
+        upload_files = {"video": (file_name, video_bytes, "video/mp4")}
+        data = {"chat_id": CURRENT_CHAT_ID, "caption": caption or f"🎬 Chintu Video Render: {file_name}"}
+        res = requests.post(send_url, data=data, files=upload_files, timeout=120)
+        if res.status_code == 200:
+            logger.info(f"Directly uploaded {file_name} to Telegram via HTTP API!")
+            return True
+        logger.error(f"Telegram upload failed: {res.text[:300]}")
+    except Exception as vid_err:
+        logger.warning(f"Video delivery warning: {vid_err}")
+    return False
+
 def _deliver_rendered_video(sbx: Any, extra_dirs: Any = ()) -> bool:
     """Upload the first rendered .mp4 found in the sandbox straight to Telegram."""
     if not (CURRENT_CHAT_ID and TELEGRAM_BOT_TOKEN):
@@ -414,17 +532,11 @@ def _deliver_rendered_video(sbx: Any, extra_dirs: Any = ()) -> bool:
             continue
         try:
             video_bytes = sbx.files.read(video_path, format="bytes")
-            file_name = video_path.rsplit("/", 1)[-1]
-            send_url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendVideo"
-            upload_files = {"video": (file_name, video_bytes, "video/mp4")}
-            data = {"chat_id": CURRENT_CHAT_ID, "caption": f"🎬 Chintu Video Render: {file_name}"}
-            res = requests.post(send_url, data=data, files=upload_files, timeout=120)
-            if res.status_code == 200:
-                logger.info(f"Directly uploaded {file_name} to Telegram via HTTP API!")
-                return True
-            logger.error(f"Telegram upload failed: {res.text[:300]}")
         except Exception as vid_err:
             logger.warning(f"Video delivery warning: {vid_err}")
+            continue
+        if _telegram_send_video(video_bytes, video_path.rsplit("/", 1)[-1]):
+            return True
     return False
 
 def _provision_render_toolchain(sbx: Any, want_browser: bool = False) -> str:
@@ -470,33 +582,279 @@ def _validate_composition_html(html: str) -> Optional[str]:
         return "the composition references moviepy, which is forbidden in this pipeline."
     return None
 
+def _hf_jobs_api() -> Dict[str, Any]:
+    """Import the Jobs client lazily so the agent still boots without it."""
+    try:
+        from huggingface_hub import cancel_job, fetch_job_logs, inspect_job, run_job, wait_for_job
+    except Exception as e:
+        return {
+            "error": (
+                f"Hugging Face Jobs client unavailable: {e}. "
+                "Install or upgrade with: pip install -U 'huggingface_hub>=0.36'"
+            )
+        }
+    return {"run": run_job, "inspect": inspect_job, "logs": fetch_job_logs, "wait": wait_for_job, "cancel": cancel_job}
+
+def _hf_namespace() -> str:
+    """Resolve the token's own namespace so artifacts get a home repository."""
+    if _hf_namespace_cache.get("name"):
+        return _hf_namespace_cache["name"]
+    try:
+        res = requests.get(
+            f"{HF_ENDPOINT}/api/whoami-v2",
+            headers={"Authorization": f"Bearer {HF_TOKEN}"},
+            timeout=15,
+        )
+        if res.status_code == 200:
+            name = (res.json() or {}).get("name") or ""
+            if name:
+                _hf_namespace_cache["name"] = name
+                return name
+        return f"Error: could not resolve the Hugging Face namespace (HTTP {res.status_code})."
+    except Exception as e:
+        return f"Error: could not reach {HF_ENDPOINT} to resolve the namespace ({e})."
+
+def _hf_artifact_repo() -> str:
+    """The dataset repository that render artifacts are committed to."""
+    if HF_ARTIFACT_REPO:
+        return HF_ARTIFACT_REPO
+    namespace = _hf_namespace()
+    if namespace.startswith("Error"):
+        return namespace
+    return f"{namespace}/{HF_ARTIFACT_REPO_NAME}"
+
+def _hf_ensure_dataset_repo(repo_id: str) -> str:
+    """Create the artifact dataset when absent. Returns "" on success, else a message."""
+    owner, _, name = repo_id.partition("/")
+    payload: Dict[str, Any] = {"type": "dataset", "name": name or owner, "private": True}
+    if name:
+        payload["organization"] = owner
+    try:
+        res = requests.post(
+            f"{HF_ENDPOINT}/api/repos/create",
+            headers={"Authorization": f"Bearer {HF_TOKEN}", "Content-Type": "application/json"},
+            json=payload,
+            timeout=20,
+        )
+    except Exception as e:
+        return f"Error: could not reach {HF_ENDPOINT} to create the artifact repo ({e})."
+    if res.status_code in (200, 201):
+        logger.info(f"[HF] artifact dataset {repo_id} created (private)")
+        return ""
+    body = (res.text or "")[:200]
+    # 409 means it already exists, which is the steady state for every later render.
+    if res.status_code == 409 or "already" in body.lower() or "exists" in body.lower():
+        return ""
+    return (
+        f"Error: could not create the artifact dataset {repo_id} (HTTP {res.status_code}: {body}). "
+        "The token needs write access, or set HF_ARTIFACT_REPO to an existing dataset repo."
+    )
+
+def _hf_stage(info: Any) -> str:
+    """Normalise a JobInfo status into a plain uppercase stage name."""
+    status = getattr(info, "status", None)
+    stage = getattr(status, "stage", None) if status is not None else None
+    value = getattr(stage, "value", stage)
+    return str(value or "UNKNOWN").upper()
+
+def _hf_log_tail(api: Dict[str, Any], job_id: str, lines: int = 80, limit: int = 6000) -> str:
+    """Fetch the tail of a Job's logs; they persist after the Job finishes."""
+    try:
+        chunks = [str(chunk) for chunk in api["logs"](job_id=job_id, tail=lines, token=HF_TOKEN)]
+    except Exception as e:
+        return f"(log fetch failed: {e})"
+    return "".join(chunks)[-limit:]
+
+def _hf_submit_render(html: str, slug: str, fps: int, quality: str) -> str:
+    """Submit one render as a Hugging Face Job on the 16 GB cpu-basic flavor."""
+    api = _hf_jobs_api()
+    if "error" in api:
+        return api["error"]
+    repo_id = _hf_artifact_repo()
+    if repo_id.startswith("Error"):
+        return repo_id
+    problem = _hf_ensure_dataset_repo(repo_id)
+    if problem:
+        return problem
+    artifact_path = f"renders/{slug}-{datetime.utcnow().strftime('%Y%m%dT%H%M%SZ')}.mp4"
+    job_env = {
+        "PROJECT_SLUG": slug,
+        "RENDER_FPS": str(int(fps)),
+        "RENDER_QUALITY": quality,
+        "HYPERFRAMES_VERSION": HYPERFRAMES_VERSION,
+        "COMPOSITION_B64": base64.b64encode(html.encode("utf-8")).decode("ascii"),
+        "HYPERFRAMES_JSON_B64": base64.b64encode(
+            json.dumps(HYPERFRAMES_PROJECT_CONFIG).encode("utf-8")
+        ).decode("ascii"),
+        "HF_ARTIFACT_REPO": repo_id,
+        "HF_ARTIFACT_PATH": artifact_path,
+        "HF_ENDPOINT": HF_ENDPOINT,
+    }
+    try:
+        job = api["run"](
+            image=HF_RENDER_IMAGE,
+            command=["bash", "-lc", HF_RENDER_JOB_SCRIPT],
+            env=job_env,
+            secrets={"HF_TOKEN": HF_TOKEN},
+            flavor=HF_RENDER_FLAVOR,
+            timeout=HF_RENDER_TIMEOUT,
+            name=HF_RENDER_JOB_NAME,
+            labels={"app": "chintu", "kind": "motion-graphics"},
+            token=HF_TOKEN,
+        )
+    except Exception as e:
+        logger.error(f"Hugging Face job submission failed: {e}", exc_info=True)
+        return (
+            f"Hugging Face job submission failed: {e}\n"
+            "Jobs need a positive compute-credit balance on the account, and an older "
+            "client cannot submit them: pip install -U 'huggingface_hub>=0.36'."
+        )
+    job_id = getattr(job, "id", "") or ""
+    job_url = getattr(job, "url", "") or f"{HF_ENDPOINT}/jobs/{job_id}"
+    return (
+        "Hugging Face Jobs render submitted.\n"
+        f"HF_JOB_ID={job_id}\n"
+        f"job url: {job_url}\n"
+        f"hardware: {HF_RENDER_FLAVOR} (2 vCPU / 16 GB RAM / 50 GB disk, $0.01 per hour, billed per minute)\n"
+        f"image: {HF_RENDER_IMAGE} | timeout: {HF_RENDER_TIMEOUT}\n"
+        f"composition: {slug} | {len(html)} chars | {int(fps)} fps | quality={quality}\n"
+        f"artifact once uploaded: {HF_ENDPOINT}/datasets/{repo_id}/resolve/main/{artifact_path}\n"
+        "The container installs ffmpeg and Chrome's libraries, downloads the pinned Chrome, "
+        "then lints and renders, so allow a few minutes. Now call "
+        f"hf_render_status(job_id=\"{job_id}\", wait_seconds={HF_RENDER_WAIT_SECONDS}) to wait for "
+        "it, read the logs and have the MP4 delivered to Telegram."
+    )
+
+def _hf_fetch_artifact(url: str) -> Optional[bytes]:
+    """Download the rendered MP4 from the artifact dataset."""
+    try:
+        res = requests.get(
+            url, headers={"Authorization": f"Bearer {HF_TOKEN}"}, timeout=180, allow_redirects=True
+        )
+        if res.status_code == 200 and res.content:
+            return res.content
+        logger.error(f"[HF] artifact download failed: HTTP {res.status_code} {res.text[:200]}")
+    except Exception as e:
+        logger.warning(f"[HF] artifact download warning: {e}")
+    return None
+
+def hf_render_status(job_id: str, wait_seconds: int = 0) -> str:
+    """Check a Hugging Face render Job, then fetch and deliver the MP4 when it finished.
+
+    Args:
+        job_id: The id printed as HF_JOB_ID by render_html_video.
+        wait_seconds: Block up to this many seconds for a terminal stage (capped at 900).
+            Use 0 to poll once and return immediately. The default suggested to the model
+            after submission is HF_RENDER_WAIT_SECONDS.
+    """
+    if not HF_TOKEN:
+        return "Error: HF_TOKEN is not configured."
+    # Tolerate a pasted "HF_JOB_ID=<id>" or a job URL.
+    job_id = (job_id or "").strip().rstrip("/").split("/")[-1].split("=")[-1].strip()
+    if not job_id:
+        return "Error: job_id is required; pass the HF_JOB_ID printed by render_html_video."
+    api = _hf_jobs_api()
+    if "error" in api:
+        return api["error"]
+    wait_seconds = max(0, min(int(wait_seconds or 0), 900))
+    try:
+        if wait_seconds:
+            info = api["wait"](job_id, timeout=wait_seconds, token=HF_TOKEN)
+        else:
+            info = api["inspect"](job_id=job_id, token=HF_TOKEN)
+    except Exception as e:
+        return f"Hugging Face job lookup failed for {job_id}: {e}"
+    stage = _hf_stage(info)
+    tail = _hf_log_tail(api, job_id)
+    job_url = getattr(info, "url", "") or f"{HF_ENDPOINT}/jobs/{job_id}"
+    lines = [
+        f"Hugging Face render job {job_id}",
+        f"status: {stage}",
+        f"url: {job_url}",
+        f"hardware: {HF_RENDER_FLAVOR}",
+    ]
+    if stage == "COMPLETED":
+        verified = re.search(r"RENDER_VERIFIED\s+(\S+)\s+(\d+)\s+bytes", tail)
+        if verified:
+            lines.append(f"[VERIFIED] {verified.group(1)} = {verified.group(2)} bytes of MP4")
+        url_match = re.search(r"ARTIFACT_URL\s+(\S+)", tail)
+        if not url_match:
+            lines.append(
+                "[FAILED] The job completed but printed no ARTIFACT_URL, so no MP4 was "
+                "uploaded. Read the log tail below."
+            )
+        else:
+            artifact_url = url_match.group(1)
+            video_bytes = _hf_fetch_artifact(artifact_url)
+            if not video_bytes:
+                lines.append(f"[FAILED] Could not download {artifact_url} with the current HF_TOKEN.")
+            elif b"ftyp" not in video_bytes[:32]:
+                lines.append(f"[FAILED] {len(video_bytes)} bytes downloaded but it is not an MP4.")
+            else:
+                file_name = artifact_url.rsplit("/", 1)[-1]
+                delivered = _telegram_send_video(
+                    video_bytes, file_name, f"🎬 Chintu · Hugging Face ({HF_RENDER_FLAVOR}) render"
+                )
+                lines.append(f"[SUCCESS] {len(video_bytes)} byte MP4 at {artifact_url}")
+                lines.append(
+                    "delivered to Telegram." if delivered else "(no Telegram chat bound; artifact is on the Hub)."
+                )
+    elif stage in ("ERROR", "CANCELED", "DELETED"):
+        lines.append(
+            "[FAILED] The Job did not complete. Read the log tail below, fix the cause, then "
+            "either resubmit with render_html_video or fall back to the sandbox backend with "
+            'render_html_video(html, backend="e2b").'
+        )
+    else:
+        lines.append(
+            "Still running (the container installs its toolchain before rendering). Call "
+            "hf_render_status again with a wait_seconds budget to keep waiting."
+        )
+    lines.append("--- job log tail ---")
+    lines.append(tail)
+    return "\n".join(lines)
+
 def render_html_video(
     html: str,
     project_name: str = "chintu-motion",
     fps: int = 30,
     quality: str = "looks",
+    backend: str = "auto",
 ) -> str:
-    """Render a HyperFrames HTML/GSAP composition to MP4 in the cloud VM and deliver it.
+    """Render a HyperFrames HTML/GSAP composition to MP4 in the cloud and deliver it.
 
     This is the executable form of directive 7: the composition is linted and then
     rendered by the real `hyperframes` CLI (chrome-headless-shell + system ffmpeg),
     so seekable GSAP timelines and deterministic frame capture stay the framework's
     job instead of being hand-rolled.
 
+    Two backends: with HF_TOKEN configured the render is submitted to a Hugging Face
+    Job on `cpu-basic` (2 vCPU / 16 GB RAM / 50 GB disk) and this call returns at once
+    with a job id to hand to `hf_render_status`; otherwise the E2B sandbox path below
+    runs to completion in this call.
+
     Args:
         html: The full composition document (root carries data-composition-id and
             registers window.__timelines["<id>"] as one paused GSAP timeline).
-        project_name: Kebab-case project directory name under /home/user/videos.
+        project_name: Kebab-case project directory name.
         fps: Frame rate recorded on the render (24-240; 30 typical).
         quality: draft (fast iteration), looks (default) or delivery (final).
+        backend: auto (default), huggingface or e2b.
     """
-    if not E2B_API_KEY:
-        return "Error: E2B_API_KEY is not configured."
+    backend = (backend or "auto").strip().lower()
+    if backend not in ("auto", "huggingface", "hf", "e2b"):
+        return f"Unknown render backend '{backend}'. Use 'auto', 'huggingface' or 'e2b'."
     problem = _validate_composition_html(html)
     if problem:
         return f"Composition rejected before render: {problem}"
     slug = re.sub(r"[^a-z0-9-]+", "-", (project_name or "chintu-motion").lower()).strip("-")
     slug = slug or "chintu-motion"
+    if backend in ("auto", "huggingface", "hf") and HF_TOKEN:
+        return _hf_submit_render(html, slug, fps, quality)
+    if backend in ("huggingface", "hf"):
+        return "Error: HF_TOKEN is not configured, so the Hugging Face Jobs backend is unavailable."
+    if not E2B_API_KEY:
+        return "Error: E2B_API_KEY is not configured."
     project_dir = f"/home/user/videos/{slug}"
     sbx = None
     try:
@@ -806,7 +1164,8 @@ ALL_TOOLS_LIST = [
     web_search_research,
     list_skills,
     load_skill,
-    render_html_video
+    render_html_video,
+    hf_render_status
 ]
 
 SYSTEM_INSTRUCTION = """You are Chintu, an autonomous execution assistant.
@@ -818,7 +1177,7 @@ STRICT OPERATIONAL DIRECTIVES:
 4. CONCISE FACTUAL OUTPUT: Report only actual ground truth from tool execution stdout and stderr.
 5. SANDBOX CODE HYGIENE: Submit a single, syntactically valid `run_task.py` (validate it with `ast.parse` before sending). Do not mix root-level shell commands (cat/curl/ffmpeg/...) into Python source; invoke them through `subprocess` when required.
 6. SKILL LIBRARY: You ship with a curated skill library. Call `list_skills` to enumerate it and `load_skill` to read the real documentation before writing code in an unfamiliar domain. For ANY motion-graphics or animated-video request, load `hyperframes` FIRST (its router, composition contract and CLI docs), then `motion_graphics_prompts` for direction, then follow the APIs you actually read instead of inventing signatures. Long docs are paged: when a response says TRUNCATED, keep going with `load_skill(name, path, offset=<shown_end>)` until you have the section you need.
-7. MOTION GRAPHICS PIPELINE: Author motion graphics as HTML/CSS with a single paused GSAP timeline, then render them with `render_html_video` — it lints and renders inside the cloud VM through the real hyperframes CLI (chrome-headless-shell + ffmpeg), which installs Node and the Chrome runtime libraries on that path. Keep the pure-Python route (Pillow + NumPy frames stitched by system `ffmpeg`) only as the fallback when `render_html_video` reports the toolchain could not be provisioned. An 8-second 30fps 1080p render takes roughly a minute of capture time, so keep short-form pieces short and use `quality="draft"` while iterating. Use `whisper` only when audio must be transcribed for captions or voice-over timing.
+7. MOTION GRAPHICS PIPELINE: Author motion graphics as HTML/CSS with a single paused GSAP timeline, then render them with `render_html_video`. It prefers a Hugging Face Job on the 16 GB `cpu-basic` flavor (2 vCPU / 16 GB RAM, $0.01/hour) whenever HF_TOKEN is configured, and falls back to the E2B sandbox otherwise; both lints and renders through the real hyperframes CLI (chrome-headless-shell + ffmpeg). A Job is ASYNCHRONOUS: `render_html_video` returns a `HF_JOB_ID` immediately, so you must then call `hf_render_status(job_id="<id>", wait_seconds=600)` to wait for it, read the logs and let the MP4 be delivered to Telegram. Report the artifact facts the job prints (ffprobe size/frames, the `[VERIFIED]`/`[SUCCESS]` lines), never an assumed result. If a Job fails, fix the reported cause or rerun with `render_html_video(..., backend="e2b")`. Keep the pure-Python route (Pillow + NumPy frames stitched by system `ffmpeg`) only as the last resort. A 9-second 30fps 1080p render is roughly a minute of capture on top of a few minutes of container setup, so keep short-form pieces short and use `quality="draft"` while iterating. Use `whisper` only when audio must be transcribed for captions or voice-over timing.
 """
 
 def _sync_chat_call(model_name: str, message: str) -> str:
@@ -998,6 +1357,14 @@ def health_check():
         "tools_count": len(ALL_TOOLS_LIST),
         "skills": list(SKILL_REGISTRY.keys()),
         "skills_count": len(SKILL_REGISTRY),
+        "render_backends": {
+            "huggingface_jobs": bool(HF_TOKEN),
+            "e2b_sandbox": bool(E2B_API_KEY),
+            "hf_flavor": HF_RENDER_FLAVOR,
+            "hf_image": HF_RENDER_IMAGE,
+            "hf_timeout": HF_RENDER_TIMEOUT,
+            "hf_artifact_repo": HF_ARTIFACT_REPO or f"<namespace>/{HF_ARTIFACT_REPO_NAME}",
+        },
         "timestamp": datetime.utcnow().isoformat()
     }
 

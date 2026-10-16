@@ -11,5 +11,5 @@ matplotlib
 PyGithub
 apscheduler
 praw
-huggingface_hub
+huggingface_hub>=0.36
 composio

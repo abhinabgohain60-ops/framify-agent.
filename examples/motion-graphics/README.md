@@ -3,9 +3,11 @@
 A known-good HyperFrames composition plus the exact toolchain and commands needed to
 render it. Verified end-to-end on Linux x64 (Ubuntu 24.04, Node 24, no root).
 
-- **Composition**: kinetic type, three scenes (wordmark → capability rows → lockup)
-- **Artifact**: `renders/video.mp4` — H.264, 1920x1080, 30 fps, 240 frames, 8.000 s
-  (`ffprobe -count_frames` independently decodes 240 pictures)
+- **Compositions**: `index.html` (root + three sub-compositions) and `single-file.html` (the same
+  piece as one HTML string — the shape `render_html_video` can actually deliver)
+- **Artifacts**: `renders/video.mp4` — H.264, 1920x1080, 30 fps, 240 frames, 8.000 s;
+  `renders/single-file.mp4` — H.264, 1920x1080, 30 fps, 270 frames, 9.000 s (1,965,046 bytes)
+  (`ffprobe -count_frames` independently decodes the picture count of both)
 - **Capture mode**: `screenshot` + `software gpu` (no GPU in a headless VM)
 
 ## Requirements
@@ -64,6 +66,60 @@ for final output.
   `0 sample(s)` / `0/0 text checks`. A clean-looking report at that point means nothing
   ran; clear lint errors first.
 
+## The single-file variant (`single-file.html`)
+
+`render_html_video` takes **one HTML string**, so a composition that mounts its scenes through
+`data-composition-src` cannot be sent through it. `single-file.html` is the same piece built to
+that constraint: every scene inline, one registered timeline driving all of them.
+
+The rules that actually bit while building it:
+
+- **Drop the `.clip` wrapper when the markup is inline.** A timeline element containing nested
+  markup lints `nested_structure_needs_subcomposition` (the tooling expects clips to *mount*
+  sub-compositions). Leaving `#stage` as plain markup keeps the root `data-duration` as the length
+  source and the report clean.
+- **Never animate `letterSpacing`** — `gsap_non_transform_motion`, an *error*. It reflows text and
+  snaps glyphs to integer device pixels, which stutters under seek-by-frame capture. Split the
+  wordmark into per-glyph spans and animate each glyph's `x` (the spread) instead.
+- **An exit must finish before the next entrance starts.** Overlapping a fading-out scene with an
+  entering one is a `content_overlap` layout finding rather than a style choice, because the
+  audit samples that instant too.
+- A lint **error** silently disables the layout and contrast audits, so a clean-looking report at
+  that moment proves nothing.
+
+`check .` on this file: **0 lint, 0 runtime, 0 motion, 0 layout issues across 9 samples, 24/24
+WCAG AA text checks**.
+
+## Rendering on Hugging Face Jobs (the 16 GB `cpu-basic` flavor)
+
+`render_html_video` submits the render to a Hugging Face **Job** whenever `HF_TOKEN` is set:
+`cpu-basic` is 2 vCPU / **16 GB RAM** / 50 GB disk at $0.01 per hour, billed per minute, so the
+20-minute timeout costs at most about $0.003. The RAM is the point — HyperFrames pins itself to one
+worker and screenshot capture below 8 GB (`totalMemMb` vs `thresholdMb: 8192` in its render log).
+This machine reports `totalMemMb: 8011` and renders solo; a Job reports 16 GB and takes the
+calibrated multi-worker path.
+
+The job script (**`HF_RENDER_JOB_SCRIPT` in `main.py`**, the single source of truth for what the
+remote container executes) runs on `node:22-bookworm` and:
+
+1. installs `ffmpeg`, `curl`, fonts and the 16 Chrome runtime packages — one `apt-get` per package,
+   so a single missing name cannot abort the install;
+2. decodes the composition and project config from base64 env vars into `/tmp/chintu-render/<slug>/`;
+3. `doctor` → `browser ensure` → `lint` → `render . --skill=motion-graphics -f <fps> -q <quality>`;
+4. proves the MP4 on disk with `ffprobe -count_frames` and prints `RENDER_VERIFIED <path> <bytes>`;
+5. commits it to the artifact dataset in **one** request to the Hub commit API
+   (`POST /api/datasets/<repo>/commit/main`, NDJSON with base64 content, assembled through a file
+   rather than argv) and prints `ARTIFACT_URL`.
+
+`render_html_video` returns immediately with `HF_JOB_ID=<id>`; `hf_render_status(job_id,
+wait_seconds=600)` waits for a terminal stage, reads the log tail, downloads the artifact and
+delivers it to Telegram. The MP4 then exists twice: in the private Hub dataset and in the chat.
+
+Configuration: `HF_TOKEN` (write scope) plus a positive compute-credit balance on the account;
+the artifact dataset defaults to `<your-namespace>/chintu-renders` (override with
+`HF_ARTIFACT_REPO`) and is created private on first use. Set `HF_RENDER_FLAVOR=cpu-upgrade`
+(8 vCPU / 32 GB, $0.03/hour) when a render is too slow rather than too large.
+
 ## Measured on this machine (2 cores, 3.8 GB, software GL)
 
 | Stage | Time |
@@ -71,8 +127,11 @@ for final output.
 | `check` | ~20 s |
 | 3 snapshots | ~15 s |
 | `render` 240 frames @1080p, `-q delivery` | 50.2 s (49.2 s capture + encode) |
+| `render` 270 frames @1080p, `-q looks` | 67.4 s (compile 0.6 s + capture 66.1 s + assemble 0.1 s) |
 
-Static-frame dedup reused 22/188 predicted frames (~12%) on the plain-wordmark beats.
+Static-frame dedup reused 22/188 predicted frames (~12%) on the plain-wordmark beats. The 270-frame
+figure was measured running the shipped job script verbatim (`HF_JOB_INSTALL=0`, this VM's
+toolchain, uploads pointed at a local mock of the Hub endpoint).
 
 ## Installing the browser without root
 
