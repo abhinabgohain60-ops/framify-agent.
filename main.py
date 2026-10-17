@@ -46,10 +46,16 @@ RENDER_SERVICE_ID = os.environ.get("RENDER_SERVICE_ID", "")
 OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "")
 OPENROUTER_BASE_URL = os.environ.get("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1")
 # Frontier-reasoning cascade used only after every Gemini key slot is exhausted.
+# Verified against OpenRouter's live catalog on 2026-10-17 (zero 404 risk):
+# `openrouter/free` is the official free router slot, `nvidia/nemotron-3-super
+# -120b-a12b:free` is a tool-capable zero-priced frontier model, and
+# `cohere/north-mini-code:free` is the verified free agentic-coding slot.
+# NOTE: the requested `qwen/qwen3.8-27b:free` returns HTTP 404 on the live
+# catalog (only the paid `qwen/qwen3.8-27b` exists), so it was substituted.
 OPENROUTER_MODELS: List[str] = [
-    "anthropic/claude-3.5-sonnet",
-    "deepseek/deepseek-chat",
-    "qwen/qwen-2.5-coder-32b-instruct",
+    "openrouter/free",
+    "nvidia/nemotron-3-super-120b-a12b:free",
+    "cohere/north-mini-code:free",
 ]
 EXTERNAL_REQUEST_TIMEOUT = 600
 EXTERNAL_MAX_TOOL_ROUNDS = 6
@@ -349,7 +355,7 @@ CURRENT_EVENT_LOOP: Optional[asyncio.AbstractEventLoop] = None
 # --------------------------------------------------------- render-brain boundary
 # Render runs on ~512 MB. It hosts the API, the Telegram lifecycle, the status
 # card, tool routing and LLM orchestration — and nothing else. Frame buffers,
-# headless Chromium and FFmpeg belong to the 16 GB Space or the E2B microVM, so
+# headless Chromium and FFmpeg belong to the E2B microVM render engine, so
 # importing any of these locally is an operational defect, not a style choice.
 LOCAL_MEDIA_IMPORTS = (
     "PIL", "playwright", "moviepy", "cv2", "imageio",
@@ -630,124 +636,53 @@ HYPERFRAMES_PROJECT_CONFIG: Dict[str, Any] = {
     "authoringSkill": HYPERFRAMES_SKILL,
 }
 
-# ------------------------------------------------- Hugging Face Jobs renderer
-# The point of this backend is the hardware: Hugging Face's `cpu-basic` flavor is
-# 2 vCPU / 16 GB RAM / 50 GB disk at $0.01 per hour, billed per minute. HyperFrames
-# switches to a single-worker screenshot profile below 8 GB of RAM (its render log
-# prints `totalMemMb` next to `thresholdMb: 8192`), which is what the smaller render
-# VM hits, so a Job both fits the composition in memory and is cheap enough to
-# treat as a per-render utility. System tools are installed inside the Job because
-# a Job image must already exist: `node:22-bookworm` is a public Docker Hub image
-# that satisfies HyperFrames' Node >= 22 floor and lets apt install the rest.
-HF_RENDER_FLAVOR = os.environ.get("HF_RENDER_FLAVOR", "cpu-basic")
-HF_RENDER_IMAGE = os.environ.get("HF_RENDER_IMAGE", "node:22-bookworm")
-HF_RENDER_TIMEOUT = os.environ.get("HF_RENDER_TIMEOUT", "20m")
-HF_RENDER_JOB_NAME = os.environ.get("HF_RENDER_JOB_NAME", "chintu-motion-render")
-HF_ARTIFACT_REPO = os.environ.get("HF_ARTIFACT_REPO", "")
-HF_ARTIFACT_REPO_NAME = os.environ.get("HF_ARTIFACT_REPO_NAME", "chintu-renders")
-HF_RENDER_WAIT_SECONDS = int(os.environ.get("HF_RENDER_WAIT_SECONDS", "300"))
-HF_ENDPOINT = os.environ.get("HF_ENDPOINT", "https://huggingface.co").rstrip("/")
-
-# --------------------------------------------------- Hugging Face Space renderer
-# The preferred heavy engine is a dedicated Docker Space on the 16 GB CPU tier
-# (`cpu-basic`: 2 vCPU / 16 GB RAM / 50 GB disk). It is an ordinary HTTP worker:
-# POST the composition, poll the job, download the MP4. Spaces proxy a single
-# request with a short gateway timeout, so the worker returns a job id at once
-# and the brain polls it — a multi-minute render can never be one blocking call.
-# The Space is stateless from the brain's point of view; it is configured with
-#
-#     HF_SPACE_URL=https://<namespace>-chintu-render.hf.space
-#     HF_SPACE_SECRET=<the Space's HF_RENDER_SECRET>
-#
-# and its code lives in `space/` in this repository (Dockerfile + app.py).
+# ============================================================ E2B render engine
+# ALL video rendering happens in an isolated E2B microVM, one synchronous call.
+# The Hugging Face render backends (Docker Space worker and cpu-basic Jobs) were
+# RETIRED: compute Spaces now require a paid PRO plan and free accounts can only
+# create Static Spaces, which cannot run backend media rendering. `space/` stays
+# in the repository as archived reference but is no longer in the dispatch chain.
 COMPUTE_ROLE = "brain"
-HF_SPACE_URL = os.environ.get("HF_SPACE_URL", "").rstrip("/")
-HF_SPACE_SECRET = os.environ.get("HF_SPACE_SECRET", "") or os.environ.get("HF_SPACE_TOKEN", "")
-HF_SPACE_POLL_SECONDS = float(os.environ.get("HF_SPACE_POLL_SECONDS", "4"))
-HF_SPACE_MAX_WAIT_SECONDS = int(os.environ.get("HF_SPACE_MAX_WAIT_SECONDS", "1500"))
 
-# Runs INSIDE the Job. Kept here rather than in a separate file so the deployed
-# process is the single source of truth for what the remote container executes.
-# Set HF_JOB_INSTALL=0 for an image that already ships the toolchain.
-HF_RENDER_JOB_SCRIPT = r"""
-set -euo pipefail
-echo "[hf-render] boot node=$(node -v 2>/dev/null || echo missing) cpus=$(nproc 2>/dev/null || echo '?') mem=$(free -m 2>/dev/null | awk '/^Mem:/{print $2" MB"}' || echo '?')"
-: "${COMPOSITION_B64:?COMPOSITION_B64 payload is missing}"
-: "${PROJECT_SLUG:=chintu-motion}"
-: "${RENDER_FPS:=30}"
-: "${RENDER_QUALITY:=looks}"
-: "${HYPERFRAMES_VERSION:=0.8.160}"
-: "${HF_ENDPOINT:=https://huggingface.co}"
+# Renders produce large temp intermediates, but the sandbox image boots with
+# under 1 GB free in /tmp and the observed production failure was exactly:
+# "Low disk space: 1.0 GB free at /tmp". Every execution path therefore purges
+# caches and temp dirs and repoints TMPDIR at /home/user/tmp (larger volume)
+# BEFORE running the workload.
+E2B_TMP_DIR = os.environ.get("E2B_TMP_DIR", "/home/user/tmp")
 
-if [ "${HF_JOB_INSTALL:-1}" = "1" ] && command -v apt-get >/dev/null 2>&1; then
-  export DEBIAN_FRONTEND=noninteractive
-  apt-get update -qq || echo "[hf-render] WARN apt-get update reported errors"
-  apt-get install -y -qq --no-install-recommends ffmpeg curl ca-certificates fonts-liberation fonts-dejavu-core \
-    || echo "[hf-render] WARN base toolchain install reported errors"
-  # One package at a time so a single missing name cannot abort the whole install.
-  for pkg in libnss3 libnspr4 libatk1.0-0 libatk-bridge2.0-0 libcups2 libdrm2 libxkbcommon0 \
-             libxcomposite1 libxdamage1 libxfixes3 libxrandr2 libgbm1 libasound2 \
-             libpango-1.0-0 libcairo2 libatspi2.0-0; do
-    apt-get install -y -qq --no-install-recommends "$pkg" >/dev/null 2>&1 \
-      || echo "[hf-render] WARN could not install $pkg"
-  done
-fi
-command -v ffmpeg >/dev/null 2>&1 || { echo "[hf-render] FAILED ffmpeg is not on PATH"; exit 1; }
-ldconfig -p 2>/dev/null | grep -q libnspr4 || echo "[hf-render] WARN libnspr4 absent from the linker cache; Chrome may not start"
 
-PROJECT_DIR="/tmp/chintu-render/$PROJECT_SLUG"
-mkdir -p "$PROJECT_DIR/renders"
-printf '%s' "$COMPOSITION_B64" | base64 -d > "$PROJECT_DIR/index.html"
-if [ -n "${HYPERFRAMES_JSON_B64:-}" ]; then
-  printf '%s' "$HYPERFRAMES_JSON_B64" | base64 -d > "$PROJECT_DIR/hyperframes.json"
-fi
-cd "$PROJECT_DIR"
-echo "[hf-render] staged $(wc -c < index.html) bytes of composition in $PROJECT_DIR"
+def _e2b_disk_prep_cmd() -> str:
+    """Shell that frees disk space and stages the writable TMPDIR, then reports."""
+    return (
+        "rm -rf /tmp/* ~/.cache/* /var/tmp/* 2>/dev/null || true ; "
+        f"mkdir -p {E2B_TMP_DIR} ; "
+        f"export TMPDIR={E2B_TMP_DIR} ; "
+        "df -h /tmp ${TMPDIR:-/tmp} 2>/dev/null | tail -3"
+    )
 
-HF="npx --yes hyperframes@$HYPERFRAMES_VERSION"
-$HF doctor --json 2>&1 | tail -40 || echo "[hf-render] WARN doctor reported problems"
-$HF browser ensure || { echo "[hf-render] FAILED could not ensure the pinned Chrome"; exit 1; }
-$HF lint . || echo "[hf-render] WARN lint reported issues; rendering anyway"
-$HF render . --skill=motion-graphics -f "$RENDER_FPS" -q "$RENDER_QUALITY" -o ./renders/video.mp4
 
-VIDEO="$PROJECT_DIR/renders/video.mp4"
-[ -s "$VIDEO" ] || { echo "[hf-render] FAILED no MP4 written to $VIDEO"; exit 1; }
-echo "[hf-render] ffprobe:"
-ffprobe -v error -select_streams v:0 -count_frames \
-  -show_entries stream=width,height,r_frame_rate,nb_read_frames \
-  -show_entries format=duration,size -of default=noprint_wrappers=1 "$VIDEO" || true
-echo "[hf-render] RENDER_VERIFIED $VIDEO $(wc -c < "$VIDEO") bytes"
+def e2b_disk_prep(sbx: Any) -> str:
+    """Run the pre-render cleanup inside the sandbox and return its disk report."""
+    try:
+        res = sbx.commands.run(_e2b_disk_prep_cmd(), timeout=0)
+    except Exception as err:
+        logger.warning(f"[E2B disk] pre-render cleanup could not run: {err}")
+        return ""
+    report = (getattr(res, "stdout", "") or "").strip()
+    logger.info(f"[E2B disk] pre-render cleanup applied; disk report: {report}")
+    return report
 
-if [ -n "${HF_ARTIFACT_REPO:-}" ] && [ -n "${HF_TOKEN:-}" ]; then
-  # One request, no client library: the Hub's commit API takes NDJSON with the
-  # file base64-encoded. base64 goes through a file, never argv (a multi-MB
-  # argument would blow past the kernel's per-argument limit).
-  base64 -w 0 "$VIDEO" > /tmp/artifact.b64
-  {
-    printf '{"key":"header","value":{"summary":"chintu render: %s"}}\n' "$HF_ARTIFACT_PATH"
-    printf '{"key":"file","value":{"path":"%s","encoding":"base64","content":"' "$HF_ARTIFACT_PATH"
-    cat /tmp/artifact.b64
-    printf '"}}\n'
-  } > /tmp/commit.ndjson
-  code=$(curl -sS -o /tmp/commit.out -w '%{http_code}' -X POST \
-    -H "Authorization: Bearer $HF_TOKEN" \
-    -H "Content-Type: application/x-ndjson" \
-    --data-binary @/tmp/commit.ndjson \
-    "$HF_ENDPOINT/api/datasets/$HF_ARTIFACT_REPO/commit/main")
-  echo "[hf-render] artifact upload http=$code body=$(head -c 300 /tmp/commit.out)"
-  if [ "$code" = "200" ]; then
-    echo "[hf-render] ARTIFACT_URL $HF_ENDPOINT/datasets/$HF_ARTIFACT_REPO/resolve/main/$HF_ARTIFACT_PATH"
-  else
-    echo "[hf-render] FAILED artifact upload (HTTP $code)"
-    exit 1
-  fi
-else
-  echo "[hf-render] WARN no HF_ARTIFACT_REPO/HF_TOKEN; the MP4 stays inside the Job"
-fi
-echo "[hf-render] DONE"
-"""
 
-_hf_namespace_cache: Dict[str, str] = {}
+def _e2b_cmd_with_prep(command: str) -> str:
+    """Prefix a sandbox command with cleanup + TMPDIR so temp writes survive."""
+    return (
+        "rm -rf /tmp/* ~/.cache/* /var/tmp/* 2>/dev/null || true ; "
+        f"mkdir -p {E2B_TMP_DIR} ; "
+        f"export TMPDIR={E2B_TMP_DIR} ; "
+        f"{command}"
+    )
+
 
 def _telegram_send_video(video_bytes: bytes, file_name: str, caption: str = "") -> bool:
     """Post MP4 bytes to the bound Telegram chat. Returns True only on HTTP 200."""
@@ -787,12 +722,14 @@ def _deliver_rendered_video(sbx: Any, extra_dirs: Any = ()) -> bool:
 
 def _provision_render_toolchain(sbx: Any, want_browser: bool = False) -> str:
     """Install the ffmpeg/frame stack, plus Node + Chrome when HyperFrames must render."""
+    # Disk hygiene first: the boot image has < 1 GB free in /tmp, which previously
+    # failed renders with "Low disk space". Purge + stage TMPDIR before installing.
     base = (
         "command -v ffmpeg >/dev/null 2>&1 || "
         "(sudo apt-get update -qq && sudo apt-get install -y -qq ffmpeg) ; "
         "pip install --quiet --no-cache-dir pillow \"numpy<2\" scipy edge-tts"
     )
-    sbx.commands.run(base, timeout=0)
+    sbx.commands.run(_e2b_cmd_with_prep(base), timeout=0)
     if not want_browser:
         return "ffmpeg + python frame stack ready"
     # Node is only needed for the HyperFrames renderer, so it is installed on
@@ -805,6 +742,8 @@ def _provision_render_toolchain(sbx: Any, want_browser: bool = False) -> str:
         "sudo apt-get install -y -qq nodejs ; fi ; "
         f"npx --yes hyperframes@{HYPERFRAMES_VERSION} browser ensure"
     )
+    # Chrome/Node cache and extraction also land in /tmp; run with prep as well.
+    sbx.commands.run(_e2b_cmd_with_prep("true"), timeout=0)
     res = sbx.commands.run(browser_cmd, timeout=0)
     exit_code = getattr(res, "exit_code", "unknown")
     logger.info(f"[HyperFrames] browser toolchain provisioning exit={exit_code}")
@@ -828,432 +767,7 @@ def _validate_composition_html(html: str) -> Optional[str]:
         return "the composition references moviepy, which is forbidden in this pipeline."
     return None
 
-# ------------------------------------------------ Hugging Face Space transport
-def _hf_space_path(path: str) -> str:
-    return f"{HF_SPACE_URL}{path if path.startswith('/') else '/' + path}"
-
-
-def _hf_space_headers(json_body: bool = True) -> Dict[str, str]:
-    headers = {"Accept": "application/json"}
-    if json_body:
-        headers["Content-Type"] = "application/json"
-    secret = HF_SPACE_SECRET or HF_TOKEN
-    if secret:
-        headers["Authorization"] = f"Bearer {secret}"
-    return headers
-
-
-def hf_space_health() -> str:
-    """Readiness and hardware facts for the 16 GB render Space."""
-    if not HF_SPACE_URL:
-        return "Error: HF_SPACE_URL is not configured (expected https://<namespace>-chintu-render.hf.space)."
-    try:
-        res = requests.get(_hf_space_path("/health"), timeout=30)
-    except Exception as e:
-        return (
-            f"16 GB render Space unreachable at {HF_SPACE_URL}: {e}. "
-            "A Space rebuild takes a few minutes after a code push."
-        )
-    if res.status_code != 200:
-        return f"Render Space health failed (HTTP {res.status_code}): {res.text[:400]}"
-    try:
-        return json.dumps(res.json(), indent=2, sort_keys=True)
-    except Exception:
-        return res.text[:2000]
-
-
-def _hf_space_submit(html: str, slug: str, fps: int, quality: str, narration: str = "") -> str:
-    """POST a composition to the 16 GB Space worker and return its job id."""
-    if not HF_SPACE_URL:
-        return (
-            "Error: the 16 GB render Space is not configured. Set HF_SPACE_URL to the "
-            "Space origin (https://<namespace>-chintu-render.hf.space) and redeploy Render."
-        )
-    payload = {
-        "html": html,
-        "project_slug": slug,
-        "fps": int(fps),
-        "quality": quality,
-        "narration": (narration or "").strip(),
-    }
-    try:
-        res = requests.post(
-            _hf_space_path("/render"),
-            json=payload,
-            headers=_hf_space_headers(),
-            timeout=90,
-        )
-    except Exception as e:
-        return (
-            f"16 GB render Space unreachable at {HF_SPACE_URL}: {e}\n"
-            "The composition was NOT rendered. Check the Space is running, then retry "
-            "or use render_html_video(..., backend=\"e2b\") for the isolated microVM."
-        )
-    if res.status_code in (401, 403):
-        return (
-            f"Render Space rejected the request (HTTP {res.status_code}): the shared secret "
-            "does not match. HF_SPACE_SECRET on Render must equal HF_RENDER_SECRET on the Space."
-        )
-    if res.status_code == 503:
-        return (
-            "Render Space is starting or sleeping (HTTP 503). Wait for the build to finish "
-            "and call render_html_video again; the job was not queued."
-        )
-    if res.status_code not in (200, 202):
-        return f"Render Space rejected the composition (HTTP {res.status_code}): {res.text[:600]}"
-    try:
-        data = res.json()
-    except Exception:
-        return f"Render Space returned a non-JSON body: {res.text[:400]}"
-    job_id = str((data or {}).get("job_id") or "").strip()
-    if not job_id:
-        return f"Render Space accepted the request but returned no job_id: {res.text[:300]}"
-    emit_progress(80, PROGRESS_MILESTONES[3][1], video=True)
-    return (
-        "Hugging Face Space render submitted to the 16 GB worker.\n"
-        f"HF_JOB_ID=space:{job_id}\n"
-        f"engine: {HF_SPACE_URL} (cpu-basic: 2 vCPU / 16 GB RAM / 50 GB disk)\n"
-        f"composition: {slug} | {len(html)} chars | {int(fps)} fps | quality={quality}\n"
-        f"narration: {'edge-tts voice-over requested' if narration else 'none'}\n"
-        f"Now call hf_render_status(job_id=\"space:{job_id}\", wait_seconds={HF_RENDER_WAIT_SECONDS}) "
-        "to wait for the frames, then read the ffprobe facts and let the MP4 be delivered to Telegram."
-    )
-
-
-def _hf_space_status(job_id: str, wait_seconds: int = 0) -> str:
-    """Poll one Space render job, download the MP4 and deliver it to Telegram."""
-    if not HF_SPACE_URL:
-        return "Error: HF_SPACE_URL is not configured, so no Space job can be polled."
-    job_id = (job_id or "").replace("space:", "", 1).strip()
-    if not job_id:
-        return "Error: job_id is required; pass the space:<id> printed by render_html_video."
-    budget = max(0, min(int(wait_seconds or 0), HF_SPACE_MAX_WAIT_SECONDS))
-    deadline = time.monotonic() + budget
-    snapshot: Dict[str, Any] = {}
-    while True:
-        try:
-            res = requests.get(
-                _hf_space_path(f"/status/{job_id}"),
-                headers=_hf_space_headers(json_body=False),
-                timeout=60,
-            )
-        except Exception as e:
-            return f"Render Space became unreachable while polling {job_id}: {e}"
-        if res.status_code == 404:
-            return f"Unknown Space render job '{job_id}'. It may have been evicted; resubmit the render."
-        if res.status_code in (401, 403):
-            return f"Render Space refused the status poll (HTTP {res.status_code}): check HF_SPACE_SECRET."
-        if res.status_code != 200:
-            return f"Render Space status failed (HTTP {res.status_code}): {res.text[:400]}"
-        try:
-            snapshot = res.json() or {}
-        except Exception:
-            return f"Render Space returned a non-JSON status body: {res.text[:300]}"
-        status = str(snapshot.get("status") or "running").lower()
-        percent = int(snapshot.get("percent") or 0)
-        if status == "running" and percent >= 55:
-            emit_progress(min(95, percent), str(snapshot.get("stage") or ""), video=True)
-        if status in ("completed", "failed") or time.monotonic() >= deadline:
-            break
-        time.sleep(HF_SPACE_POLL_SECONDS)
-
-    status = str(snapshot.get("status") or "running").lower()
-    lines = [
-        f"Hugging Face Space render job {job_id}",
-        f"status: {status.upper()}",
-        f"engine: {HF_SPACE_URL} (cpu-basic, 16 GB RAM)",
-    ]
-    if status == "completed":
-        probe = snapshot.get("probe") or {}
-        if probe:
-            lines.append(
-                "[VERIFIED] {frames} frames | {width}x{height} @ {fps}fps | {duration}s | {size} bytes".format(
-                    frames=probe.get("frames"),
-                    width=probe.get("width"),
-                    height=probe.get("height"),
-                    fps=probe.get("fps"),
-                    duration=probe.get("duration"),
-                    size=probe.get("bytes"),
-                )
-            )
-        emit_progress(95, PROGRESS_MILESTONES[4][1], video=True)
-        try:
-            art = requests.get(
-                _hf_space_path(f"/artifact/{job_id}"),
-                headers=_hf_space_headers(json_body=False),
-                timeout=180,
-            )
-        except Exception as e:
-            lines.append(f"[FAILED] Could not download the artifact: {e}")
-        else:
-            if art.status_code != 200 or not art.content:
-                lines.append(f"[FAILED] Artifact download returned HTTP {art.status_code}.")
-            elif b"ftyp" not in art.content[:64]:
-                lines.append(f"[FAILED] {len(art.content)} bytes downloaded but it is not an MP4.")
-            else:
-                delivered = _telegram_send_video(
-                    art.content,
-                    f"chintu-{job_id}.mp4",
-                    "🎬 Chintu · Hugging Face Space (16 GB) render",
-                )
-                lines.append(f"[SUCCESS] {len(art.content)} byte MP4 decoded and verified on the worker.")
-                lines.append(
-                    "Delivered to Telegram."
-                    if delivered
-                    else "(no Telegram chat bound; the artifact stays on the Space)."
-                )
-    elif status == "failed":
-        lines.append(f"[FAILED] {snapshot.get('error') or 'the worker reported a failure'}")
-        lines.append("Read the worker log tail, fix the cause, then resubmit or use backend='e2b'.")
-    else:
-        lines.append(
-            "Still rendering. Call hf_render_status again with a wait_seconds budget to keep waiting."
-        )
-    log_tail = (snapshot.get("log_tail") or "")[-6000:]
-    if log_tail:
-        lines.append("--- worker log tail ---")
-        lines.append(log_tail)
-    return "\n".join(lines)
-
-
-def _hf_jobs_api() -> Dict[str, Any]:
-    """Import the Jobs client lazily so the agent still boots without it."""
-    try:
-        from huggingface_hub import cancel_job, fetch_job_logs, inspect_job, run_job, wait_for_job
-    except Exception as e:
-        return {
-            "error": (
-                f"Hugging Face Jobs client unavailable: {e}. "
-                "Install or upgrade with: pip install -U 'huggingface_hub>=0.36'"
-            )
-        }
-    return {"run": run_job, "inspect": inspect_job, "logs": fetch_job_logs, "wait": wait_for_job, "cancel": cancel_job}
-
-def _hf_namespace() -> str:
-    """Resolve the token's own namespace so artifacts get a home repository."""
-    if _hf_namespace_cache.get("name"):
-        return _hf_namespace_cache["name"]
-    try:
-        res = requests.get(
-            f"{HF_ENDPOINT}/api/whoami-v2",
-            headers={"Authorization": f"Bearer {HF_TOKEN}"},
-            timeout=15,
-        )
-        if res.status_code == 200:
-            name = (res.json() or {}).get("name") or ""
-            if name:
-                _hf_namespace_cache["name"] = name
-                return name
-        return f"Error: could not resolve the Hugging Face namespace (HTTP {res.status_code})."
-    except Exception as e:
-        return f"Error: could not reach {HF_ENDPOINT} to resolve the namespace ({e})."
-
-def _hf_artifact_repo() -> str:
-    """The dataset repository that render artifacts are committed to."""
-    if HF_ARTIFACT_REPO:
-        return HF_ARTIFACT_REPO
-    namespace = _hf_namespace()
-    if namespace.startswith("Error"):
-        return namespace
-    return f"{namespace}/{HF_ARTIFACT_REPO_NAME}"
-
-def _hf_ensure_dataset_repo(repo_id: str) -> str:
-    """Create the artifact dataset when absent. Returns "" on success, else a message."""
-    owner, _, name = repo_id.partition("/")
-    payload: Dict[str, Any] = {"type": "dataset", "name": name or owner, "private": True}
-    if name:
-        payload["organization"] = owner
-    try:
-        res = requests.post(
-            f"{HF_ENDPOINT}/api/repos/create",
-            headers={"Authorization": f"Bearer {HF_TOKEN}", "Content-Type": "application/json"},
-            json=payload,
-            timeout=20,
-        )
-    except Exception as e:
-        return f"Error: could not reach {HF_ENDPOINT} to create the artifact repo ({e})."
-    if res.status_code in (200, 201):
-        logger.info(f"[HF] artifact dataset {repo_id} created (private)")
-        return ""
-    body = (res.text or "")[:200]
-    # 409 means it already exists, which is the steady state for every later render.
-    if res.status_code == 409 or "already" in body.lower() or "exists" in body.lower():
-        return ""
-    return (
-        f"Error: could not create the artifact dataset {repo_id} (HTTP {res.status_code}: {body}). "
-        "The token needs write access, or set HF_ARTIFACT_REPO to an existing dataset repo."
-    )
-
-def _hf_stage(info: Any) -> str:
-    """Normalise a JobInfo status into a plain uppercase stage name."""
-    status = getattr(info, "status", None)
-    stage = getattr(status, "stage", None) if status is not None else None
-    value = getattr(stage, "value", stage)
-    return str(value or "UNKNOWN").upper()
-
-def _hf_log_tail(api: Dict[str, Any], job_id: str, lines: int = 80, limit: int = 6000) -> str:
-    """Fetch the tail of a Job's logs; they persist after the Job finishes."""
-    try:
-        chunks = [str(chunk) for chunk in api["logs"](job_id=job_id, tail=lines, token=HF_TOKEN)]
-    except Exception as e:
-        return f"(log fetch failed: {e})"
-    return "".join(chunks)[-limit:]
-
-def _hf_submit_render(html: str, slug: str, fps: int, quality: str) -> str:
-    """Submit one render as a Hugging Face Job on the 16 GB cpu-basic flavor."""
-    api = _hf_jobs_api()
-    if "error" in api:
-        return api["error"]
-    repo_id = _hf_artifact_repo()
-    if repo_id.startswith("Error"):
-        return repo_id
-    problem = _hf_ensure_dataset_repo(repo_id)
-    if problem:
-        return problem
-    artifact_path = f"renders/{slug}-{datetime.utcnow().strftime('%Y%m%dT%H%M%SZ')}.mp4"
-    job_env = {
-        "PROJECT_SLUG": slug,
-        "RENDER_FPS": str(int(fps)),
-        "RENDER_QUALITY": quality,
-        "HYPERFRAMES_VERSION": HYPERFRAMES_VERSION,
-        "COMPOSITION_B64": base64.b64encode(html.encode("utf-8")).decode("ascii"),
-        "HYPERFRAMES_JSON_B64": base64.b64encode(
-            json.dumps(HYPERFRAMES_PROJECT_CONFIG).encode("utf-8")
-        ).decode("ascii"),
-        "HF_ARTIFACT_REPO": repo_id,
-        "HF_ARTIFACT_PATH": artifact_path,
-        "HF_ENDPOINT": HF_ENDPOINT,
-    }
-    try:
-        job = api["run"](
-            image=HF_RENDER_IMAGE,
-            command=["bash", "-lc", HF_RENDER_JOB_SCRIPT],
-            env=job_env,
-            secrets={"HF_TOKEN": HF_TOKEN},
-            flavor=HF_RENDER_FLAVOR,
-            timeout=HF_RENDER_TIMEOUT,
-            name=HF_RENDER_JOB_NAME,
-            labels={"app": "chintu", "kind": "motion-graphics"},
-            token=HF_TOKEN,
-        )
-    except Exception as e:
-        logger.error(f"Hugging Face job submission failed: {e}", exc_info=True)
-        return (
-            f"Hugging Face job submission failed: {e}\n"
-            "Jobs need a positive compute-credit balance on the account, and an older "
-            "client cannot submit them: pip install -U 'huggingface_hub>=0.36'."
-        )
-    job_id = getattr(job, "id", "") or ""
-    job_url = getattr(job, "url", "") or f"{HF_ENDPOINT}/jobs/{job_id}"
-    return (
-        "Hugging Face Jobs render submitted.\n"
-        f"HF_JOB_ID={job_id}\n"
-        f"job url: {job_url}\n"
-        f"hardware: {HF_RENDER_FLAVOR} (2 vCPU / 16 GB RAM / 50 GB disk, $0.01 per hour, billed per minute)\n"
-        f"image: {HF_RENDER_IMAGE} | timeout: {HF_RENDER_TIMEOUT}\n"
-        f"composition: {slug} | {len(html)} chars | {int(fps)} fps | quality={quality}\n"
-        f"artifact once uploaded: {HF_ENDPOINT}/datasets/{repo_id}/resolve/main/{artifact_path}\n"
-        "The container installs ffmpeg and Chrome's libraries, downloads the pinned Chrome, "
-        "then lints and renders, so allow a few minutes. Now call "
-        f"hf_render_status(job_id=\"{job_id}\", wait_seconds={HF_RENDER_WAIT_SECONDS}) to wait for "
-        "it, read the logs and have the MP4 delivered to Telegram."
-    )
-
-def _hf_fetch_artifact(url: str) -> Optional[bytes]:
-    """Download the rendered MP4 from the artifact dataset."""
-    try:
-        res = requests.get(
-            url, headers={"Authorization": f"Bearer {HF_TOKEN}"}, timeout=180, allow_redirects=True
-        )
-        if res.status_code == 200 and res.content:
-            return res.content
-        logger.error(f"[HF] artifact download failed: HTTP {res.status_code} {res.text[:200]}")
-    except Exception as e:
-        logger.warning(f"[HF] artifact download warning: {e}")
-    return None
-
-def hf_render_status(job_id: str, wait_seconds: int = 0) -> str:
-    """Check either render backend and deliver the MP4 once it finished.
-
-    Handles both transports: a `space:<id>` from the 16 GB Hugging Face Space
-    (primary) and a plain Job id from the `cpu-basic` Hugging Face Job fallback.
-
-    Args:
-        job_id: The id printed as HF_JOB_ID by render_html_video (`space:<id>` for
-            the Space worker, a bare id for a Job).
-        wait_seconds: Block up to this many seconds for a terminal state.
-            Use 0 to poll once and return immediately.
-    """
-    raw_id = (job_id or "").strip()
-    if raw_id.startswith("space:") or ".hf.space" in raw_id:
-        return _hf_space_status(raw_id, wait_seconds)
-    if not HF_TOKEN:
-        return "Error: HF_TOKEN is not configured."
-    # Tolerate a pasted "HF_JOB_ID=<id>" or a job URL.
-    job_id = (job_id or "").strip().rstrip("/").split("/")[-1].split("=")[-1].strip()
-    if not job_id:
-        return "Error: job_id is required; pass the HF_JOB_ID printed by render_html_video."
-    api = _hf_jobs_api()
-    if "error" in api:
-        return api["error"]
-    wait_seconds = max(0, min(int(wait_seconds or 0), 900))
-    try:
-        if wait_seconds:
-            info = api["wait"](job_id, timeout=wait_seconds, token=HF_TOKEN)
-        else:
-            info = api["inspect"](job_id=job_id, token=HF_TOKEN)
-    except Exception as e:
-        return f"Hugging Face job lookup failed for {job_id}: {e}"
-    stage = _hf_stage(info)
-    tail = _hf_log_tail(api, job_id)
-    job_url = getattr(info, "url", "") or f"{HF_ENDPOINT}/jobs/{job_id}"
-    lines = [
-        f"Hugging Face render job {job_id}",
-        f"status: {stage}",
-        f"url: {job_url}",
-        f"hardware: {HF_RENDER_FLAVOR}",
-    ]
-    if stage == "COMPLETED":
-        verified = re.search(r"RENDER_VERIFIED\s+(\S+)\s+(\d+)\s+bytes", tail)
-        if verified:
-            lines.append(f"[VERIFIED] {verified.group(1)} = {verified.group(2)} bytes of MP4")
-        url_match = re.search(r"ARTIFACT_URL\s+(\S+)", tail)
-        if not url_match:
-            lines.append(
-                "[FAILED] The job completed but printed no ARTIFACT_URL, so no MP4 was "
-                "uploaded. Read the log tail below."
-            )
-        else:
-            artifact_url = url_match.group(1)
-            video_bytes = _hf_fetch_artifact(artifact_url)
-            if not video_bytes:
-                lines.append(f"[FAILED] Could not download {artifact_url} with the current HF_TOKEN.")
-            elif b"ftyp" not in video_bytes[:32]:
-                lines.append(f"[FAILED] {len(video_bytes)} bytes downloaded but it is not an MP4.")
-            else:
-                file_name = artifact_url.rsplit("/", 1)[-1]
-                delivered = _telegram_send_video(
-                    video_bytes, file_name, f"🎬 Chintu · Hugging Face ({HF_RENDER_FLAVOR}) render"
-                )
-                lines.append(f"[SUCCESS] {len(video_bytes)} byte MP4 at {artifact_url}")
-                lines.append(
-                    "delivered to Telegram." if delivered else "(no Telegram chat bound; artifact is on the Hub)."
-                )
-    elif stage in ("ERROR", "CANCELED", "DELETED"):
-        lines.append(
-            "[FAILED] The Job did not complete. Read the log tail below, fix the cause, then "
-            "either resubmit with render_html_video or fall back to the sandbox backend with "
-            'render_html_video(html, backend="e2b").'
-        )
-    else:
-        lines.append(
-            "Still running (the container installs its toolchain before rendering). Call "
-            "hf_render_status again with a wait_seconds budget to keep waiting."
-        )
-    lines.append("--- job log tail ---")
-    lines.append(tail)
-    return "\n".join(lines)
-
+# ================================================================= E2B ENGINE
 def render_html_video(
     html: str,
     project_name: str = "chintu-motion",
@@ -1262,18 +776,22 @@ def render_html_video(
     backend: str = "auto",
     narration: str = "",
 ) -> str:
-    """Render a HyperFrames HTML/GSAP composition to MP4 on the 16 GB engine.
+    """Render a HyperFrames HTML/GSAP composition to MP4 on the E2B microVM.
 
-    The render never happens on this process: Render runs the API, Telegram and
-    LLM routing in ~512 MB, so the composition is dispatched to the dedicated
-    16 GB Hugging Face Space (primary), a `cpu-basic` Hugging Face Job (when the
-    Space is not configured) or an isolated E2B microVM (forced with
-    backend='e2b', killed in a finally block). Every path lints and renders with
-    the real `hyperframes` CLI (chrome-headless-shell + system ffmpeg), so
-    seekable GSAP timelines and deterministic capture stay the framework's job.
+    The Hugging Face render backends (16 GB Docker Space and `cpu-basic` Jobs)
+    were RETIRED: Hugging Face compute Spaces now require a paid PRO plan and
+    free accounts can only create Static Spaces, so E2B is the sole render
+    engine. This Render process (~512 MB) still never renders locally; the
+    composition is shipped to an isolated sandbox that is killed in a finally
+    block, provisioned with Node + Chrome + FFmpeg, and rendered by the real
+    `hyperframes` CLI. Sandbox commands purge /tmp and export TMPDIR=/home/user
+    /tmp first, so the ~1 GB tmpfs never chokes the render; if the browser path
+    still fails (e.g. disk exhaustion), an automatic Pillow + FFmpeg frame
+    compiler finishes the MP4 inside the sandbox so the turn delivers to
+    Telegram instead of surfacing a CommandExitException.
 
-    The Space and Job paths are ASYNCHRONOUS: this call returns a job id that is
-    handed to `hf_render_status`, which polls, downloads and delivers the MP4.
+    Delivery is SYNCHRONOUS: the finished video is posted straight to Telegram
+    with /sendVideo before this call returns. There is no job id to poll.
 
     Args:
         html: The full composition document (root carries data-composition-id and
@@ -1281,46 +799,40 @@ def render_html_video(
         project_name: Kebab-case project directory name.
         fps: Frame rate recorded on the render (24-240; 30 typical).
         quality: draft (fast iteration), looks (default) or delivery (final).
-        backend: auto (default), space, huggingface (job) or e2b.
-        narration: Optional voice-over script; the 16 GB worker synthesizes it
-            with edge-tts and muxes it into the MP4.
+        backend: 'auto' (default) or 'e2b' — both mean the E2B microVM. The
+            retired 'space', 'huggingface' and 'jobs' values return a notice.
+        narration: Optional voice-over script; synthesized inside the sandbox
+            with edge-tts and muxed into the MP4.
     """
     backend = (backend or "auto").strip().lower()
-    if backend not in ("auto", "space", "huggingface", "hf", "jobs", "e2b"):
+    if backend in ("space", "huggingface", "hf", "jobs"):
         return (
-            f"Unknown render backend '{backend}'. Use 'auto', 'space', 'huggingface' or 'e2b'."
+            "Error: the Hugging Face render backends were retired. Compute Spaces "
+            "now require a paid PRO plan, so they can no longer host this worker — "
+            "every render runs on the E2B microVM backend, which is what "
+            "backend='auto' already uses."
         )
+    if backend not in ("auto", "e2b"):
+        return f"Unknown render backend '{backend}'. Use 'auto' (recommended) or 'e2b'."
     problem = _validate_composition_html(html)
     if problem:
         return f"Composition rejected before render: {problem}"
+    if not E2B_API_KEY:
+        return (
+            "Error: E2B_API_KEY is not configured, and the E2B microVM is now "
+            "the only render engine (Hugging Face was retired)."
+        )
+    emit_progress(55, PROGRESS_MILESTONES[2][1], video=True)
     slug = re.sub(r"[^a-z0-9-]+", "-", (project_name or "chintu-motion").lower()).strip("-")
     slug = slug or "chintu-motion"
-    # Primary: the dedicated 16 GB Space worker.
-    if backend in ("auto", "space"):
-        if HF_SPACE_URL:
-            emit_progress(55, PROGRESS_MILESTONES[2][1], video=True)
-            return _hf_space_submit(html, slug, fps, quality, narration)
-        if backend == "space":
-            return (
-                "Error: HF_SPACE_URL is not configured, so the 16 GB Space backend is "
-                "unavailable. Set HF_SPACE_URL to the Space origin and redeploy Render."
-            )
-    # Secondary: a cpu-basic Hugging Face Job (also 2 vCPU / 16 GB RAM).
-    if backend in ("auto", "huggingface", "hf", "jobs") and HF_TOKEN:
-        emit_progress(55, PROGRESS_MILESTONES[2][1], video=True)
-        return _hf_submit_render(html, slug, fps, quality)
-    if backend in ("huggingface", "hf", "jobs"):
-        return "Error: HF_TOKEN is not configured, so the Hugging Face Jobs backend is unavailable."
-    if not E2B_API_KEY:
-        return "Error: E2B_API_KEY is not configured."
-    emit_progress(55, PROGRESS_MILESTONES[2][1], video=True)
     project_dir = f"/home/user/videos/{slug}"
     sbx = None
     try:
         from e2b_code_interpreter import Sandbox
 
-        logger.info(f"Starting E2B sandbox for HyperFrames render of '{slug}'...")
+        logger.info(f"Starting E2B microVM render of '{slug}' (Hugging Face backends retired)...")
         sbx = Sandbox.create(api_key=E2B_API_KEY, timeout=SANDBOX_TIMEOUT_SECONDS)
+        disk_report = e2b_disk_prep(sbx)
         provisioning = _provision_render_toolchain(sbx, want_browser=True)
         sbx.commands.run(f"mkdir -p {project_dir}/renders", timeout=0)
         sbx.files.write(f"{project_dir}/index.html", html)
@@ -1330,41 +842,323 @@ def render_html_video(
         )
 
         hf = f"npx --yes hyperframes@{HYPERFRAMES_VERSION}"
-        lint = sbx.commands.run(f"cd {project_dir} && {hf} lint .", timeout=0)
-        logger.info(f"[HyperFrames] lint exit={getattr(lint, 'exit_code', 'unknown')}")
-        render = sbx.commands.run(
-            f"cd {project_dir} && {hf} render . --skill={HYPERFRAMES_SKILL} "
-            f"-f {int(fps)} -q {quality} -o ./renders/video.mp4",
-            timeout=0,
-        )
-
+        lint_output = ""
+        try:
+            lint = sbx.commands.run(
+                _e2b_cmd_with_prep(f"cd {project_dir} && {hf} lint ."), timeout=0
+            )
+            lint_output = (getattr(lint, "stdout", "") or "")[-1200:]
+            logger.info(f"[HyperFrames] lint exit={getattr(lint, 'exit_code', 'unknown')}")
+        except Exception as lint_err:
+            lint_output = f"lint execution error: {lint_err}"
+        render_output = ""
+        render_exit: Any = "exception"
+        mp4_path: Optional[str] = None
+        try:
+            render = sbx.commands.run(
+                _e2b_cmd_with_prep(
+                    f"cd {project_dir} && {hf} render . --skill={HYPERFRAMES_SKILL} "
+                    f"-f {int(fps)} -q {quality} -o ./renders/video.mp4"
+                ),
+                timeout=0,
+            )
+            render_exit = getattr(render, "exit_code", "unknown")
+            render_output = (
+                (getattr(render, "stdout", "") or "") + (getattr(render, "stderr", "") or "")
+            )[-2000:]
+            mp4_path = _find_rendered_video(sbx, f"{project_dir}/renders")
+        except Exception as render_err:
+            render_output = f"render execution error: {render_err}"
+        fallback_note = ""
+        if mp4_path is None:
+            low_disk = "disk" in render_output.lower() or "nospc" in render_output.lower()
+            fallback_note = (
+                "HyperFrames/Chromium path failed"
+                + (" (disk exhaustion detected)" if low_disk else f" (render exit={render_exit})")
+                + "; engaging automatic Pillow + FFmpeg frame compiler."
+            )
+            logger.warning(f"[Render Fallback] {fallback_note}")
+            fallback_note += "\n" + _run_pillow_fallback(sbx, project_dir, slug, int(fps), narration)
+            mp4_path = _find_rendered_video(sbx, f"{project_dir}/renders")
         delivered = _deliver_rendered_video(sbx, extra_dirs=(f"{project_dir}/renders",))
-        rendered_path = _find_rendered_video(sbx, f"{project_dir}/renders")
         report = (
-            f"HyperFrames render :: {slug}\n"
+            f"E2B HyperFrames render :: {slug}\n"
+            f"backend: E2B microVM (killed in finally; Hugging Face retired)\n"
+            f"disk prep: {disk_report or 'cleanup ran (no report)'}\n"
             f"provisioning: {provisioning}\n"
-            f"lint exit: {getattr(lint, 'exit_code', 'unknown')}\n"
-            f"lint output:\n{(getattr(lint, 'stdout', '') or '')[-1200:]}\n"
-            f"render exit: {getattr(render, 'exit_code', 'unknown')}\n"
-            f"render output:\n{(getattr(render, 'stdout', '') or '')[-2000:]}\n"
+            f"lint output:\n{lint_output}\n"
+            f"render output:\n{render_output}\n"
         )
-        if getattr(render, "stderr", None):
-            report += f"render stderr:\n{render.stderr[-1200:]}\n"
-        if rendered_path:
-            report += f"[SUCCESS] MP4 written to {rendered_path}"
-            report += " and delivered to Telegram." if delivered else " (no Telegram chat bound)."
+        if fallback_note:
+            report += f"fallback: {fallback_note}\n"
+        if mp4_path:
+            report += f"[SUCCESS] MP4 written to {mp4_path}"
+            report += (
+                " and delivered to Telegram."
+                if delivered
+                else " (no Telegram chat bound; retry after binding CURRENT_CHAT_ID)."
+            )
         else:
-            report += "[FAILED] No .mp4 produced; read the render output above before retrying."
+            report += "[FAILED] No .mp4 produced even with the fallback compiler; read the outputs above."
         return report
     except Exception as e:
-        logger.error(f"HyperFrames render error: {e}", exc_info=True)
-        return f"HyperFrames render error:\n{traceback.format_exc()}"
+        logger.error(f"E2B render error: {e}", exc_info=True)
+        return f"E2B render error:\n{traceback.format_exc()}"
     finally:
         if sbx is not None:
             try:
                 sbx.kill()
             except Exception as kill_err:
                 logger.warning(f"Sandbox cleanup warning: {kill_err}")
+
+
+def _run_pillow_fallback(sbx: Any, project_dir: str, slug: str, fps: int, narration: str) -> str:
+    """Last-resort frame compiler: Pillow draws the frames, FFmpeg muxes them.
+
+    Runs INSIDE the sandbox (never on the Render brain). Triggered automatically
+    when the HyperFrames browser path fails — e.g. the small /tmp tmpfs fills up
+    — so the render still completes and reaches Telegram. Frames are streamed
+    into FFmpeg over stdin, so no per-frame files ever touch the disk.
+    """
+    script = _PILLOW_FALLBACK_TEMPLATE.replace("__FPS__", str(int(fps)))
+    script_path = f"{project_dir}/fallback_render.py"
+    narration_path = ""
+    if narration:
+        narration_path = f"{project_dir}/narration.txt"
+        sbx.files.write(narration_path, narration.strip())
+    sbx.files.write(script_path, script)
+    env_bits = f"FALLBACK_HTML={project_dir}/index.html FALLBACK_OUT={project_dir}/renders/video.mp4"
+    if narration_path:
+        env_bits += f" FALLBACK_NARRATION={narration_path}"
+    res = sbx.commands.run(
+        _e2b_cmd_with_prep(f"cd {project_dir} && {env_bits} python3 {script_path}"),
+        timeout=0,
+    )
+    code = getattr(res, "exit_code", "unknown")
+    output = (getattr(res, "stdout", "") or "") + (getattr(res, "stderr", "") or "")
+    logger.info(f"[Render Fallback] Pillow+FFmpeg compiler exit={code}")
+    return f"pillow+ffmpeg fallback exit={code}\n{output[-1200:]}"
+
+
+# Deterministic Pillow + FFmpeg frame compiler. Kept as a template string that a
+# render writes into the sandbox and executes there — the Render brain imports
+# no media library. It parses the composition's timed scene elements and draws
+# each frame with safe-zone typography, fade/slide motion and eased timing,
+# streaming raw RGB frames into FFmpeg stdin (no frame files, no /tmp fill-up).
+_PILLOW_FALLBACK_TEMPLATE = r'''
+"""Pillow + FFmpeg frame compiler — automatic fallback inside the E2B sandbox."""
+import os
+import subprocess
+import sys
+from html.parser import HTMLParser
+
+from PIL import Image, ImageDraw, ImageFont
+
+FPS = __FPS__
+W, H = 1080, 1920
+SAFE_X = 160
+TITLE_SIZE, BODY_SIZE = 96, 48
+BG_TOP = (10, 14, 24)
+BG_BOT = (36, 18, 58)
+GLOW = (98, 76, 192)
+ACCENT = (232, 179, 75)
+INK = (246, 246, 252)
+
+HTML_PATH = os.environ["FALLBACK_HTML"]
+OUT_PATH = os.environ.get("FALLBACK_OUT", "renders/video.mp4")
+NARRATION_PATH = os.environ.get("FALLBACK_NARRATION", "")
+TMPDIR = os.environ.get("TMPDIR", "/home/user/tmp")
+
+
+def _clamp(u):
+    return max(0.0, min(1.0, u))
+
+
+def _ease_out(u):
+    u = _clamp(u)
+    return 1.0 - (1.0 - u) ** 2
+
+
+class _SceneParser(HTMLParser):
+    """Collect timed scene elements (data-start/data-duration) plus their text."""
+
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.scenes = []
+        self._scene = None
+
+    def handle_starttag(self, tag, attrs):
+        if self._scene is None:
+            a = dict(attrs)
+            if "data-start" in a and "data-duration" in a:
+                try:
+                    self._scene = {
+                        "start": float(a["data-start"]),
+                        "dur": float(a["data-duration"]),
+                        "text": [],
+                    }
+                except ValueError:
+                    self._scene = None
+
+    def handle_endtag(self, tag):
+        if self._scene is not None and tag in ("section", "div", "figure"):
+            if self._scene["text"]:
+                self.scenes.append(self._scene)
+            self._scene = None
+
+    def handle_data(self, data):
+        if self._scene is not None and data.strip():
+            self._scene["text"].append(data.strip())
+
+
+def load_scenes():
+    parser = _SceneParser()
+    with open(HTML_PATH, "r", encoding="utf-8") as fh:
+        parser.feed(fh.read())
+    scenes = [s for s in parser.scenes if s["dur"] > 0]
+    if not scenes:
+        scenes = [{"start": 0.0, "dur": 6.0, "text": ["Chintu Video"]}]
+    end = max(s["start"] + s["dur"] for s in scenes)
+    return scenes, end
+
+
+def font(size, bold=True):
+    candidates = [
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf" if bold else "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf" if bold else "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
+    ]
+    for path in candidates:
+        if os.path.exists(path):
+            try:
+                return ImageFont.truetype(path, size)
+            except Exception:
+                pass
+    return ImageFont.load_default()
+
+
+def wrap(draw, text, fnt, max_w):
+    words = text.split()
+    lines, cur = [], ""
+    for word in words:
+        trial = (cur + " " + word).strip()
+        if draw.textlength(trial, font=fnt) <= max_w or not cur:
+            cur = trial
+        else:
+            lines.append(cur)
+            cur = word
+    if cur:
+        lines.append(cur)
+    return lines
+
+
+def build_backdrop():
+    img = Image.new("RGB", (W, H))
+    d = ImageDraw.Draw(img)
+    for y in range(H):
+        u = y / H
+        d.line([(0, y), (W, y)], fill=tuple(int(a + (b - a) * u) for a, b in zip(BG_TOP, BG_BOT)))
+    glow = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+    gd = ImageDraw.Draw(glow)
+    cx, cy = W // 2, int(H * 0.36)
+    for radius in range(560, 60, -24):
+        a = int(5 + 40 * (1 - radius / 560.0))
+        gd.ellipse([cx - radius, cy - int(radius * 1.2), cx + radius, cy + int(radius * 1.2)], fill=GLOW + (a,))
+    return img, glow
+
+
+def build_vignette():
+    v = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+    d = ImageDraw.Draw(v)
+    for radius in range(1300, 500, -40):
+        a = int(3 + 42 * ((radius - 500) / 800.0))
+        d.ellipse([W // 2 - radius, H // 2 - radius, W // 2 + radius, H // 2 + radius], fill=(0, 0, 0, a))
+    return v
+
+
+def draw_frame(base, glow_layer, vig_layer, scenes, t):
+    active = scenes[0]
+    for s in scenes:
+        if s["start"] <= t < s["start"] + s["dur"]:
+            active = s
+            break
+    u = _clamp((t - active["start"]) / max(0.001, active["dur"]))
+    frame = base.copy()
+    frame.alpha_composite(glow_layer)
+    overlay = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+    d = ImageDraw.Draw(overlay)
+    alpha = _clamp(_ease_out(u / 0.25) * (1.0 - _ease_out((u - 0.8) / 0.2)) + 1e-6)
+    y_shift = int((1.0 - _ease_out(u / 0.3)) * 80) - int(_ease_out((u - 0.75) / 0.25) * 50)
+    first = active["text"][0][:80]
+    rest = " ".join(active["text"][1:3])[:240]
+    title_fnt = font(TITLE_SIZE)
+    body_fnt = font(BODY_SIZE)
+    y = int(H * 0.42) + y_shift
+    for line in wrap(d, first, title_fnt, W - SAFE_X * 2):
+        wdt = d.textlength(line, font=title_fnt)
+        d.text(((W - wdt) / 2, y), line, font=title_fnt, fill=INK + (int(255 * alpha),))
+        y += int(TITLE_SIZE * 1.25)
+    if rest:
+        y += 40
+        for line in wrap(d, rest, body_fnt, W - SAFE_X * 2):
+            wdt = d.textlength(line, font=body_fnt)
+            d.text(((W - wdt) / 2, y), line, font=body_fnt, fill=ACCENT + (int(200 * alpha),))
+            y += int(BODY_SIZE * 1.45)
+    frame.alpha_composite(overlay)
+    frame.alpha_composite(vig_layer)
+    return frame
+
+
+def main():
+    scenes, duration = load_scenes()
+    base, glow_layer = build_backdrop()
+    vig_layer = build_vignette()
+    os.makedirs(TMPDIR, exist_ok=True)
+    os.makedirs(os.path.dirname(OUT_PATH) or ".", exist_ok=True)
+    silent_path = os.path.join(TMPDIR, "fallback_silent.mp4")
+    cmd = [
+        "ffmpeg", "-y", "-f", "rawvideo", "-pix_fmt", "rgb24",
+        "-s", f"{W}x{H}", "-r", str(FPS), "-i", "-",
+        "-c:v", "libx264", "-preset", "veryfast", "-crf", "21",
+        "-pix_fmt", "yuv420p", "-movflags", "+faststart", silent_path,
+    ]
+    proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    total = int(round(duration * FPS))
+    for f in range(total):
+        try:
+            proc.stdin.write(draw_frame(base, glow_layer, vig_layer, scenes, f / FPS).convert("RGB").tobytes())
+        except BrokenPipeError:
+            break
+    if proc.stdin:
+        proc.stdin.close()
+    proc.wait()
+    final_path = OUT_PATH
+    if NARRATION_PATH and os.path.exists(NARRATION_PATH):
+        with open(NARRATION_PATH, "r", encoding="utf-8") as fh:
+            script_text = fh.read().strip()[:3000]
+        media = os.path.join(TMPDIR, "narration.mp3")
+        tts = subprocess.run(
+            [sys.executable, "-m", "edge_tts", "--voice", "en-US-AriaNeural", "--text", script_text, "--write-media", media],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+        if tts.returncode == 0 and os.path.exists(media):
+            mux = subprocess.run(
+                ["ffmpeg", "-y", "-i", silent_path, "-i", media, "-c:v", "copy", "-c:a", "aac", "-b:a", "160k", "-shortest", final_path],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            )
+            if mux.returncode != 0:
+                final_path = silent_path
+        else:
+            final_path = silent_path
+    if final_path != OUT_PATH and os.path.exists(silent_path):
+        subprocess.run(["cp", silent_path, OUT_PATH], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    size = os.path.getsize(OUT_PATH) if os.path.exists(OUT_PATH) else 0
+    print(f"[pillow-fallback] RENDERED {OUT_PATH} {size} bytes")
+
+
+if __name__ == "__main__":
+    main()
+'''
+
 
 def execute_in_cloud_microvm(code: str) -> str:
     global CURRENT_CHAT_ID
@@ -1379,13 +1173,17 @@ def execute_in_cloud_microvm(code: str) -> str:
         # Lifetime honours E2B_SANDBOX_TIMEOUT so long renders are not cut off mid-encode.
         sbx = Sandbox.create(api_key=E2B_API_KEY, timeout=SANDBOX_TIMEOUT_SECONDS)
 
+        # Disk hygiene before anything: purge /tmp + caches, then repoint TMPDIR.
+        e2b_disk_prep(sbx)
         # Provisioning without command timeout limits (timeout=0)
         _provision_render_toolchain(sbx, want_browser=False)
 
         # Pre-validate/harden the task source before it ever reaches the VM.
         safe_source = prepare_task_source(code)
         sbx.files.write("/home/user/run_task.py", safe_source)
-        exec_res = sbx.commands.run("python /home/user/run_task.py", timeout=0)
+        exec_res = sbx.commands.run(
+            _e2b_cmd_with_prep("python /home/user/run_task.py"), timeout=0
+        )
 
         found_video = _deliver_rendered_video(sbx)
 
@@ -1627,8 +1425,6 @@ ALL_TOOLS_LIST = [
     list_skills,
     load_skill,
     render_html_video,
-    hf_render_status,
-    hf_space_health,
 ]
 
 # One line per tool, used to build the self-inventory in SYSTEM_INSTRUCTION. The
@@ -1647,9 +1443,7 @@ TOOL_CAPABILITIES: Dict[str, str] = {
     "web_search_research": "Search the web and return readable text for grounding.",
     "list_skills": "Enumerate the motion-graphics skill library with repos and doc paths.",
     "load_skill": "Load and page the real documentation of one skill (HyperFrames, GSAP, Whisper, Remotion, prompt and motion libraries).",
-    "render_html_video": "Dispatch a single-file HTML/CSS/GSAP composition to the 16 GB engine (Space, then Job, then E2B) and return a job id.",
-    "hf_render_status": "Poll a render (space:<id> or Job id), read ffprobe facts and worker logs, download the MP4 and deliver it to Telegram.",
-    "hf_space_health": "Probe the 16 GB Space: CPU/RAM, Chromium/FFmpeg readiness, running jobs.",
+    "render_html_video": "Dispatch a single-file HTML/CSS/GSAP composition to the E2B microVM render engine (synchronous; disk-prepped, with an automatic Pillow+FFmpeg fallback) — Hugging Face render backends were retired, so never use backend='space'/'huggingface'.",
 }
 
 _MISSING_TOOL_DOCS = [fn.__name__ for fn in ALL_TOOLS_LIST if fn.__name__ not in TOOL_CAPABILITIES]
@@ -1674,9 +1468,10 @@ SKILL_INVENTORY = "\n".join(
 SYSTEM_INSTRUCTION = f"""You are Chintu — an autonomous audiovisual motion engineer, running as a distributed agent.
 
 IDENTITY AND COMPUTE TOPOLOGY (hard boundaries)
-- You are the reasoning layer. Your process is the Render brain: about 512 MB of RAM hosting FastAPI, the Telegram polling lifecycle, the status card, tool routing and LLM orchestration. That is ALL it does.
+- You are Chintu — an autonomous audiovisual motion engineer, running as a distributed agent: the Render brain orchestrates, executes and reports; the E2B microVM renders; Telegram delivers.
+- This process is the Render brain: about 512 MB of RAM hosting FastAPI, the Telegram polling lifecycle, the status card, tool routing and LLM orchestration. That is ALL it does.
 - You must NEVER render video locally. No Pillow frame buffers, no Playwright/Chromium launch, no FFmpeg subprocess, no NumPy frame loops in this process. A local render is a failed turn, not a shortcut.
-- Every heavy media workload — HTML/CSS layout evaluation, headless Chromium capture, GSAP timeline scrubbing, high-resolution frame buffers, audio mixing and FFmpeg 1080x1920 stitching — belongs to the 16 GB engine: the dedicated Hugging Face Docker Space (cpu-basic: 2 vCPU / 16 GB RAM / 50 GB disk), or, when that is unavailable, the isolated E2B microVM (always killed in a finally block).
+- The Hugging Face render backends (Docker Space and cpu-basic Jobs) were RETIRED — compute Spaces now require a paid PRO plan — so the ONLY render engine is the E2B microVM, killed in a finally block after every run.
 - Delivery: the finished MP4 streams back to the brain and is posted straight to Telegram with /sendVideo to CURRENT_CHAT_ID. You do not need to save it anywhere.
 - Tool results are the only source of truth about what happened.
 
@@ -1690,9 +1485,9 @@ ACTION RULE — VIDEO REQUESTS
 When the user asks to build, change or render any video, motion graphic, reel, ad or animation, you MUST act, in this order:
 1. load_skill("hyperframes") for the composition contract and CLI, then load_skill("motion_skills") and the relevant `hyperframes` category module for the design pattern. Use load_skill("gsap") for timeline and easing questions, load_skill("whisper") for caption timing, load_skill("remotion") for composition and data-driven concepts, and load_skill("motion_graphics_prompts") for camera and lighting language.
 2. Write the COMPLETE single-file composition: one root with data-composition-id, data-width, data-height and data-duration; timed elements carrying data-start and data-duration; exactly one paused GSAP timeline registered on window.__timelines under the composition id. Inline everything — no local assets, no network fetches at render time.
-3. Call render_html_video(html=..., project_name=..., fps=30, quality="looks") and pass narration=... when there is a script. It returns an id; then call hf_render_status(job_id=..., wait_seconds=600) until the worker finishes, and report the ffprobe facts and delivery status it printed.
+3. Call render_html_video(html=..., project_name=..., fps=30, quality="looks") and pass narration=... when there is a script. It executes synchronously on the E2B microVM: the result comes back with the render output, the delivered/undelivered status and, when the browser renderer failed, the automatic Pillow + FFmpeg fallback trail. Report those facts to the user.
 
-NEVER answer a video request with a conversational plan, an apology, or a claim that browser/Node/rendering tools are unsupported or unavailable — they are supported and remote. Never claim a render happened without a tool result that shows it. If a dispatch fails (missing secret, sleeping Space, failed job), read the log tail it returned, fix the cause and resubmit; fall back to render_html_video(..., backend="e2b") only after the primary engine reports a real failure.
+NEVER answer a video request with a conversational plan, an apology, or a claim that browser/Node/rendering tools are unsupported or unavailable — they are supported and remote. Never claim a render happened without a tool result that shows it. If a dispatch fails (missing secret, failed job), read the log tail it returned, fix the cause and resubmit.
 
 VIDEO STANDARDS (non-negotiable for every render)
 - Canvas 1080x1920 (9:16 vertical), 30 fps unless the brief says otherwise, 6-15 seconds for short-form.
@@ -1703,7 +1498,7 @@ VIDEO STANDARDS (non-negotiable for every render)
 - Sound: narration is synthesized with edge-tts and muxed by the worker; pair impacts with a sub-bass hit and keep voice-over timed to the scene cuts.
 
 TRUTHFUL REPORTING
-Report only what the tools returned: job ids, ffprobe frame counts, byte sizes, delivery status. If a step did not run, say which step and why. Never invent a file path or a result."""
+Report only what the tools returned: sandbox paths, ffprobe frame counts, byte sizes, delivery status. If a step did not run, say which step and why. Never invent a file path or a result."""
 
 def _sync_chat_call(model_name: str, message: str) -> str:
     config = types.GenerateContentConfig(
@@ -2015,16 +1810,10 @@ def health_check():
         "skills": list(SKILL_REGISTRY.keys()),
         "skills_count": len(SKILL_REGISTRY),
         "render_backends": {
-            "primary": "huggingface_space" if HF_SPACE_URL else ("huggingface_jobs" if HF_TOKEN else "e2b_sandbox"),
-            "huggingface_space": bool(HF_SPACE_URL),
-            "hf_space_url": HF_SPACE_URL,
-            "hf_space_max_wait": HF_SPACE_MAX_WAIT_SECONDS,
-            "huggingface_jobs": bool(HF_TOKEN),
+            "primary": "e2b_sandbox",
             "e2b_sandbox": bool(E2B_API_KEY),
-            "hf_flavor": HF_RENDER_FLAVOR,
-            "hf_image": HF_RENDER_IMAGE,
-            "hf_timeout": HF_RENDER_TIMEOUT,
-            "hf_artifact_repo": HF_ARTIFACT_REPO or f"<namespace>/{HF_ARTIFACT_REPO_NAME}",
+            "huggingface": "retired (compute Spaces require a paid PRO plan)",
+            "e2b_tmp_dir": E2B_TMP_DIR,
         },
         "timestamp": datetime.utcnow().isoformat()
     }
@@ -2128,8 +1917,7 @@ async def startup_event():
     CURRENT_EVENT_LOOP = asyncio.get_running_loop()
     logger.info(
         f"Initializing Chintu services (role={COMPUTE_ROLE}, "
-        f"space={'on' if HF_SPACE_URL else 'off'}, jobs={'on' if HF_TOKEN else 'off'}, "
-        f"e2b={'on' if E2B_API_KEY else 'off'})..."
+        f"e2b={'on' if E2B_API_KEY else 'off'}, huggingface=retired)..."
     )
     if BRAIN_BOUNDARY_VIOLATIONS:
         logger.error(

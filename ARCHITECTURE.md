@@ -2,13 +2,13 @@
 
 Chintu is a distributed agent, not a monolith. The process that answers Telegram is
 deliberately too small to render anything; the hardware that renders is deliberately
-too expensive to idle.
+ephemeral and disposable.
 
 ## 1. Brain vs. engine
 
-| | Render brain (`main.py`) | 16 GB engine (`space/app.py`) |
+| | Render brain (`main.py`) | Render engine (E2B microVM) |
 | --- | --- | --- |
-| Hardware | ~512 MB service | `cpu-basic`: 2 vCPU / 16 GB RAM / 50 GB |
+| Hardware | ~512 MB service | isolated disposable sandbox (FFmpeg + Chromium-capable) |
 | Owns | FastAPI, Telegram lifecycle, status card, tool routing, LLM orchestration | layout evaluation, headless Chromium, GSAP scrubbing, frame buffers, FFmpeg, voice-over muxing |
 | Must never | import Pillow/NumPy/Playwright/spawn FFmpeg | answer Telegram or hold chat state |
 
@@ -16,21 +16,37 @@ too expensive to idle.
 heavy-media module appears in its import graph. It is asserted empty in the suite,
 and the auditor itself is tested against a planted `import PIL` / `import subprocess`.
 
-Transport (no shared disk, no queue):
+Transport: the composition is written into the sandbox over the file API and
+rendered synchronously with the real `hyperframes` CLI; the finished MP4 is read
+back and posted straight to Telegram.
 
 ```
-brain  --POST /render {html, project_slug, fps, quality, narration}-->  Space
-brain  --GET  /status/<job_id>  (percent, stage, probe, log_tail)-->    Space
-brain  --GET  /artifact/<job_id> (video/mp4)-->                         Space
-brain  --POST /sendVideo to CURRENT_CHAT_ID-->                          Telegram
+brain --write index.html + hyperframes.json--> E2B sandbox
+brain --npx hyperframes render (disk-prepped, TMPDIR=/home/user/tmp)--> frames -> MP4
+brain --read MP4 bytes--> Telegram /sendVideo to CURRENT_CHAT_ID
 ```
 
-The Space renders asynchronously (a request-scoped proxy timeout cannot hold a
-multi-minute encode) and keeps at most `MAX_JOBS_RETAINED` artifacts in memory.
+**Hugging Face was retired as a render path.** Compute Spaces (Docker/Gradio) now
+require a paid PRO plan and free accounts can only create Static Spaces, which
+cannot run backend media rendering — so the account could not host a worker. The
+archived `space/` worker remains in the repository for reference only; it is not in
+the dispatch chain, and `hf_render_status` / `hf_space_health` are gone. Requests
+with `backend="space"` / `"huggingface"` / `"jobs"` return an explicit retirement
+notice instead of a render.
 
-Fallbacks, in order: Space → Hugging Face Job (`cpu-basic`, same RAM, artifact
-committed to a private dataset and downloaded by the brain) → E2B microVM
-(`backend="e2b"`, always `sbx.kill()` in `finally`).
+Disk resilience (the production failure was **"Low disk space: 1.0 GB free at /tmp"**):
+every sandbox command that produces intermediates runs behind a pre-render prep —
+`rm -rf /tmp/* ~/.cache/* /var/tmp/* 2>/dev/null || true`, `mkdir -p /home/user/tmp`
+and `export TMPDIR=/home/user/tmp` — so temp writes land on the larger volume, and
+frames are piped into FFmpeg over stdin rather than written per-frame.
+
+**Automatic fallback renderer:** if the HyperFrames/Chromium path fails (for example
+the tmpfs fills anyway), `render_html_video` engages `_run_pillow_fallback`: a
+Pillow + FFmpeg frame compiler written into the sandbox — it parses the
+composition's timed scene elements, draws 1080x1920 frames with safe-zone
+typography, fade/slide motion and eased timing, and streams raw frames into
+FFmpeg (optional edge-tts narration muxed as AAC). The turn still ends with a
+delivered MP4 instead of a `CommandExitException`.
 
 ## 2. Model ladder
 
@@ -39,8 +55,9 @@ committed to a private dataset and downloaded by the brain) → E2B microVM
    every configured key slot, with rotation on `429`/`500`/`503`.
 2. On exhaustion, OpenRouter with the same tool schemas, serialized from
    `ALL_TOOLS_LIST` by signature introspection:
-   `anthropic/claude-3.5-sonnet` → `deepseek/deepseek-chat` →
-   `qwen/qwen-2.5-coder-32b-instruct`, 600 s per request, up to 6 tool rounds.
+   `openrouter/free` → `nvidia/nemotron-3-super-120b-a12b:free` →
+   `cohere/north-mini-code:free` (all verified against the live OpenRouter catalog
+   so a rate-limited cascade never hits a 404), 600 s per request, up to 6 tool rounds.
 3. Freebuff (OpenAI-compatible) as the last resort.
 
 `PROVIDER_TELEMETRY` records the provider/model that actually answered and the number
@@ -69,18 +86,18 @@ to `PROGRESS_STATE["history"]` synchronously, so a phase cannot be lost between 
 
 | Variable | Where | Purpose |
 | --- | --- | --- |
-| `HF_SPACE_URL` | Render | Space origin, e.g. `https://<ns>-chintu-render.hf.space` |
-| `HF_SPACE_SECRET` | Render | must equal the Space's `HF_RENDER_SECRET` |
-| `HF_RENDER_SECRET` | Space | auth for `/render`, `/status`, `/artifact` |
-| `HF_TOKEN` | Render | Job fallback + private artifact dataset |
-| `HF_ARTIFACT_REPO` | Render | override `<namespace>/chintu-renders` |
-| `E2B_API_KEY` | Render | microVM fallback |
+| `E2B_API_KEY` | Render | the only render engine (E2B microVM) |
+| `E2B_TMP_DIR` | Render | sandbox TMPDIR override (default `/home/user/tmp`) |
+| `E2B_SANDBOX_TIMEOUT` | Render | sandbox lifetime for long renders |
 | `GEMINI_API_KEY[_2/_3]` | Render | Gemini pool |
 | `OPENROUTER_API_KEY` | Render | frontier fallback |
 | `TELEGRAM_BOT_TOKEN` | Render | chat transport |
 
-`/health` reports the compute role, the active render engine, boundary violations,
-provider telemetry, tool/skill counts and the failover cascade.
+`HF_TOKEN` remains only for `huggingface_task_runner` (model inference, not rendering).
+
+`/health` reports the compute role, the active render engine (E2B, with the HF
+retirement notice), boundary violations, provider telemetry, tool/skill counts and
+the failover cascade.
 
 ## 5. Verification
 
@@ -89,13 +106,13 @@ provider telemetry, tool/skill counts and the failover cascade.
 - skill registry and live skill loading (6 engines, including Remotion),
 - GitHub CDN-first reads, caching and rate-limit messaging,
 - composition validation and the E2B render path (fake sandbox, always killed),
-- the Job script ↔ caller contract (base64, ffprobe proof, Hub commit, secret handling),
-- the Space contract end to end: payload, auth, polling, probe facts, artifact download,
-  Telegram delivery, non-MP4 refusal, failed-job surfacing,
-- OpenRouter cascade order, JSON tool schemas, tool execution and provider telemetry,
+- the E2B engine contract: disk prep + TMPDIR before every execution path, the
+  Pillow fallback template AST-parses and is written/executed only in the sandbox,
+  retirement notices for `backend='space'/'huggingface'/'jobs'` with no HTTP call,
+- OpenRouter cascade order (the verified free models), JSON tool schemas, tool
+  execution and provider telemetry,
 - progress card monotonicity, heartbeat, and a full simulated Telegram turn,
-- the worker itself: validation, render pipeline, failure capture, mux path handling,
-  and the real HTTP surface on a real socket.
+- the archived Space worker still parses and runs standalone (reference code).
 
 ```bash
 python3 .tools/regression_suite.py     # expects the stubs in .tools/stubs

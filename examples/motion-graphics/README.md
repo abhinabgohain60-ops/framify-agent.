@@ -90,48 +90,31 @@ The rules that actually bit while building it:
 `check .` on this file: **0 lint, 0 runtime, 0 motion, 0 layout issues across 9 samples, 24/24
 WCAG AA text checks**.
 
-## Rendering on the 16 GB engine
+## Rendering on the E2B engine
 
-Render itself never renders a frame. `render_html_video` dispatches, in order:
+Render itself never renders a frame. `render_html_video` is **synchronous on the E2B microVM**
+and posts the finished MP4 directly to Telegram with `/sendVideo`: there is no job id to poll.
+(All Hugging Face render backends were retired — compute Spaces now require a paid PRO plan —
+so `backend='space'` / `'huggingface'` / `'jobs'` return a retirement notice. The old Space
+worker stays in `space/` as reference only.)
 
-1. **Hugging Face Docker Space** (`space/`, `cpu-basic`: 2 vCPU / **16 GB RAM** / 50 GB) over HTTP —
-   `POST /render`, poll `GET /status/<id>`, download `GET /artifact/<id>`. This is the primary path
-   whenever `HF_SPACE_URL` is set. It is asynchronous on purpose: a Space proxies one request with a
-   short gateway timeout, so a multi-minute render cannot be one blocking POST.
-2. **Hugging Face Job** on the same hardware when `HF_SPACE_URL` is unset (details below).
-3. **E2B microVM** only when forced with `render_html_video(..., backend="e2b")`.
+Inside the sandbox, one call does:
 
-`narration="…"` is sent with the composition; the worker synthesizes it with `edge-tts` and muxes
-it as AAC over the copied H.264 stream. Configuration: `HF_SPACE_URL` and `HF_SPACE_SECRET` on
-Render, `HF_RENDER_SECRET` (same value) as a Space secret. The Space code, image and deploy steps
-are in `space/README.md`.
+1. **Disk prep** — `rm -rf /tmp/* ~/.cache/* /var/tmp/* 2>/dev/null || true`, then
+   `mkdir -p /home/user/tmp` and `export TMPDIR=/home/user/tmp`. The sandbox tmpfs is ~1 GB
+   and previous runs failed with "Low disk space: 1.0 GB free at /tmp"; temp output now lands
+   on the larger volume, and the fallback streams frames into FFmpeg over stdin so no frame
+   files touch disk at all.
+2. **Provisioning** — ffmpeg + the Pillow/NumPy frame stack (and, for the browser path,
+   Node 22 + Chrome's runtime libs + `hyperframes browser ensure`).
+3. **lint → `render . --skill=motion-graphics -f <fps> -q <quality>`** with the real HyperFrames
+   CLI, then the MP4 is read back and delivered to Telegram.
+4. **Automatic fallback** — if the browser path fails (e.g. disk exhaustion), a Pillow + FFmpeg
+   frame compiler (`_PILLOW_FALLBACK_TEMPLATE`) is written into the sandbox and executed there:
+   it parses the composition's timed scenes and draws 1080x1920 frames with safe-zone
+   typography, fade/slide motion and eased timing, with edge-tts narration muxed as AAC.
 
-### Fallback: Hugging Face Jobs
-
-The RAM is the point — HyperFrames pins itself to one worker and screenshot capture below 8 GB
-(`totalMemMb` vs `thresholdMb: 8192` in its render log). This machine reports `totalMemMb: 8011`
-and renders solo; the 16 GB hardware takes the calibrated multi-worker path.
-
-The job script (**`HF_RENDER_JOB_SCRIPT` in `main.py`**, the single source of truth for what the
-remote container executes) runs on `node:22-bookworm` and:
-
-1. installs `ffmpeg`, `curl`, fonts and the 16 Chrome runtime packages — one `apt-get` per package,
-   so a single missing name cannot abort the install;
-2. decodes the composition and project config from base64 env vars into `/tmp/chintu-render/<slug>/`;
-3. `doctor` → `browser ensure` → `lint` → `render . --skill=motion-graphics -f <fps> -q <quality>`;
-4. proves the MP4 on disk with `ffprobe -count_frames` and prints `RENDER_VERIFIED <path> <bytes>`;
-5. commits it to the artifact dataset in **one** request to the Hub commit API
-   (`POST /api/datasets/<repo>/commit/main`, NDJSON with base64 content, assembled through a file
-   rather than argv) and prints `ARTIFACT_URL`.
-
-`render_html_video` returns immediately with `HF_JOB_ID=<id>`; `hf_render_status(job_id,
-wait_seconds=600)` waits for a terminal stage, reads the log tail, downloads the artifact and
-delivers it to Telegram. The MP4 then exists twice: in the private Hub dataset and in the chat.
-
-Configuration: `HF_TOKEN` (write scope) plus a positive compute-credit balance on the account;
-the artifact dataset defaults to `<your-namespace>/chintu-renders` (override with
-`HF_ARTIFACT_REPO`) and is created private on first use. Set `HF_RENDER_FLAVOR=cpu-upgrade`
-(8 vCPU / 32 GB, $0.03/hour) when a render is too slow rather than too large.
+`narration="…"` travels with the composition request and is synthesized in the sandbox.
 
 ## Measured on this machine (2 cores, 3.8 GB, software GL)
 
