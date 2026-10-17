@@ -5,12 +5,23 @@ import sys
 import json
 import logging
 import asyncio
+import inspect
 import io
 import re
 import contextlib
+import time
 import traceback
 from datetime import datetime
-from typing import Any, Dict, List, Optional
+from typing import (
+    Any,
+    Dict,
+    List,
+    Optional,
+    Union,
+    get_args,
+    get_origin,
+    get_type_hints,
+)
 import requests
 import uvicorn
 from fastapi import FastAPI, BackgroundTasks, Request
@@ -34,6 +45,14 @@ RENDER_API_KEY = os.environ.get("RENDER_API_KEY", "")
 RENDER_SERVICE_ID = os.environ.get("RENDER_SERVICE_ID", "")
 OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "")
 OPENROUTER_BASE_URL = os.environ.get("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1")
+# Frontier-reasoning cascade used only after every Gemini key slot is exhausted.
+OPENROUTER_MODELS: List[str] = [
+    "anthropic/claude-3.5-sonnet",
+    "deepseek/deepseek-chat",
+    "qwen/qwen-2.5-coder-32b-instruct",
+]
+EXTERNAL_REQUEST_TIMEOUT = 600
+EXTERNAL_MAX_TOOL_ROUNDS = 6
 FREEBUFF_API_KEY = os.environ.get("FREEBUFF_API_KEY", "")
 FREEBUFF_BASE_URL = os.environ.get("FREEBUFF_BASE_URL", "https://api.freebuff.com/v1")
 DEFAULT_REPO = os.environ.get("DEFAULT_REPO", "abhinabgohain60-ops/framify-agent.")
@@ -302,11 +321,218 @@ SKILL_REGISTRY: Dict[str, Dict[str, Any]] = {
             "explainers, data visualization, short-form video and WebGL."
         ),
     },
+    "remotion": {
+        "repo": "remotion-dev/remotion",
+        "role": "programmatic_react_video",
+        "entrypoint": "README.md",
+        "docs": [
+            "README.md",
+            "packages/docs/docs/composition.mdx",
+            "packages/docs/docs/animating-properties.mdx",
+            "packages/docs/docs/building-a-timeline.mdx",
+        ],
+        "max_chars": 20000,
+        "summary": (
+            "Programmatic React video engine: compositions, frame-based animation, "
+            "interpolation and batch rendering. Read it for timeline and data-driven "
+            "composition concepts to port into a single-file HyperFrames build — do not "
+            "scaffold a React project, the render contract stays HTML/CSS/GSAP."
+        ),
+    },
 }
 
 CURRENT_CHAT_ID: Optional[int] = None
 CURRENT_STATUS_MSG = None
 TELEGRAM_BOT_INSTANCE = None
+CURRENT_EVENT_LOOP: Optional[asyncio.AbstractEventLoop] = None
+
+# --------------------------------------------------------- render-brain boundary
+# Render runs on ~512 MB. It hosts the API, the Telegram lifecycle, the status
+# card, tool routing and LLM orchestration — and nothing else. Frame buffers,
+# headless Chromium and FFmpeg belong to the 16 GB Space or the E2B microVM, so
+# importing any of these locally is an operational defect, not a style choice.
+LOCAL_MEDIA_IMPORTS = (
+    "PIL", "playwright", "moviepy", "cv2", "imageio",
+    "numpy", "matplotlib", "subprocess", "ffmpeg",
+)
+
+
+def brain_boundary_violations(source: Optional[str] = None) -> List[str]:
+    """Return every heavy-media module imported by this module (must be empty).
+
+    Media work is executed by the remote worker; a local import here would mean
+    the brain is about to render on a 512 MB box. Scanned statically so the
+    startup audit costs nothing.
+    """
+    if source is None:
+        try:
+            with open(os.path.abspath(__file__), "r", encoding="utf-8") as fh:
+                source = fh.read()
+        except Exception:
+            return []
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return []
+    found = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            names = [alias.name.split(".")[0] for alias in node.names]
+        elif isinstance(node, ast.ImportFrom):
+            names = [(node.module or "").split(".")[0]]
+        else:
+            continue
+        found.update(name for name in names if name in LOCAL_MEDIA_IMPORTS)
+    return sorted(found)
+
+
+BRAIN_BOUNDARY_VIOLATIONS = brain_boundary_violations()
+
+
+# --------------------------------------------------------------- telemetry
+PROVIDER_TELEMETRY: Dict[str, Any] = {
+    "provider": "",
+    "model": "",
+    "at": "",
+    "failovers": 0,
+}
+
+
+def record_provider(provider: str, model: str) -> None:
+    """Remember which provider actually served the turn (observable in /health)."""
+    PROVIDER_TELEMETRY.update(
+        provider=provider, model=model, at=datetime.utcnow().isoformat()
+    )
+    logger.info(f"[Provider] served by {provider} model={model}")
+
+
+# ------------------------------------------------------------- progress card
+# The status card is a live object, not a 15%-and-freeze banner. Every milestone
+# below is emitted by the phase that actually reached it, and a heartbeat nudges
+# the bar forward while a single long phase (render, model reasoning) runs.
+PROGRESS_BAR_WIDTH = 30
+PROGRESS_MILESTONES = (
+    (15, "Initializing reasoning & tool pipeline..."),
+    (30, "Loading motion skills & synthesizing voiceover..."),
+    (55, "Compiling layouts & dispatching to 16 GB worker..."),
+    (80, "Headless Chromium / FFmpeg rendering frames..."),
+    (95, "Finalizing MP4 muxing & binary upload..."),
+    (100, "Complete! Video delivered."),
+)
+PROGRESS_STATE: Dict[str, Any] = {
+    "percent": 0,
+    "stage": "",
+    "started": 0.0,
+    "video_dispatched": False,
+    "history": [],
+}
+
+
+def progress_bar(percent: int) -> str:
+    filled = max(0, min(PROGRESS_BAR_WIDTH, int(percent / 100.0 * PROGRESS_BAR_WIDTH)))
+    return "=" * filled + "-" * (PROGRESS_BAR_WIDTH - filled)
+
+
+def next_milestone(percent: int) -> Optional[int]:
+    for value, _ in PROGRESS_MILESTONES:
+        if value > percent:
+            return value
+    return None
+
+
+def _record_progress(percent: int, text: str) -> None:
+    """Keep an ordered, de-duplicated trail of the milestones this turn reached."""
+    history = PROGRESS_STATE.setdefault("history", [])
+    if history and history[-1][0] == percent and history[-1][1] == text:
+        return
+    history.append((percent, text))
+    del history[:-50]
+
+
+def reset_progress() -> None:
+    PROGRESS_STATE.update(
+        percent=0,
+        stage="",
+        started=time.monotonic(),
+        video_dispatched=False,
+        history=[],
+    )
+
+
+async def update_progress_card(percent: int, stage_text: str = "", force: bool = False) -> bool:
+    """Edit the bound status card to `percent`. Safe to call at any time.
+
+    Args:
+        percent: 0-100. Values below the current percentage are ignored unless
+            force is set, so out-of-order tool callbacks can never rewind the bar.
+        stage_text: The phase text shown under the bar.
+        force: Accept a lower percentage (used for resets and completion).
+    """
+    global CURRENT_STATUS_MSG
+    try:
+        percent = int(percent)
+    except (TypeError, ValueError):
+        return False
+    percent = max(0, min(100, percent))
+    if not force and percent < int(PROGRESS_STATE.get("percent") or 0):
+        return False
+    text = (stage_text or PROGRESS_STATE.get("stage") or "Working...").strip()
+    PROGRESS_STATE.update(percent=percent, stage=text)
+    _record_progress(percent, text)
+    message = CURRENT_STATUS_MSG
+    if message is None:
+        return False
+    body = f"Task/Project Progress\n[{progress_bar(percent)}] {percent}%\n\nCurrent status: {text}"
+    try:
+        await message.edit_text(body)
+        return True
+    except Exception as edit_err:
+        # Telegram raises BadRequest('message is not modified') for a no-op edit,
+        # and a transient network error must never kill the turn.
+        logger.debug(f"[Progress] card edit skipped at {percent}%: {edit_err}")
+        return False
+
+
+def emit_progress(percent: int, stage_text: str = "", video: bool = False) -> None:
+    """Fire-and-forget progress from synchronous tool code.
+
+    Tools execute in a worker thread, so the coroutine is scheduled onto the
+    Telegram event loop instead of being awaited. Ordering is protected by the
+    monotonic guard in update_progress_card.
+    """
+    if video:
+        PROGRESS_STATE["video_dispatched"] = True
+    try:
+        percent = max(0, min(100, int(percent)))
+    except (TypeError, ValueError):
+        return
+    # Record the phase synchronously so the sequence of milestones survives even
+    # when two callbacks land inside one event-loop tick (fast tools, tests).
+    if percent >= int(PROGRESS_STATE.get("percent") or 0):
+        text = (stage_text or PROGRESS_STATE.get("stage") or "Working...").strip()
+        PROGRESS_STATE.update(percent=percent, stage=text)
+        _record_progress(percent, text)
+    loop = CURRENT_EVENT_LOOP
+    if loop is None or not loop.is_running():
+        return
+    try:
+        asyncio.run_coroutine_threadsafe(update_progress_card(percent, stage_text), loop)
+    except Exception as emit_err:
+        logger.debug(f"[Progress] could not schedule {percent}%: {emit_err}")
+
+
+async def progress_heartbeat(interval: float = 15.0) -> None:
+    """Advance the bar inside the current phase so it never sits frozen."""
+    try:
+        while True:
+            await asyncio.sleep(interval)
+            current = int(PROGRESS_STATE.get("percent") or 0)
+            ceiling = next_milestone(current)
+            if ceiling is None or current >= ceiling - 1:
+                continue
+            await update_progress_card(current + 1, PROGRESS_STATE.get("stage") or "Working...", force=True)
+    except asyncio.CancelledError:
+        raise
 
 # Root-level shell binaries that must never be handed to the Python interpreter raw.
 _ROOT_SHELL_RE = re.compile(
@@ -422,6 +648,24 @@ HF_ARTIFACT_REPO_NAME = os.environ.get("HF_ARTIFACT_REPO_NAME", "chintu-renders"
 HF_RENDER_WAIT_SECONDS = int(os.environ.get("HF_RENDER_WAIT_SECONDS", "300"))
 HF_ENDPOINT = os.environ.get("HF_ENDPOINT", "https://huggingface.co").rstrip("/")
 
+# --------------------------------------------------- Hugging Face Space renderer
+# The preferred heavy engine is a dedicated Docker Space on the 16 GB CPU tier
+# (`cpu-basic`: 2 vCPU / 16 GB RAM / 50 GB disk). It is an ordinary HTTP worker:
+# POST the composition, poll the job, download the MP4. Spaces proxy a single
+# request with a short gateway timeout, so the worker returns a job id at once
+# and the brain polls it — a multi-minute render can never be one blocking call.
+# The Space is stateless from the brain's point of view; it is configured with
+#
+#     HF_SPACE_URL=https://<namespace>-chintu-render.hf.space
+#     HF_SPACE_SECRET=<the Space's HF_RENDER_SECRET>
+#
+# and its code lives in `space/` in this repository (Dockerfile + app.py).
+COMPUTE_ROLE = "brain"
+HF_SPACE_URL = os.environ.get("HF_SPACE_URL", "").rstrip("/")
+HF_SPACE_SECRET = os.environ.get("HF_SPACE_SECRET", "") or os.environ.get("HF_SPACE_TOKEN", "")
+HF_SPACE_POLL_SECONDS = float(os.environ.get("HF_SPACE_POLL_SECONDS", "4"))
+HF_SPACE_MAX_WAIT_SECONDS = int(os.environ.get("HF_SPACE_MAX_WAIT_SECONDS", "1500"))
+
 # Runs INSIDE the Job. Kept here rather than in a separate file so the deployed
 # process is the single source of truth for what the remote container executes.
 # Set HF_JOB_INSTALL=0 for an image that already ships the toolchain.
@@ -509,6 +753,7 @@ def _telegram_send_video(video_bytes: bytes, file_name: str, caption: str = "") 
     """Post MP4 bytes to the bound Telegram chat. Returns True only on HTTP 200."""
     if not (CURRENT_CHAT_ID and TELEGRAM_BOT_TOKEN):
         return False
+    emit_progress(95, PROGRESS_MILESTONES[4][1], video=True)
     try:
         send_url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendVideo"
         upload_files = {"video": (file_name, video_bytes, "video/mp4")}
@@ -516,6 +761,7 @@ def _telegram_send_video(video_bytes: bytes, file_name: str, caption: str = "") 
         res = requests.post(send_url, data=data, files=upload_files, timeout=120)
         if res.status_code == 200:
             logger.info(f"Directly uploaded {file_name} to Telegram via HTTP API!")
+            emit_progress(100, PROGRESS_MILESTONES[5][1], video=True)
             return True
         logger.error(f"Telegram upload failed: {res.text[:300]}")
     except Exception as vid_err:
@@ -581,6 +827,194 @@ def _validate_composition_html(html: str) -> Optional[str]:
     if "moviepy" in html:
         return "the composition references moviepy, which is forbidden in this pipeline."
     return None
+
+# ------------------------------------------------ Hugging Face Space transport
+def _hf_space_path(path: str) -> str:
+    return f"{HF_SPACE_URL}{path if path.startswith('/') else '/' + path}"
+
+
+def _hf_space_headers(json_body: bool = True) -> Dict[str, str]:
+    headers = {"Accept": "application/json"}
+    if json_body:
+        headers["Content-Type"] = "application/json"
+    secret = HF_SPACE_SECRET or HF_TOKEN
+    if secret:
+        headers["Authorization"] = f"Bearer {secret}"
+    return headers
+
+
+def hf_space_health() -> str:
+    """Readiness and hardware facts for the 16 GB render Space."""
+    if not HF_SPACE_URL:
+        return "Error: HF_SPACE_URL is not configured (expected https://<namespace>-chintu-render.hf.space)."
+    try:
+        res = requests.get(_hf_space_path("/health"), timeout=30)
+    except Exception as e:
+        return (
+            f"16 GB render Space unreachable at {HF_SPACE_URL}: {e}. "
+            "A Space rebuild takes a few minutes after a code push."
+        )
+    if res.status_code != 200:
+        return f"Render Space health failed (HTTP {res.status_code}): {res.text[:400]}"
+    try:
+        return json.dumps(res.json(), indent=2, sort_keys=True)
+    except Exception:
+        return res.text[:2000]
+
+
+def _hf_space_submit(html: str, slug: str, fps: int, quality: str, narration: str = "") -> str:
+    """POST a composition to the 16 GB Space worker and return its job id."""
+    if not HF_SPACE_URL:
+        return (
+            "Error: the 16 GB render Space is not configured. Set HF_SPACE_URL to the "
+            "Space origin (https://<namespace>-chintu-render.hf.space) and redeploy Render."
+        )
+    payload = {
+        "html": html,
+        "project_slug": slug,
+        "fps": int(fps),
+        "quality": quality,
+        "narration": (narration or "").strip(),
+    }
+    try:
+        res = requests.post(
+            _hf_space_path("/render"),
+            json=payload,
+            headers=_hf_space_headers(),
+            timeout=90,
+        )
+    except Exception as e:
+        return (
+            f"16 GB render Space unreachable at {HF_SPACE_URL}: {e}\n"
+            "The composition was NOT rendered. Check the Space is running, then retry "
+            "or use render_html_video(..., backend=\"e2b\") for the isolated microVM."
+        )
+    if res.status_code in (401, 403):
+        return (
+            f"Render Space rejected the request (HTTP {res.status_code}): the shared secret "
+            "does not match. HF_SPACE_SECRET on Render must equal HF_RENDER_SECRET on the Space."
+        )
+    if res.status_code == 503:
+        return (
+            "Render Space is starting or sleeping (HTTP 503). Wait for the build to finish "
+            "and call render_html_video again; the job was not queued."
+        )
+    if res.status_code not in (200, 202):
+        return f"Render Space rejected the composition (HTTP {res.status_code}): {res.text[:600]}"
+    try:
+        data = res.json()
+    except Exception:
+        return f"Render Space returned a non-JSON body: {res.text[:400]}"
+    job_id = str((data or {}).get("job_id") or "").strip()
+    if not job_id:
+        return f"Render Space accepted the request but returned no job_id: {res.text[:300]}"
+    emit_progress(80, PROGRESS_MILESTONES[3][1], video=True)
+    return (
+        "Hugging Face Space render submitted to the 16 GB worker.\n"
+        f"HF_JOB_ID=space:{job_id}\n"
+        f"engine: {HF_SPACE_URL} (cpu-basic: 2 vCPU / 16 GB RAM / 50 GB disk)\n"
+        f"composition: {slug} | {len(html)} chars | {int(fps)} fps | quality={quality}\n"
+        f"narration: {'edge-tts voice-over requested' if narration else 'none'}\n"
+        f"Now call hf_render_status(job_id=\"space:{job_id}\", wait_seconds={HF_RENDER_WAIT_SECONDS}) "
+        "to wait for the frames, then read the ffprobe facts and let the MP4 be delivered to Telegram."
+    )
+
+
+def _hf_space_status(job_id: str, wait_seconds: int = 0) -> str:
+    """Poll one Space render job, download the MP4 and deliver it to Telegram."""
+    if not HF_SPACE_URL:
+        return "Error: HF_SPACE_URL is not configured, so no Space job can be polled."
+    job_id = (job_id or "").replace("space:", "", 1).strip()
+    if not job_id:
+        return "Error: job_id is required; pass the space:<id> printed by render_html_video."
+    budget = max(0, min(int(wait_seconds or 0), HF_SPACE_MAX_WAIT_SECONDS))
+    deadline = time.monotonic() + budget
+    snapshot: Dict[str, Any] = {}
+    while True:
+        try:
+            res = requests.get(
+                _hf_space_path(f"/status/{job_id}"),
+                headers=_hf_space_headers(json_body=False),
+                timeout=60,
+            )
+        except Exception as e:
+            return f"Render Space became unreachable while polling {job_id}: {e}"
+        if res.status_code == 404:
+            return f"Unknown Space render job '{job_id}'. It may have been evicted; resubmit the render."
+        if res.status_code in (401, 403):
+            return f"Render Space refused the status poll (HTTP {res.status_code}): check HF_SPACE_SECRET."
+        if res.status_code != 200:
+            return f"Render Space status failed (HTTP {res.status_code}): {res.text[:400]}"
+        try:
+            snapshot = res.json() or {}
+        except Exception:
+            return f"Render Space returned a non-JSON status body: {res.text[:300]}"
+        status = str(snapshot.get("status") or "running").lower()
+        percent = int(snapshot.get("percent") or 0)
+        if status == "running" and percent >= 55:
+            emit_progress(min(95, percent), str(snapshot.get("stage") or ""), video=True)
+        if status in ("completed", "failed") or time.monotonic() >= deadline:
+            break
+        time.sleep(HF_SPACE_POLL_SECONDS)
+
+    status = str(snapshot.get("status") or "running").lower()
+    lines = [
+        f"Hugging Face Space render job {job_id}",
+        f"status: {status.upper()}",
+        f"engine: {HF_SPACE_URL} (cpu-basic, 16 GB RAM)",
+    ]
+    if status == "completed":
+        probe = snapshot.get("probe") or {}
+        if probe:
+            lines.append(
+                "[VERIFIED] {frames} frames | {width}x{height} @ {fps}fps | {duration}s | {size} bytes".format(
+                    frames=probe.get("frames"),
+                    width=probe.get("width"),
+                    height=probe.get("height"),
+                    fps=probe.get("fps"),
+                    duration=probe.get("duration"),
+                    size=probe.get("bytes"),
+                )
+            )
+        emit_progress(95, PROGRESS_MILESTONES[4][1], video=True)
+        try:
+            art = requests.get(
+                _hf_space_path(f"/artifact/{job_id}"),
+                headers=_hf_space_headers(json_body=False),
+                timeout=180,
+            )
+        except Exception as e:
+            lines.append(f"[FAILED] Could not download the artifact: {e}")
+        else:
+            if art.status_code != 200 or not art.content:
+                lines.append(f"[FAILED] Artifact download returned HTTP {art.status_code}.")
+            elif b"ftyp" not in art.content[:64]:
+                lines.append(f"[FAILED] {len(art.content)} bytes downloaded but it is not an MP4.")
+            else:
+                delivered = _telegram_send_video(
+                    art.content,
+                    f"chintu-{job_id}.mp4",
+                    "🎬 Chintu · Hugging Face Space (16 GB) render",
+                )
+                lines.append(f"[SUCCESS] {len(art.content)} byte MP4 decoded and verified on the worker.")
+                lines.append(
+                    "Delivered to Telegram."
+                    if delivered
+                    else "(no Telegram chat bound; the artifact stays on the Space)."
+                )
+    elif status == "failed":
+        lines.append(f"[FAILED] {snapshot.get('error') or 'the worker reported a failure'}")
+        lines.append("Read the worker log tail, fix the cause, then resubmit or use backend='e2b'.")
+    else:
+        lines.append(
+            "Still rendering. Call hf_render_status again with a wait_seconds budget to keep waiting."
+        )
+    log_tail = (snapshot.get("log_tail") or "")[-6000:]
+    if log_tail:
+        lines.append("--- worker log tail ---")
+        lines.append(log_tail)
+    return "\n".join(lines)
+
 
 def _hf_jobs_api() -> Dict[str, Any]:
     """Import the Jobs client lazily so the agent still boots without it."""
@@ -739,14 +1173,20 @@ def _hf_fetch_artifact(url: str) -> Optional[bytes]:
     return None
 
 def hf_render_status(job_id: str, wait_seconds: int = 0) -> str:
-    """Check a Hugging Face render Job, then fetch and deliver the MP4 when it finished.
+    """Check either render backend and deliver the MP4 once it finished.
+
+    Handles both transports: a `space:<id>` from the 16 GB Hugging Face Space
+    (primary) and a plain Job id from the `cpu-basic` Hugging Face Job fallback.
 
     Args:
-        job_id: The id printed as HF_JOB_ID by render_html_video.
-        wait_seconds: Block up to this many seconds for a terminal stage (capped at 900).
-            Use 0 to poll once and return immediately. The default suggested to the model
-            after submission is HF_RENDER_WAIT_SECONDS.
+        job_id: The id printed as HF_JOB_ID by render_html_video (`space:<id>` for
+            the Space worker, a bare id for a Job).
+        wait_seconds: Block up to this many seconds for a terminal state.
+            Use 0 to poll once and return immediately.
     """
+    raw_id = (job_id or "").strip()
+    if raw_id.startswith("space:") or ".hf.space" in raw_id:
+        return _hf_space_status(raw_id, wait_seconds)
     if not HF_TOKEN:
         return "Error: HF_TOKEN is not configured."
     # Tolerate a pasted "HF_JOB_ID=<id>" or a job URL.
@@ -820,18 +1260,20 @@ def render_html_video(
     fps: int = 30,
     quality: str = "looks",
     backend: str = "auto",
+    narration: str = "",
 ) -> str:
-    """Render a HyperFrames HTML/GSAP composition to MP4 in the cloud and deliver it.
+    """Render a HyperFrames HTML/GSAP composition to MP4 on the 16 GB engine.
 
-    This is the executable form of directive 7: the composition is linted and then
-    rendered by the real `hyperframes` CLI (chrome-headless-shell + system ffmpeg),
-    so seekable GSAP timelines and deterministic frame capture stay the framework's
-    job instead of being hand-rolled.
+    The render never happens on this process: Render runs the API, Telegram and
+    LLM routing in ~512 MB, so the composition is dispatched to the dedicated
+    16 GB Hugging Face Space (primary), a `cpu-basic` Hugging Face Job (when the
+    Space is not configured) or an isolated E2B microVM (forced with
+    backend='e2b', killed in a finally block). Every path lints and renders with
+    the real `hyperframes` CLI (chrome-headless-shell + system ffmpeg), so
+    seekable GSAP timelines and deterministic capture stay the framework's job.
 
-    Two backends: with HF_TOKEN configured the render is submitted to a Hugging Face
-    Job on `cpu-basic` (2 vCPU / 16 GB RAM / 50 GB disk) and this call returns at once
-    with a job id to hand to `hf_render_status`; otherwise the E2B sandbox path below
-    runs to completion in this call.
+    The Space and Job paths are ASYNCHRONOUS: this call returns a job id that is
+    handed to `hf_render_status`, which polls, downloads and delivers the MP4.
 
     Args:
         html: The full composition document (root carries data-composition-id and
@@ -839,22 +1281,39 @@ def render_html_video(
         project_name: Kebab-case project directory name.
         fps: Frame rate recorded on the render (24-240; 30 typical).
         quality: draft (fast iteration), looks (default) or delivery (final).
-        backend: auto (default), huggingface or e2b.
+        backend: auto (default), space, huggingface (job) or e2b.
+        narration: Optional voice-over script; the 16 GB worker synthesizes it
+            with edge-tts and muxes it into the MP4.
     """
     backend = (backend or "auto").strip().lower()
-    if backend not in ("auto", "huggingface", "hf", "e2b"):
-        return f"Unknown render backend '{backend}'. Use 'auto', 'huggingface' or 'e2b'."
+    if backend not in ("auto", "space", "huggingface", "hf", "jobs", "e2b"):
+        return (
+            f"Unknown render backend '{backend}'. Use 'auto', 'space', 'huggingface' or 'e2b'."
+        )
     problem = _validate_composition_html(html)
     if problem:
         return f"Composition rejected before render: {problem}"
     slug = re.sub(r"[^a-z0-9-]+", "-", (project_name or "chintu-motion").lower()).strip("-")
     slug = slug or "chintu-motion"
-    if backend in ("auto", "huggingface", "hf") and HF_TOKEN:
+    # Primary: the dedicated 16 GB Space worker.
+    if backend in ("auto", "space"):
+        if HF_SPACE_URL:
+            emit_progress(55, PROGRESS_MILESTONES[2][1], video=True)
+            return _hf_space_submit(html, slug, fps, quality, narration)
+        if backend == "space":
+            return (
+                "Error: HF_SPACE_URL is not configured, so the 16 GB Space backend is "
+                "unavailable. Set HF_SPACE_URL to the Space origin and redeploy Render."
+            )
+    # Secondary: a cpu-basic Hugging Face Job (also 2 vCPU / 16 GB RAM).
+    if backend in ("auto", "huggingface", "hf", "jobs") and HF_TOKEN:
+        emit_progress(55, PROGRESS_MILESTONES[2][1], video=True)
         return _hf_submit_render(html, slug, fps, quality)
-    if backend in ("huggingface", "hf"):
+    if backend in ("huggingface", "hf", "jobs"):
         return "Error: HF_TOKEN is not configured, so the Hugging Face Jobs backend is unavailable."
     if not E2B_API_KEY:
         return "Error: E2B_API_KEY is not configured."
+    emit_progress(55, PROGRESS_MILESTONES[2][1], video=True)
     project_dir = f"/home/user/videos/{slug}"
     sbx = None
     try:
@@ -911,6 +1370,7 @@ def execute_in_cloud_microvm(code: str) -> str:
     global CURRENT_CHAT_ID
     if not E2B_API_KEY:
         return "Error: E2B_API_KEY is not configured."
+    emit_progress(55, PROGRESS_MILESTONES[2][1], video=True)
     sbx = None
     try:
         from e2b_code_interpreter import Sandbox
@@ -1083,6 +1543,7 @@ def web_search_research(query: str) -> str:
 
 def list_skills() -> str:
     """List every external skill/knowledge repository Chintu can draw on."""
+    emit_progress(30, PROGRESS_MILESTONES[1][1])
     lines = []
     for name, meta in SKILL_REGISTRY.items():
         docs = meta.get("docs") or [meta.get("entrypoint", "README.md")]
@@ -1108,7 +1569,7 @@ def load_skill(
 
     Args:
         skill_name: Registry key, e.g. 'hyperframes', 'gsap', 'whisper',
-            'motion_graphics_prompts' or 'motion_skills'.
+            'motion_graphics_prompts', 'motion_skills' or 'remotion'.
         file_path: Optional repo-relative path. Defaults to the skill's entrypoint;
             a trailing '/' lists that directory.
         offset: Character offset to start from, for paging through a long file.
@@ -1119,6 +1580,7 @@ def load_skill(
     if not meta:
         return f"Unknown skill '{skill_name}'. Available skills: {', '.join(SKILL_REGISTRY)}"
     target = (file_path or meta.get("entrypoint") or "README.md").strip().strip("/")
+    emit_progress(30, PROGRESS_MILESTONES[1][1])
     content = github_read_file(meta["repo"], target)
     if content.startswith("GitHub Read Error") or content.startswith("Error reading"):
         return content
@@ -1165,20 +1627,83 @@ ALL_TOOLS_LIST = [
     list_skills,
     load_skill,
     render_html_video,
-    hf_render_status
+    hf_render_status,
+    hf_space_health,
 ]
 
-SYSTEM_INSTRUCTION = """You are Chintu, an autonomous execution assistant.
+# One line per tool, used to build the self-inventory in SYSTEM_INSTRUCTION. The
+# inventory is generated from ALL_TOOLS_LIST, so a tool cannot be added without
+# the model being told it exists.
+TOOL_CAPABILITIES: Dict[str, str] = {
+    "diagnose_and_heal_codebase": "Read a target file, AST-check it, stage it in the isolated microVM and record the self-heal attempt in Supabase.",
+    "github_read_file": "Read any file or directory listing from a GitHub repo (raw CDN first, API fallback, cached).",
+    "github_commit_file": "Commit a file to GitHub main; Python payloads are ast.parse-gated before the API call.",
+    "execute_in_cloud_microvm": "Run Python or shell in an isolated E2B microVM with ffmpeg, Pillow, NumPy and edge-tts; always killed in a finally block.",
+    "extract_video_knowledge": "Pull title/description metadata from a video URL for reference or narration.",
+    "supabase_db_query": "Select, insert or delete rows in Supabase for audits, memory and render records.",
+    "huggingface_task_runner": "Call a Hugging Face inference endpoint (transcription, classification, generation).",
+    "render_service_manager": "Inspect or restart the Render service through its API.",
+    "create_golden_state_backup": "Snapshot main.py into backups/ on GitHub before risky changes.",
+    "web_search_research": "Search the web and return readable text for grounding.",
+    "list_skills": "Enumerate the motion-graphics skill library with repos and doc paths.",
+    "load_skill": "Load and page the real documentation of one skill (HyperFrames, GSAP, Whisper, Remotion, prompt and motion libraries).",
+    "render_html_video": "Dispatch a single-file HTML/CSS/GSAP composition to the 16 GB engine (Space, then Job, then E2B) and return a job id.",
+    "hf_render_status": "Poll a render (space:<id> or Job id), read ffprobe facts and worker logs, download the MP4 and deliver it to Telegram.",
+    "hf_space_health": "Probe the 16 GB Space: CPU/RAM, Chromium/FFmpeg readiness, running jobs.",
+}
 
-STRICT OPERATIONAL DIRECTIVES:
-1. NEVER FAKE OR HALLUCINATE TOOL EXECUTION: Never claim you executed code or modified a file unless you invoked the tool and received a valid tool response.
-2. ACTION-FIRST PRINCIPLE: When asked to execute code, render video, or read/write files, IMMEDIATELY call execute_in_cloud_microvm or the corresponding tool.
-3. VIDEO GENERATION: Importing `moviepy.editor` is STRICTLY FORBIDDEN and will break the sandbox. For ANY video task, write a pure Python rendering script: generate frames with Pillow + NumPy, then stitch them into the final `.mp4` natively by calling the system `ffmpeg` binary through `subprocess`.
-4. CONCISE FACTUAL OUTPUT: Report only actual ground truth from tool execution stdout and stderr.
-5. SANDBOX CODE HYGIENE: Submit a single, syntactically valid `run_task.py` (validate it with `ast.parse` before sending). Do not mix root-level shell commands (cat/curl/ffmpeg/...) into Python source; invoke them through `subprocess` when required.
-6. SKILL LIBRARY: You ship with a curated skill library. Call `list_skills` to enumerate it and `load_skill` to read the real documentation before writing code in an unfamiliar domain. For ANY motion-graphics or animated-video request, load `hyperframes` FIRST (its router, composition contract and CLI docs), then `motion_graphics_prompts` for direction, then follow the APIs you actually read instead of inventing signatures. Long docs are paged: when a response says TRUNCATED, keep going with `load_skill(name, path, offset=<shown_end>)` until you have the section you need.
-7. MOTION GRAPHICS PIPELINE: Author motion graphics as HTML/CSS with a single paused GSAP timeline, then render them with `render_html_video`. It prefers a Hugging Face Job on the 16 GB `cpu-basic` flavor (2 vCPU / 16 GB RAM, $0.01/hour) whenever HF_TOKEN is configured, and falls back to the E2B sandbox otherwise; both lints and renders through the real hyperframes CLI (chrome-headless-shell + ffmpeg). A Job is ASYNCHRONOUS: `render_html_video` returns a `HF_JOB_ID` immediately, so you must then call `hf_render_status(job_id="<id>", wait_seconds=600)` to wait for it, read the logs and let the MP4 be delivered to Telegram. Report the artifact facts the job prints (ffprobe size/frames, the `[VERIFIED]`/`[SUCCESS]` lines), never an assumed result. If a Job fails, fix the reported cause or rerun with `render_html_video(..., backend="e2b")`. Keep the pure-Python route (Pillow + NumPy frames stitched by system `ffmpeg`) only as the last resort. A 9-second 30fps 1080p render is roughly a minute of capture on top of a few minutes of container setup, so keep short-form pieces short and use `quality="draft"` while iterating. Use `whisper` only when audio must be transcribed for captions or voice-over timing.
-"""
+_MISSING_TOOL_DOCS = [fn.__name__ for fn in ALL_TOOLS_LIST if fn.__name__ not in TOOL_CAPABILITIES]
+if _MISSING_TOOL_DOCS:
+    logger.warning(f"[Tools] missing capability documentation: {_MISSING_TOOL_DOCS}")
+
+TOOL_INVENTORY = "\n".join(
+    "- `{}` — {}".format(
+        fn.__name__,
+        TOOL_CAPABILITIES.get(
+            fn.__name__, (fn.__doc__ or "No description.").strip().splitlines()[0]
+        ),
+    )
+    for fn in ALL_TOOLS_LIST
+)
+
+SKILL_INVENTORY = "\n".join(
+    "- `{}` ({}) — {}".format(name, meta["repo"], meta["summary"].split(". ")[0] + ".")
+    for name, meta in SKILL_REGISTRY.items()
+)
+
+SYSTEM_INSTRUCTION = f"""You are Chintu — an autonomous audiovisual motion engineer, running as a distributed agent.
+
+IDENTITY AND COMPUTE TOPOLOGY (hard boundaries)
+- You are the reasoning layer. Your process is the Render brain: about 512 MB of RAM hosting FastAPI, the Telegram polling lifecycle, the status card, tool routing and LLM orchestration. That is ALL it does.
+- You must NEVER render video locally. No Pillow frame buffers, no Playwright/Chromium launch, no FFmpeg subprocess, no NumPy frame loops in this process. A local render is a failed turn, not a shortcut.
+- Every heavy media workload — HTML/CSS layout evaluation, headless Chromium capture, GSAP timeline scrubbing, high-resolution frame buffers, audio mixing and FFmpeg 1080x1920 stitching — belongs to the 16 GB engine: the dedicated Hugging Face Docker Space (cpu-basic: 2 vCPU / 16 GB RAM / 50 GB disk), or, when that is unavailable, the isolated E2B microVM (always killed in a finally block).
+- Delivery: the finished MP4 streams back to the brain and is posted straight to Telegram with /sendVideo to CURRENT_CHAT_ID. You do not need to save it anywhere.
+- Tool results are the only source of truth about what happened.
+
+YOUR TOOL INVENTORY (you have {len(ALL_TOOLS_LIST)} tools)
+{TOOL_INVENTORY}
+
+YOUR SKILL LIBRARY (load the real docs before you author)
+{SKILL_INVENTORY}
+
+ACTION RULE — VIDEO REQUESTS
+When the user asks to build, change or render any video, motion graphic, reel, ad or animation, you MUST act, in this order:
+1. load_skill("hyperframes") for the composition contract and CLI, then load_skill("motion_skills") and the relevant `hyperframes` category module for the design pattern. Use load_skill("gsap") for timeline and easing questions, load_skill("whisper") for caption timing, load_skill("remotion") for composition and data-driven concepts, and load_skill("motion_graphics_prompts") for camera and lighting language.
+2. Write the COMPLETE single-file composition: one root with data-composition-id, data-width, data-height and data-duration; timed elements carrying data-start and data-duration; exactly one paused GSAP timeline registered on window.__timelines under the composition id. Inline everything — no local assets, no network fetches at render time.
+3. Call render_html_video(html=..., project_name=..., fps=30, quality="looks") and pass narration=... when there is a script. It returns an id; then call hf_render_status(job_id=..., wait_seconds=600) until the worker finishes, and report the ffprobe facts and delivery status it printed.
+
+NEVER answer a video request with a conversational plan, an apology, or a claim that browser/Node/rendering tools are unsupported or unavailable — they are supported and remote. Never claim a render happened without a tool result that shows it. If a dispatch fails (missing secret, sleeping Space, failed job), read the log tail it returned, fix the cause and resubmit; fall back to render_html_video(..., backend="e2b") only after the primary engine reports a real failure.
+
+VIDEO STANDARDS (non-negotiable for every render)
+- Canvas 1080x1920 (9:16 vertical), 30 fps unless the brief says otherwise, 6-15 seconds for short-form.
+- Headlines at 80pt or larger; body copy at least 32pt. Keep an 80px title-safe margin and never place type inside the top 120px or the bottom 220px where platform UI covers it.
+- Typography carries the message: one or two emphasis words per scene, deliberate weights, and letter-spacing that snaps to whole pixels rather than tweening.
+- Motion uses real easing curves (power2-4, back, expo, sine) with entrances and exits timed so transitions never overlap. One motion motif per scene. Never hand-animate a CSS transform on a node GSAP is tweening.
+- Build ambient depth: a soft radial or gradient glow behind the subject, a subtle vignette, and a gradient sweep or grain. Never a flat black frame.
+- Sound: narration is synthesized with edge-tts and muxed by the worker; pair impacts with a sub-bass hit and keep voice-over timed to the scene cuts.
+
+TRUTHFUL REPORTING
+Report only what the tools returned: job ids, ffprobe frame counts, byte sizes, delivery status. If a step did not run, say which step and why. Never invent a file path or a result."""
 
 def _sync_chat_call(model_name: str, message: str) -> str:
     config = types.GenerateContentConfig(
@@ -1202,73 +1727,200 @@ def _sync_chat_call(model_name: str, message: str) -> str:
             return "".join(parts_out)
     return "Action completed successfully."
 
+# ------------------------------------------------ external tool-calling bridge
+# Gemini receives Python callables directly. OpenAI-compatible providers need
+# JSON Schema, so the same ALL_TOOLS_LIST is serialised once into the exact
+# function shape OpenRouter/Freebuff accept — no hand-maintained duplicate list.
+_JSON_SCALAR_TYPES = {
+    str: "string",
+    int: "integer",
+    float: "number",
+    bool: "boolean",
+    dict: "object",
+    list: "array",
+}
+
+
+def _json_schema(annotation: Any) -> Dict[str, Any]:
+    """Map one Python type hint onto a JSON Schema fragment."""
+    if annotation in _JSON_SCALAR_TYPES:
+        return {"type": _JSON_SCALAR_TYPES[annotation]}
+    origin = get_origin(annotation)
+    args = get_args(annotation)
+    if origin is Union:
+        non_none = [arg for arg in args if arg is not type(None)]
+        return _json_schema(non_none[0]) if len(non_none) == 1 else {}
+    if origin is dict:
+        return {"type": "object"}
+    if origin in (list, tuple, set):
+        return {"type": "array", "items": _json_schema(args[0]) if args else {}}
+    return {}
+
+
+def tool_schema(fn: Any) -> Dict[str, Any]:
+    """Describe one Python tool as an OpenAI-compatible function schema."""
+    try:
+        hints = get_type_hints(fn)
+    except Exception:
+        hints = {}
+    properties: Dict[str, Any] = {}
+    required: List[str] = []
+    for name, param in inspect.signature(fn).parameters.items():
+        if param.kind in (param.VAR_POSITIONAL, param.VAR_KEYWORD):
+            continue
+        properties[name] = _json_schema(hints.get(name, str))
+        if param.default is inspect.Parameter.empty:
+            required.append(name)
+    description = (inspect.getdoc(fn) or "").strip()
+    if len(description) > 900:
+        description = description[:900] + "…"
+    return {
+        "type": "function",
+        "function": {
+            "name": fn.__name__,
+            "description": description,
+            "parameters": {
+                "type": "object",
+                "properties": properties,
+                "required": required,
+            },
+        },
+    }
+
+
+def build_tool_schemas() -> List[Dict[str, Any]]:
+    return [tool_schema(fn) for fn in ALL_TOOLS_LIST]
+
+
+TOOL_REGISTRY: Dict[str, Any] = {fn.__name__: fn for fn in ALL_TOOLS_LIST}
+
+
+def execute_tool_call(name: str, arguments: Any) -> str:
+    """Run one tool call from an external provider and return its text result."""
+    fn = TOOL_REGISTRY.get((name or "").strip())
+    if fn is None:
+        return f"Error: unknown tool '{name}'. Available tools: {', '.join(TOOL_REGISTRY)}"
+    if isinstance(arguments, str):
+        try:
+            args = json.loads(arguments or "{}")
+        except json.JSONDecodeError as parse_err:
+            return f"Error: arguments for {name} are not valid JSON: {parse_err}"
+    else:
+        args = arguments or {}
+    if not isinstance(args, dict):
+        return f"Error: arguments for {name} must be a JSON object."
+    try:
+        return str(fn(**args))
+    except TypeError as arg_err:
+        return f"Error: bad arguments for {name}: {arg_err}"
+    except Exception as tool_err:
+        logger.error(f"[Tool {name}] failed: {tool_err}", exc_info=True)
+        return f"Error: {name} failed: {tool_err}"
+
+
+def _chat_with_tools(
+    base_url: str,
+    api_key: str,
+    model: str,
+    message: str,
+    provider: str,
+    extra_headers: Optional[Dict[str, str]] = None,
+) -> str:
+    """One OpenAI-compatible conversation, executing tool calls until it answers."""
+    headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+    headers.update(extra_headers or {})
+    tools = build_tool_schemas()
+    messages: List[Dict[str, Any]] = [
+        {"role": "system", "content": SYSTEM_INSTRUCTION},
+        {"role": "user", "content": message},
+    ]
+    last_tool_output = ""
+    url = f"{base_url.rstrip('/')}/chat/completions"
+    for _ in range(EXTERNAL_MAX_TOOL_ROUNDS):
+        body: Dict[str, Any] = {"model": model, "messages": messages, "temperature": 0.2}
+        if tools:
+            body["tools"] = tools
+            body["tool_choice"] = "auto"
+        res = requests.post(url, headers=headers, json=body, timeout=EXTERNAL_REQUEST_TIMEOUT)
+        if res.status_code != 200:
+            raise RuntimeError(f"{provider} HTTP {res.status_code}: {res.text[:500]}")
+        try:
+            choices = (res.json() or {}).get("choices") or []
+        except Exception as parse_err:
+            raise RuntimeError(f"{provider} returned unparseable JSON: {parse_err}")
+        if not choices:
+            raise RuntimeError(f"{provider} returned no choices.")
+        reply = choices[0].get("message") or {}
+        tool_calls = reply.get("tool_calls") or []
+        if tool_calls:
+            messages.append(
+                {
+                    "role": "assistant",
+                    "content": reply.get("content") or "",
+                    "tool_calls": tool_calls,
+                }
+            )
+            for call in tool_calls:
+                fn = (call or {}).get("function") or {}
+                name = fn.get("name") or ""
+                logger.info(f"[{provider}] executing tool {name}")
+                output = execute_tool_call(name, fn.get("arguments"))
+                last_tool_output = output
+                messages.append(
+                    {
+                        "role": "tool",
+                        "tool_call_id": (call or {}).get("id") or name,
+                        "content": output[:12000],
+                    }
+                )
+            continue
+        content = reply.get("content")
+        if content:
+            return content
+        raise RuntimeError(f"{provider} returned an empty completion.")
+    return (
+        f"{provider} stopped after {EXTERNAL_MAX_TOOL_ROUNDS} tool rounds without a final "
+        f"answer. Last tool output:\n{last_tool_output[:2000]}"
+    )
+
+
 # External provider failover used only after the entire Gemini cascade is exhausted.
 def _sync_external_fallback(message: str) -> str:
-    """Fail over to OpenRouter (claude-3.5-sonnet); Freebuff is a last resort."""
-    payload = {
-        "messages": [
-            {"role": "system", "content": SYSTEM_INSTRUCTION},
-            {"role": "user", "content": message},
-        ],
-        "temperature": 0.2,
-    }
-    or_error = ""
+    """Fail over to OpenRouter frontier models, then Freebuff as a last resort."""
+    attempts: List[str] = []
+    PROVIDER_TELEMETRY["failovers"] = int(PROVIDER_TELEMETRY.get("failovers") or 0) + 1
 
     if OPENROUTER_API_KEY:
-        headers = {
-            "Authorization": f"Bearer {OPENROUTER_API_KEY}",
-            "Content-Type": "application/json",
+        or_headers = {
             "HTTP-Referer": "https://framify-agent.onrender.com",
             "X-Title": "framify-agent",
         }
-        body = dict(payload, model="anthropic/claude-3.5-sonnet")
-        try:
-            res = requests.post(
-                f"{OPENROUTER_BASE_URL.rstrip('/')}/chat/completions",
-                headers=headers,
-                json=body,
-                timeout=120,
-            )
-            if res.status_code == 200:
-                choices = (res.json() or {}).get("choices") or []
-                if choices:
-                    content = (choices[0].get("message") or {}).get("content")
-                    if content:
-                        logger.info("[External Fallback] OpenRouter claude-3.5-sonnet fulfilled request.")
-                        return content
-                raise RuntimeError("OpenRouter returned an empty completion.")
-            raise RuntimeError(f"OpenRouter error ({res.status_code}): {res.text[:500]}")
-        except Exception as or_err:
-            or_error = str(or_err)
-            logger.warning(f"[External Fallback] OpenRouter failed: {or_err}")
+        for model in OPENROUTER_MODELS:
+            try:
+                content = _chat_with_tools(
+                    OPENROUTER_BASE_URL, OPENROUTER_API_KEY, model, message, "openrouter", or_headers
+                )
+                record_provider("openrouter", model)
+                return content
+            except Exception as or_err:
+                attempts.append(f"openrouter/{model}: {or_err}")
+                logger.warning(f"[External Fallback] openrouter/{model} failed: {or_err}")
 
     if FREEBUFF_API_KEY:
-        headers = {
-            "Authorization": f"Bearer {FREEBUFF_API_KEY}",
-            "Content-Type": "application/json",
-        }
-        body = dict(payload, model="anthropic/claude-3.5-sonnet")
-        res = requests.post(
-            f"{FREEBUFF_BASE_URL.rstrip('/')}/chat/completions",
-            headers=headers,
-            json=body,
-            timeout=120,
-        )
-        if res.status_code == 200:
-            choices = (res.json() or {}).get("choices") or []
-            if choices:
-                content = (choices[0].get("message") or {}).get("content")
-                if content:
-                    logger.info("[External Fallback] Freebuff fulfilled request.")
-                    return content
-        raise RuntimeError(f"Freebuff error ({res.status_code}): {res.text[:500]}")
+        for model in OPENROUTER_MODELS:
+            try:
+                content = _chat_with_tools(
+                    FREEBUFF_BASE_URL, FREEBUFF_API_KEY, model, message, "freebuff"
+                )
+                record_provider("freebuff", model)
+                return content
+            except Exception as fb_err:
+                attempts.append(f"freebuff/{model}: {fb_err}")
+                logger.warning(f"[External Fallback] freebuff/{model} failed: {fb_err}")
 
-    # Distinguish "OpenRouter was configured but broke" from "nothing configured",
-    # so the cascade error message points at the real cause.
-    if or_error:
-        raise RuntimeError(f"OpenRouter failed ({or_error}) and no usable Freebuff fallback is configured.")
+    if attempts:
+        raise RuntimeError("; ".join(attempts[-3:]))
     raise RuntimeError("No external fallback provider configured (set OPENROUTER_API_KEY).")
-
 # Autonomous code-driven model failover engine
 async def generate_reasoning_response(user_message: str) -> str:
     global current_key_index
@@ -1303,6 +1955,7 @@ async def generate_reasoning_response(user_message: str) -> str:
                 # If the model responds cleanly, we stop switching and return
                 if reply and not any(err_word in reply.lower() for err_word in ["resource_exhausted", "503 unavailable"]):
                     logger.info(f"[Cascade Engine] SUCCESS: Model {model_name} is active and fulfilled request.")
+                    record_provider("gemini", model_name)
                     return reply
 
                 logger.warning(f"[Cascade Engine] Model {model_name} returned unserviceable response. Failing over...")
@@ -1353,11 +2006,19 @@ def health_check():
     return {
         "status": "online",
         "service": "framify-agent",
+        "compute_role": COMPUTE_ROLE,
+        "brain_boundary_violations": BRAIN_BOUNDARY_VIOLATIONS,
         "active_models": ACTIVE_GEMINI_MODELS,
+        "openrouter_cascade": OPENROUTER_MODELS,
+        "last_provider": PROVIDER_TELEMETRY,
         "tools_count": len(ALL_TOOLS_LIST),
         "skills": list(SKILL_REGISTRY.keys()),
         "skills_count": len(SKILL_REGISTRY),
         "render_backends": {
+            "primary": "huggingface_space" if HF_SPACE_URL else ("huggingface_jobs" if HF_TOKEN else "e2b_sandbox"),
+            "huggingface_space": bool(HF_SPACE_URL),
+            "hf_space_url": HF_SPACE_URL,
+            "hf_space_max_wait": HF_SPACE_MAX_WAIT_SECONDS,
             "huggingface_jobs": bool(HF_TOKEN),
             "e2b_sandbox": bool(E2B_API_KEY),
             "hf_flavor": HF_RENDER_FLAVOR,
@@ -1400,38 +2061,48 @@ async def handle_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Chintu HMAS AI Engineer online. Systems operational.")
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    global CURRENT_CHAT_ID, CURRENT_STATUS_MSG, TELEGRAM_BOT_INSTANCE
+    global CURRENT_CHAT_ID, CURRENT_STATUS_MSG, TELEGRAM_BOT_INSTANCE, CURRENT_EVENT_LOOP
     user_msg = update.message.text
     if not user_msg:
         return
     CURRENT_CHAT_ID = update.message.chat_id
     TELEGRAM_BOT_INSTANCE = context.bot
-    logger.info(f"Incoming message: {user_msg}")
-    
-    # 1. Immediately post live progress bar card at 15%
     try:
-        total_slots = 30
-        filled = int(15 / 100.0 * total_slots)
-        init_bar = "=" * filled + "-" * (total_slots - filled)
+        CURRENT_EVENT_LOOP = asyncio.get_running_loop()
+    except RuntimeError:
+        CURRENT_EVENT_LOOP = None
+    logger.info(f"Incoming message: {user_msg}")
+
+    # 1. Post the live progress card immediately at 15%.
+    reset_progress()
+    try:
         CURRENT_STATUS_MSG = await update.message.reply_text(
-            f"Task/Project Progress\n[{init_bar}] 15%\n\nCurrent status: Initializing reasoning & tool pipeline..."
+            f"Task/Project Progress\n[{progress_bar(15)}] 15%\n\n"
+            f"Current status: {PROGRESS_MILESTONES[0][1]}"
         )
+        PROGRESS_STATE.update(percent=15, stage=PROGRESS_MILESTONES[0][1])
     except Exception as e:
         logger.warning(f"Could not dispatch initial status card: {e}")
         CURRENT_STATUS_MSG = None
 
-    # 2. Execute fail-safe code cascade
-    reply = await generate_reasoning_response(user_msg)
-    
-    # 3. Update status card to 100% complete
-    if CURRENT_STATUS_MSG:
-        try:
-            full_bar = "=" * 30
-            await CURRENT_STATUS_MSG.edit_text(
-                f"Task/Project Progress\n[{full_bar}] 100%\n\nCurrent status: Complete"
-            )
-        except Exception:
-            pass
+    # 2. Execute the fail-safe cascade with a heartbeat, so a long reasoning or
+    #    render phase can never leave the card frozen at 15%.
+    heartbeat = asyncio.create_task(progress_heartbeat())
+    try:
+        reply = await generate_reasoning_response(user_msg)
+    except Exception as reasoning_err:
+        logger.error(f"Reasoning pipeline error: {reasoning_err}", exc_info=True)
+        reply = f"Reasoning pipeline error: {reasoning_err}"
+    finally:
+        heartbeat.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await heartbeat
+
+    # 3. Walk the card through the finishing stages. A dispatched render reaches
+    #    95% (mux/upload) and the Telegram send marks 100% when the MP4 lands.
+    if PROGRESS_STATE.get("video_dispatched"):
+        await update_progress_card(95, PROGRESS_MILESTONES[4][1])
+    await update_progress_card(100, PROGRESS_MILESTONES[5][1], force=True)
 
     # 4. Deliver response text payload
     if len(reply) <= 4000:
@@ -1453,8 +2124,17 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 @api.on_event("startup")
 async def startup_event():
-    global telegram_app
-    logger.info("Initializing Chintu services...")
+    global telegram_app, CURRENT_EVENT_LOOP
+    CURRENT_EVENT_LOOP = asyncio.get_running_loop()
+    logger.info(
+        f"Initializing Chintu services (role={COMPUTE_ROLE}, "
+        f"space={'on' if HF_SPACE_URL else 'off'}, jobs={'on' if HF_TOKEN else 'off'}, "
+        f"e2b={'on' if E2B_API_KEY else 'off'})..."
+    )
+    if BRAIN_BOUNDARY_VIOLATIONS:
+        logger.error(
+            f"[Compute Boundary] heavy media imports must not run on Render: {BRAIN_BOUNDARY_VIOLATIONS}"
+        )
     discover_available_models()
     if TELEGRAM_BOT_TOKEN:
         try:

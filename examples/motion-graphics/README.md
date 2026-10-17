@@ -90,14 +90,27 @@ The rules that actually bit while building it:
 `check .` on this file: **0 lint, 0 runtime, 0 motion, 0 layout issues across 9 samples, 24/24
 WCAG AA text checks**.
 
-## Rendering on Hugging Face Jobs (the 16 GB `cpu-basic` flavor)
+## Rendering on the 16 GB engine
 
-`render_html_video` submits the render to a Hugging Face **Job** whenever `HF_TOKEN` is set:
-`cpu-basic` is 2 vCPU / **16 GB RAM** / 50 GB disk at $0.01 per hour, billed per minute, so the
-20-minute timeout costs at most about $0.003. The RAM is the point — HyperFrames pins itself to one
-worker and screenshot capture below 8 GB (`totalMemMb` vs `thresholdMb: 8192` in its render log).
-This machine reports `totalMemMb: 8011` and renders solo; a Job reports 16 GB and takes the
-calibrated multi-worker path.
+Render itself never renders a frame. `render_html_video` dispatches, in order:
+
+1. **Hugging Face Docker Space** (`space/`, `cpu-basic`: 2 vCPU / **16 GB RAM** / 50 GB) over HTTP —
+   `POST /render`, poll `GET /status/<id>`, download `GET /artifact/<id>`. This is the primary path
+   whenever `HF_SPACE_URL` is set. It is asynchronous on purpose: a Space proxies one request with a
+   short gateway timeout, so a multi-minute render cannot be one blocking POST.
+2. **Hugging Face Job** on the same hardware when `HF_SPACE_URL` is unset (details below).
+3. **E2B microVM** only when forced with `render_html_video(..., backend="e2b")`.
+
+`narration="…"` is sent with the composition; the worker synthesizes it with `edge-tts` and muxes
+it as AAC over the copied H.264 stream. Configuration: `HF_SPACE_URL` and `HF_SPACE_SECRET` on
+Render, `HF_RENDER_SECRET` (same value) as a Space secret. The Space code, image and deploy steps
+are in `space/README.md`.
+
+### Fallback: Hugging Face Jobs
+
+The RAM is the point — HyperFrames pins itself to one worker and screenshot capture below 8 GB
+(`totalMemMb` vs `thresholdMb: 8192` in its render log). This machine reports `totalMemMb: 8011`
+and renders solo; the 16 GB hardware takes the calibrated multi-worker path.
 
 The job script (**`HF_RENDER_JOB_SCRIPT` in `main.py`**, the single source of truth for what the
 remote container executes) runs on `node:22-bookworm` and:
