@@ -596,15 +596,55 @@ def prepare_task_source(code: str) -> str:
     logger.warning("[E2B Guard] Detected invalid Python syntax; wrapping task for safe shell execution.")
     return _wrap_shell_as_python(code)
 
-def _find_rendered_video(sbx: Any, directory: str) -> Optional[str]:
-    """Return the sandbox path of the first ``.mp4`` in ``directory``, else None."""
+def _find_rendered_video(sbx: Any, directory: str, slug: str = "") -> Optional[str]:
+    """Return the sandbox path of the first .mp4 in directory or via recursive search; fall back to find if needed."""
+    # Try candidate paths including slug
+    candidates = []
+    if slug:
+        candidates.extend([
+            f"/home/user/videos/{slug}/renders/final_output.mp4",
+            f"/home/user/videos/{slug}/renders/video.mp4",
+            f"/home/user/renders/final_output.mp4",
+            f"/home/user/final_output.mp4",
+        ])
+    candidates.extend([
+        f"{directory.rstrip('/')}/final_output.mp4",
+        f"{directory.rstrip('/')}/video.mp4",
+        "/home/user/renders/final_output.mp4",
+        "/home/user/videos/{slug}/renders/final_output.mp4" if slug else "/home/user/videos/renders/final_output.mp4",
+        "/home/user/final_output.mp4",
+    ])
+    for c in candidates:
+        try:
+            sbx.files.read(c, format="bytes")
+            return c
+        except Exception:
+            pass
     try:
         for entry in sbx.files.list(directory):
             name = getattr(entry, "name", "") or ""
             if name.lower().endswith(".mp4"):
                 return f"{directory.rstrip('/')}/{name}"
     except Exception:
-        return None
+        pass
+    try:
+        res = sbx.commands.run("find /home/user -name \"final_output.mp4\" -o -name \"*.mp4\" 2>&1 | head -15")
+        out = getattr(res, "stdout", "") or ""
+        for line in out.splitlines():
+            p = line.strip()
+            if p and p.startswith("/home/user/") and ".mp4" in p:
+                try:
+                    sbx.files.read(p, format="bytes")
+                    return p
+                except Exception:
+                    continue
+    except Exception:
+        pass
+    try:
+        vlist = sbx.files.list("/home/user/videos")
+        logger.error(f"[E2B Debug] /home/user/videos: {[getattr(e,'name','') for e in vlist]}")
+    except Exception as e:
+        logger.error(f"[E2B Debug] could not list /home/user/videos: {e}")
     return None
 
 def _find_mp4_in_sandbox(sbx: Any, slug: str = "") -> Optional[str]:
@@ -1627,6 +1667,43 @@ except Exception as e:
         return f"Self-Healing Diagnostic Complete:\nSandbox verify: {sb_result}"
     except Exception as e:
         return f"Self-healing diagnostic failed: {str(e)}"
+class SelfRepairEngine:
+    def __init__(self, max_iters: int = 3):
+        self.max_iters = max_iters
+
+    def run(self, error: str, tb: str, func_name: str, failing_source: str = "", args: Any = None) -> str:
+        prompt = f"""Execution failed in {func_name}.
+Error: {error}
+Traceback:
+{tb}
+Failing source context:
+{failing_source}
+Analyze the root cause, modify the code to prevent this failure mode, and return the candidate patch."""
+        # Stub: for now return diagnostic info
+        return f"Self-repair diagnostic (stub) for {func_name}: {error}"
+
+
+
+def with_self_repair(func):
+    import functools, traceback
+    @functools.wraps(func)
+    def wrapper(*args, **kwargs):
+        try:
+            return func(*args, **kwargs)
+        except Exception as e:
+            tb = traceback.format_exc()
+            try:
+                return _run_self_repair(str(e), tb, func_name=func.__name__, failing_source=str(func.__code__.co_names)[:200])
+            except Exception:
+                raise
+    return wrapper
+
+
+
+def _run_self_repair(error: str, traceback_str: str, failed_func_source: str = "", func_name: str = "unknown", args: Any = None) -> str:
+    engine = SelfRepairEngine()
+    return engine.run(error, traceback_str, func_name, failing_source=failed_func_source, args=args)
+
 
 def create_golden_state_backup(tag: str = "stable_snapshot") -> str:
     current_code = github_read_file(DEFAULT_REPO, "main.py")
