@@ -728,10 +728,13 @@ def _synthesize_narration_audio(sbx: Any, project_dir: str, narration: str) -> s
     audio_path = f"{project_dir}/narration.mp3"
     try:
         sbx.files.write(narration_txt, text[:3000])
+        # edge-tts CLI takes -f/--file (mutually exclusive with -t/--text) —
+        # a non-existent flag like --text-file makes argparse exit non-zero
+        # and was the root cause of silently narration-less deliveries.
         tts_res = sbx.commands.run(
             _e2b_cmd_with_prep(
                 f"cd {project_dir} && python3 -m edge_tts --voice {NARRATION_VOICE} "
-                f"--text-file narration.txt --write-media narration.mp3"
+                f"--file narration.txt --write-media narration.mp3"
             ),
             timeout=0,
         )
@@ -810,26 +813,48 @@ def _telegram_send_video(video_bytes: bytes, file_name: str, caption: str = "") 
         logger.warning(f"Video delivery warning: {vid_err}")
     return False
 
-def _deliver_rendered_video(sbx: Any, extra_dirs: Any = (), preferred_path: Optional[str] = None) -> bool:
-    """Upload the rendered MP4 straight to Telegram.
+def _deliver_rendered_video(
+    sbx: Any, extra_dirs: Any = (), require_audio: bool = False
+) -> str:
+    """Upload the rendered MP4 straight to Telegram. `final_output.mp4` ALWAYS
+    wins when it exists; a narrated render is never allowed to fall back to the
+    raw, silent `video.mp4` capture.
 
-    `preferred_path` (e.g. the muxed, ffprobe-verified final_output.mp4) is
-    attempted first; the remaining scan directories follow as fallbacks.
+    Returns a status string:
+      'delivered'      an MP4 shipped to Telegram (never under the name video.mp4)
+      'no-audio'       require_audio=True but no verified final_output.mp4 exists
+                       — NOTHING was uploaded, so the failure is loud, not silent
+      'post-failed'    final_output.mp4 exists but Telegram refused every attempt
+      'no-video'       no MP4 anywhere in the sandbox
+      'unbound'        no chat id / bot token
     """
     if not (CURRENT_CHAT_ID and TELEGRAM_BOT_TOKEN):
-        return False
-    scan_dirs = [preferred_path] if preferred_path else []
-    scan_dirs += list(extra_dirs) + list(SANDBOX_VIDEO_SCAN_DIRS)
+        return "unbound"
+    scan_dirs = list(
+        dict.fromkeys(
+            d.rstrip("/") for d in list(extra_dirs) + list(SANDBOX_VIDEO_SCAN_DIRS)
+        )
+    )
+    # 1) final_output.mp4 (the ffprobe-verified, narrated artifact) first,
+    #    wherever it lives, under its own name so Telegram never shows video.mp4.
     for scan_dir in scan_dirs:
-        if preferred_path and scan_dir == preferred_path:
-            try:
-                video_bytes = sbx.files.read(preferred_path, format="bytes")
-            except Exception as vid_err:
-                logger.warning(f"Video delivery warning: {vid_err}")
-                continue
-            if _telegram_send_video(video_bytes, preferred_path.rsplit("/", 1)[-1]):
-                return True
+        final_path = f"{scan_dir}/final_output.mp4"
+        try:
+            final_bytes = sbx.files.read(final_path, format="bytes")
+        except Exception:
             continue
+        if _telegram_send_video(final_bytes, "final_output.mp4"):
+            return "delivered"
+        return "post-failed"
+    # 2) A narrated render must FAIL LOUDLY instead of shipping silent frames.
+    if require_audio:
+        logger.error(
+            "[Audio mux] narration was required but no final_output.mp4 exists — "
+            "refusing to deliver the silent capture."
+        )
+        return "no-audio"
+    # 3) Un-narrated captures still ship, but never under the name video.mp4.
+    for scan_dir in scan_dirs:
         video_path = _find_rendered_video(sbx, scan_dir)
         if not video_path:
             continue
@@ -838,9 +863,12 @@ def _deliver_rendered_video(sbx: Any, extra_dirs: Any = (), preferred_path: Opti
         except Exception as vid_err:
             logger.warning(f"Video delivery warning: {vid_err}")
             continue
-        if _telegram_send_video(video_bytes, video_path.rsplit("/", 1)[-1]):
-            return True
-    return False
+        display_name = video_path.rsplit("/", 1)[-1]
+        if display_name.lower() == "video.mp4":
+            display_name = "final_output.mp4"
+        if _telegram_send_video(video_bytes, display_name):
+            return "delivered"
+    return "no-video"
 
 def _provision_render_toolchain(sbx: Any, want_browser: bool = False) -> str:
     """Install the ffmpeg/frame stack, plus Node + Chrome when HyperFrames must render."""
@@ -1005,23 +1033,39 @@ def render_html_video(
         # HARDENED AUDIO MUX: regardless of which path produced the frames, the
         # narration is synthesized in-sandbox, muxed with an explicit stream map
         # (AAC 192k @ 44.1 kHz, +faststart) and the result is ffprobe-verified
-        # to carry an active audio stream BEFORE any Telegram delivery. A failed
-        # mux never aborts the turn — the silent render is delivered instead.
+        # to carry an active audio stream BEFORE any Telegram delivery. On
+        # failure the mux is retried once and, if it still fails, delivery
+        # fails LOUDLY: the silent capture is never shipped as if narrated.
         audio_note = ""
-        if mp4_path and (narration or "").strip():
+        wants_audio = bool((narration or "").strip())
+        if mp4_path and wants_audio:
             audio_path = _synthesize_narration_audio(sbx, project_dir, narration)
-            if audio_path:
-                muxed_path = _mux_narration_and_verify(sbx, mp4_path, audio_path)
-                if muxed_path:
-                    mp4_path = muxed_path
-                    audio_note = f"audio: narration muxed as AAC (192k/44.1kHz, +faststart) into {muxed_path}; ffprobe-verified active audio stream."
-                else:
-                    audio_note = "audio: ffmpeg mux or ffprobe audio verification failed — delivering the silent render."
+            muxed_path = (
+                _mux_narration_and_verify(sbx, mp4_path, audio_path) if audio_path else None
+            )
+            if not muxed_path:
+                # RE-MUX once: transient TTS/ffmpeg hiccups must not strand the
+                # render as silent frames.
+                logger.warning("[Audio mux] first attempt failed — re-muxing once.")
+                audio_path = audio_path or _synthesize_narration_audio(
+                    sbx, project_dir, narration
+                )
+                muxed_path = (
+                    _mux_narration_and_verify(sbx, mp4_path, audio_path)
+                    if audio_path
+                    else None
+                )
+            if muxed_path:
+                mp4_path = muxed_path
+                audio_note = f"audio: narration muxed as AAC (192k/44.1kHz, +faststart) into {muxed_path}; ffprobe-verified active audio stream."
             else:
-                audio_note = "audio: edge-tts synthesis failed — delivering the silent render."
+                audio_note = (
+                    "audio: edge-tts synthesis or ffmpeg mux/ffprobe verification "
+                    "failed after a retry — the silent capture will NOT be delivered."
+                )
             logger.info(f"[Audio mux] {audio_note}")
-        delivered = _deliver_rendered_video(
-            sbx, extra_dirs=(f"{project_dir}/renders",), preferred_path=mp4_path
+        deliver_status = _deliver_rendered_video(
+            sbx, extra_dirs=(f"{project_dir}/renders",), require_audio=wants_audio
         )
         report = (
             f"E2B HyperFrames render :: {slug}\n"
@@ -1035,13 +1079,25 @@ def render_html_video(
             report += f"fallback: {fallback_note}\n"
         if audio_note:
             report += f"{audio_note}\n"
-        if mp4_path:
-            report += f"[SUCCESS] MP4 written to {mp4_path}"
+        if deliver_status == "delivered":
             report += (
-                " and delivered to Telegram."
-                if delivered
-                else " (no Telegram chat bound; retry after binding CURRENT_CHAT_ID)."
+                f"[SUCCESS] MP4 written to {mp4_path} and delivered to Telegram "
+                "(uploaded as final_output.mp4; the player never shows 'video.mp4')."
             )
+        elif deliver_status == "no-audio":
+            report += (
+                "[FAILED-NO-AUDIO] narration was requested but no ffprobe-verified "
+                "final_output.mp4 could be produced — the silent capture "
+                f"({mp4_path or 'video.mp4'}) was NOT uploaded. Fix the cause above "
+                "(edge-tts / ffmpeg / ffprobe) and re-run the render."
+            )
+        elif deliver_status == "post-failed":
+            report += (
+                "[FAILED] final_output.mp4 exists but Telegram refused the upload; "
+                "see the delivery log above."
+            )
+        elif deliver_status == "unbound":
+            report += f"[UNDELIVERED] MP4 ready at {mp4_path} (no Telegram chat bound; retry after binding CURRENT_CHAT_ID)."
         else:
             report += "[FAILED] No .mp4 produced even with the fallback compiler; read the outputs above."
         return report
@@ -1354,7 +1410,7 @@ def execute_in_cloud_microvm(code: str) -> str:
         found_video = _deliver_rendered_video(sbx)
 
         out_msg = f"STDOUT:\n{exec_res.stdout}\nSTDERR:\n{exec_res.stderr}"
-        if found_video:
+        if found_video == "delivered":
             out_msg += "\n\n[SUCCESS] Rendered .mp4 file delivered directly to Telegram!"
         return out_msg
     except Exception as e:
