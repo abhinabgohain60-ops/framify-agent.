@@ -75,8 +75,16 @@ before anything is uploaded. Delivery rules:
    `ALL_TOOLS_LIST` by signature introspection:
    `openrouter/free` → `nvidia/nemotron-3-super-120b-a12b:free` →
    `cohere/north-mini-code:free` (all verified against the live OpenRouter catalog
-   so a rate-limited cascade never hits a 404), 600 s per request, up to 6 tool rounds.
+   so a rate-limited cascade never hits a 404), 600 s per request, up to 12 tool rounds.
+   Every external session carries `FALLBACK_TOOL_ROUND_DIRECTIVE` as a second system
+   message: *CRITICAL: Do not dump skill markdown or READMEs to the user. Inspect
+   skills concisely, generate the HTML/CSS/GSAP composition, and call
+   `render_html_video` immediately to produce and deliver the video.*
 3. Freebuff (OpenAI-compatible) as the last resort.
+
+If a provider still exhausts the 12-round ceiling, it returns the
+`stopped after N tool rounds` notice, logs the ceiling as an **error** with the last
+tool output, and records `PROGRESS_STATE["turn_failed"]` for the turn.
 
 `PROVIDER_TELEMETRY` records the provider/model that actually answered and the number
 of failovers; `/health` exposes it.
@@ -99,6 +107,11 @@ emitted by the phase that reaches them:
 `progress_heartbeat()` advances the bar inside the current phase every 15 s, so a long
 reasoning or render call never leaves the card frozen. Every milestone is also appended
 to `PROGRESS_STATE["history"]` synchronously, so a phase cannot be lost between loop ticks.
+
+The forced 100% "Complete! Video delivered." card is reserved for turns that actually
+produced a video. A turn that ends with `PROGRESS_STATE["turn_failed"]` set (tool-round
+ceiling, reasoning pipeline error) logs the error and finishes the card with
+`Stopped — no video produced (...)` at its held percentage instead.
 
 ## 4. Environment
 

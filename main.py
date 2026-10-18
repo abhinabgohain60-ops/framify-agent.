@@ -58,7 +58,7 @@ OPENROUTER_MODELS: List[str] = [
     "cohere/north-mini-code:free",
 ]
 EXTERNAL_REQUEST_TIMEOUT = 600
-EXTERNAL_MAX_TOOL_ROUNDS = 6
+EXTERNAL_MAX_TOOL_ROUNDS = 12
 FREEBUFF_API_KEY = os.environ.get("FREEBUFF_API_KEY", "")
 FREEBUFF_BASE_URL = os.environ.get("FREEBUFF_BASE_URL", "https://api.freebuff.com/v1")
 DEFAULT_REPO = os.environ.get("DEFAULT_REPO", "abhinabgohain60-ops/framify-agent.")
@@ -461,6 +461,7 @@ def reset_progress() -> None:
         stage="",
         started=time.monotonic(),
         video_dispatched=False,
+        turn_failed="",
         history=[],
     )
 
@@ -1835,6 +1836,17 @@ def execute_tool_call(name: str, arguments: Any) -> str:
         return f"Error: {name} failed: {tool_err}"
 
 
+# Injected as an extra system message into every external tool-calling session.
+# The OpenRouter fallback once burned its whole round budget paging skill
+# markdown (`load_skill` READMEs) back to the user instead of dispatching the
+# render, so the ceiling hit with no final answer and no video.
+FALLBACK_TOOL_ROUND_DIRECTIVE = (
+    "CRITICAL: Do not dump skill markdown or READMEs to the user. "
+    "Inspect skills concisely, generate the HTML/CSS/GSAP composition, and call "
+    "`render_html_video` immediately to produce and deliver the video."
+)
+
+
 def _chat_with_tools(
     base_url: str,
     api_key: str,
@@ -1849,6 +1861,7 @@ def _chat_with_tools(
     tools = build_tool_schemas()
     messages: List[Dict[str, Any]] = [
         {"role": "system", "content": SYSTEM_INSTRUCTION},
+        {"role": "system", "content": FALLBACK_TOOL_ROUND_DIRECTIVE},
         {"role": "user", "content": message},
     ]
     last_tool_output = ""
@@ -1895,6 +1908,19 @@ def _chat_with_tools(
         if content:
             return content
         raise RuntimeError(f"{provider} returned an empty completion.")
+    # Tool-round ceiling: the model kept calling tools (skill docs, READMEs)
+    # and never produced a final answer — and with it, no render and no video.
+    # Log it LOUDLY and flag the turn so the progress card can never be padded
+    # to a forced 100% "Complete! Video delivered." at the end of the turn.
+    logger.error(
+        f"[External Fallback] TOOL-ROUND CEILING: {provider}/{model} exhausted "
+        f"{EXTERNAL_MAX_TOOL_ROUNDS} tool rounds without a final answer "
+        f"(last tool output: {str(last_tool_output)[:300]!r}). No video was produced."
+    )
+    PROGRESS_STATE["turn_failed"] = (
+        f"tool-round ceiling after {EXTERNAL_MAX_TOOL_ROUNDS} rounds "
+        f"({provider}/{model}); no final answer, no video"
+    )
     return (
         f"{provider} stopped after {EXTERNAL_MAX_TOOL_ROUNDS} tool rounds without a final "
         f"answer. Last tool output:\n{last_tool_output[:2000]}"
@@ -2103,6 +2129,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reply = await generate_reasoning_response(user_msg)
     except Exception as reasoning_err:
         logger.error(f"Reasoning pipeline error: {reasoning_err}", exc_info=True)
+        PROGRESS_STATE["turn_failed"] = f"reasoning pipeline error: {reasoning_err}"
         reply = f"Reasoning pipeline error: {reasoning_err}"
     finally:
         heartbeat.cancel()
@@ -2111,9 +2138,23 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # 3. Walk the card through the finishing stages. A dispatched render reaches
     #    95% (mux/upload) and the Telegram send marks 100% when the MP4 lands.
+    #    A turn that produced NO video (tool-round ceiling, reasoning error) must
+    #    never be padded to the forced 100% "Complete! Video delivered." card.
     if PROGRESS_STATE.get("video_dispatched"):
         await update_progress_card(95, PROGRESS_MILESTONES[4][1])
-    await update_progress_card(100, PROGRESS_MILESTONES[5][1], force=True)
+    turn_failed = str(PROGRESS_STATE.get("turn_failed") or "").strip()
+    if turn_failed:
+        held_percent = int(PROGRESS_STATE.get("percent") or 0)
+        logger.error(f"[Turn] ending with NO video produced: {turn_failed}")
+        await update_progress_card(
+            held_percent,
+            f"Stopped — no video produced ({turn_failed[:160]})",
+            force=True,
+        )
+    elif PROGRESS_STATE.get("video_dispatched"):
+        await update_progress_card(100, PROGRESS_MILESTONES[5][1], force=True)
+    else:
+        await update_progress_card(100, "Task complete.", force=True)
 
     # 4. Deliver response text payload
     if len(reply) <= 4000:
