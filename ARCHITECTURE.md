@@ -48,6 +48,16 @@ typography, fade/slide motion and eased timing, and streams raw frames into
 FFmpeg (optional edge-tts narration muxed as AAC). The turn still ends with a
 delivered MP4 instead of a `CommandExitException`.
 
+**Hardened audio mux (no silent deliveries):** on BOTH render paths, when narration
+is requested it is synthesized in-sandbox with edge-tts and muxed with an explicit
+stream map (`-map 0:v:0 -map 1:a:0`, AAC 192k @ 44.1 kHz, `-shortest`,
+`-movflags +faststart`) into `renders/final_output.mp4`. `ffprobe -show_streams
+-select_streams a` must confirm an active audio stream — only then is the muxed
+final delivered; a failed mux never aborts the turn, the silent render ships
+instead. `/sendVideo` posts with the explicit `video/mp4` MIME type and
+`supports_streaming=True` so Telegram recognizes the AAC track and shows the
+unmute button.
+
 ## 2. Model ladder
 
 1. Gemini cascade over the pinned pool (`gemini-2.0-flash-exp`, `gemini-1.5-flash`,

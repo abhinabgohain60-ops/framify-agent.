@@ -684,6 +684,106 @@ def _e2b_cmd_with_prep(command: str) -> str:
     )
 
 
+NARRATION_VOICE = os.environ.get("NARRATION_VOICE", "en-US-AriaNeural")
+
+
+def _e2b_audio_mux_cmd(video_path: str, audio_path: str, final_path: str) -> str:
+    """Hardened final mux: explicit stream map, AAC 192k @ 44.1 kHz, web faststart.
+
+    Both inputs are named explicitly (-map 0:v:0 / -map 1:a:0) so the output
+    container always carries the narration track as ITS audio stream (no silent
+    MP4s, no accidental second stream), and -movflags +faststart relocates the
+    moov atom so Telegram/exoplayback can start instantly.
+    """
+    return (
+        "ffmpeg -y "
+        f"-i {video_path} -i {audio_path} "
+        "-map 0:v:0 -map 1:a:0 "
+        "-c:v copy -c:a aac -b:a 192k -ar 44100 "
+        "-shortest -movflags +faststart "
+        f"{final_path}"
+    )
+
+
+def _e2b_audio_verify_cmd(final_path: str) -> str:
+    """ffprobe check that the final MP4 actually carries an active audio stream."""
+    return f"ffprobe -i {final_path} -show_streams -select_streams a"
+
+
+def _audio_stream_verified(output: str) -> bool:
+    """True when ffprobe's -select_streams a dump lists a real audio codec."""
+    return "codec_type=audio" in (output or "") and "codec_name=" in (output or "")
+
+
+def _synthesize_narration_audio(sbx: Any, project_dir: str, narration: str) -> str:
+    """Synthesize the voice-over inside the sandbox with edge-tts.
+
+    Returns the sandbox path of narration.mp3, or '' when synthesis failed so
+    the render still delivers (silent) instead of aborting the turn.
+    """
+    text = (narration or "").strip()
+    if not text:
+        return ""
+    narration_txt = f"{project_dir}/narration.txt"
+    audio_path = f"{project_dir}/narration.mp3"
+    try:
+        sbx.files.write(narration_txt, text[:3000])
+        tts_res = sbx.commands.run(
+            _e2b_cmd_with_prep(
+                f"cd {project_dir} && python3 -m edge_tts --voice {NARRATION_VOICE} "
+                f"--text-file narration.txt --write-media narration.mp3"
+            ),
+            timeout=0,
+        )
+        if getattr(tts_res, "exit_code", 1) not in (0, None):
+            logger.warning(
+                "[Audio mux] edge-tts synthesis failed (exit=%s); delivering without narration.",
+                getattr(tts_res, "exit_code", "unknown"),
+            )
+            return ""
+        return audio_path
+    except Exception as tts_err:
+        logger.warning(f"[Audio mux] narration synthesis error: {tts_err}")
+        return ""
+
+
+def _mux_narration_and_verify(sbx: Any, video_path: str, audio_path: str) -> Optional[str]:
+    """Mux the narration into the rendered MP4 and ffprobe-verify the audio.
+
+    Runs INSIDE the sandbox. On success returns the path of
+    renders/final_output.mp4 with an ffprobe-confirmed active audio stream;
+    on any failure returns None so the caller still delivers the silent render
+    instead of throwing a CommandExitException at Telegram.
+    """
+    render_dir = video_path.rsplit("/", 1)[0]
+    final_path = f"{render_dir}/final_output.mp4"
+    try:
+        mux_res = sbx.commands.run(
+            _e2b_cmd_with_prep(_e2b_audio_mux_cmd(video_path, audio_path, final_path)),
+            timeout=0,
+        )
+        if getattr(mux_res, "exit_code", 1) not in (0, None):
+            logger.warning(
+                "[Audio mux] ffmpeg mux failed (exit=%s); keeping the silent render.",
+                getattr(mux_res, "exit_code", "unknown"),
+            )
+            return None
+        probe_res = sbx.commands.run(
+            _e2b_cmd_with_prep(_e2b_audio_verify_cmd(final_path)), timeout=0
+        )
+        probe_text = (getattr(probe_res, "stdout", "") or "") + (
+            getattr(probe_res, "stderr", "") or ""
+        )
+        if not _audio_stream_verified(probe_text):
+            logger.warning("[Audio mux] ffprobe found NO active audio stream in the final MP4.")
+            return None
+        logger.info(f"[Audio mux] narration track verified in {final_path} (AAC 192k/44.1kHz)")
+        return final_path
+    except Exception as mux_err:
+        logger.warning(f"[Audio mux] mux/verify error: {mux_err}")
+        return None
+
+
 def _telegram_send_video(video_bytes: bytes, file_name: str, caption: str = "") -> bool:
     """Post MP4 bytes to the bound Telegram chat. Returns True only on HTTP 200."""
     if not (CURRENT_CHAT_ID and TELEGRAM_BOT_TOKEN):
@@ -691,8 +791,15 @@ def _telegram_send_video(video_bytes: bytes, file_name: str, caption: str = "") 
     emit_progress(95, PROGRESS_MILESTONES[4][1], video=True)
     try:
         send_url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendVideo"
+        # The explicit video/mp4 MIME type is what Telegram checks to enable the
+        # unmute button for the AAC track, and supports_streaming=True lets
+        # Telegram stream progressive MP4s inline (no download-first banner).
         upload_files = {"video": (file_name, video_bytes, "video/mp4")}
-        data = {"chat_id": CURRENT_CHAT_ID, "caption": caption or f"🎬 Chintu Video Render: {file_name}"}
+        data = {
+            "chat_id": CURRENT_CHAT_ID,
+            "caption": caption or f"🎬 Chintu Video Render: {file_name}",
+            "supports_streaming": "true",
+        }
         res = requests.post(send_url, data=data, files=upload_files, timeout=120)
         if res.status_code == 200:
             logger.info(f"Directly uploaded {file_name} to Telegram via HTTP API!")
@@ -703,11 +810,26 @@ def _telegram_send_video(video_bytes: bytes, file_name: str, caption: str = "") 
         logger.warning(f"Video delivery warning: {vid_err}")
     return False
 
-def _deliver_rendered_video(sbx: Any, extra_dirs: Any = ()) -> bool:
-    """Upload the first rendered .mp4 found in the sandbox straight to Telegram."""
+def _deliver_rendered_video(sbx: Any, extra_dirs: Any = (), preferred_path: Optional[str] = None) -> bool:
+    """Upload the rendered MP4 straight to Telegram.
+
+    `preferred_path` (e.g. the muxed, ffprobe-verified final_output.mp4) is
+    attempted first; the remaining scan directories follow as fallbacks.
+    """
     if not (CURRENT_CHAT_ID and TELEGRAM_BOT_TOKEN):
         return False
-    for scan_dir in tuple(extra_dirs) + SANDBOX_VIDEO_SCAN_DIRS:
+    scan_dirs = [preferred_path] if preferred_path else []
+    scan_dirs += list(extra_dirs) + list(SANDBOX_VIDEO_SCAN_DIRS)
+    for scan_dir in scan_dirs:
+        if preferred_path and scan_dir == preferred_path:
+            try:
+                video_bytes = sbx.files.read(preferred_path, format="bytes")
+            except Exception as vid_err:
+                logger.warning(f"Video delivery warning: {vid_err}")
+                continue
+            if _telegram_send_video(video_bytes, preferred_path.rsplit("/", 1)[-1]):
+                return True
+            continue
         video_path = _find_rendered_video(sbx, scan_dir)
         if not video_path:
             continue
@@ -880,7 +1002,27 @@ def render_html_video(
             logger.warning(f"[Render Fallback] {fallback_note}")
             fallback_note += "\n" + _run_pillow_fallback(sbx, project_dir, slug, int(fps), narration)
             mp4_path = _find_rendered_video(sbx, f"{project_dir}/renders")
-        delivered = _deliver_rendered_video(sbx, extra_dirs=(f"{project_dir}/renders",))
+        # HARDENED AUDIO MUX: regardless of which path produced the frames, the
+        # narration is synthesized in-sandbox, muxed with an explicit stream map
+        # (AAC 192k @ 44.1 kHz, +faststart) and the result is ffprobe-verified
+        # to carry an active audio stream BEFORE any Telegram delivery. A failed
+        # mux never aborts the turn — the silent render is delivered instead.
+        audio_note = ""
+        if mp4_path and (narration or "").strip():
+            audio_path = _synthesize_narration_audio(sbx, project_dir, narration)
+            if audio_path:
+                muxed_path = _mux_narration_and_verify(sbx, mp4_path, audio_path)
+                if muxed_path:
+                    mp4_path = muxed_path
+                    audio_note = f"audio: narration muxed as AAC (192k/44.1kHz, +faststart) into {muxed_path}; ffprobe-verified active audio stream."
+                else:
+                    audio_note = "audio: ffmpeg mux or ffprobe audio verification failed — delivering the silent render."
+            else:
+                audio_note = "audio: edge-tts synthesis failed — delivering the silent render."
+            logger.info(f"[Audio mux] {audio_note}")
+        delivered = _deliver_rendered_video(
+            sbx, extra_dirs=(f"{project_dir}/renders",), preferred_path=mp4_path
+        )
         report = (
             f"E2B HyperFrames render :: {slug}\n"
             f"backend: E2B microVM (killed in finally; Hugging Face retired)\n"
@@ -891,6 +1033,8 @@ def render_html_video(
         )
         if fallback_note:
             report += f"fallback: {fallback_note}\n"
+        if audio_note:
+            report += f"{audio_note}\n"
         if mp4_path:
             report += f"[SUCCESS] MP4 written to {mp4_path}"
             report += (
@@ -1141,11 +1285,33 @@ def main():
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
         )
         if tts.returncode == 0 and os.path.exists(media):
+            # HARDENED MUX: explicit stream map so the narration becomes THE
+            # audio stream (no silent MP4s), AAC 192k @ 44.1 kHz, web faststart.
+            # ffprobe must then confirm an active audio stream before the MP4
+            # is accepted for delivery; otherwise keep the silent render.
             mux = subprocess.run(
-                ["ffmpeg", "-y", "-i", silent_path, "-i", media, "-c:v", "copy", "-c:a", "aac", "-b:a", "160k", "-shortest", final_path],
+                [
+                    "ffmpeg", "-y",
+                    "-i", silent_path, "-i", media,
+                    "-map", "0:v:0", "-map", "1:a:0",
+                    "-c:v", "copy",
+                    "-c:a", "aac", "-b:a", "192k", "-ar", "44100",
+                    "-shortest", "-movflags", "+faststart",
+                    final_path,
+                ],
                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
             )
-            if mux.returncode != 0:
+            audio_ok = False
+            if mux.returncode == 0 and os.path.exists(final_path):
+                probe = subprocess.run(
+                    ["ffprobe", "-i", final_path, "-show_streams", "-select_streams", "a"],
+                    stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                )
+                audio_ok = (
+                    b"codec_type=audio" in (probe.stdout or b"")
+                    and b"codec_name=" in (probe.stdout or b"")
+                )
+            if not audio_ok:
                 final_path = silent_path
         else:
             final_path = silent_path
@@ -1495,7 +1661,7 @@ VIDEO STANDARDS (non-negotiable for every render)
 - Typography carries the message: one or two emphasis words per scene, deliberate weights, and letter-spacing that snaps to whole pixels rather than tweening.
 - Motion uses real easing curves (power2-4, back, expo, sine) with entrances and exits timed so transitions never overlap. One motion motif per scene. Never hand-animate a CSS transform on a node GSAP is tweening.
 - Build ambient depth: a soft radial or gradient glow behind the subject, a subtle vignette, and a gradient sweep or grain. Never a flat black frame.
-- Sound: narration is synthesized with edge-tts and muxed by the worker; pair impacts with a sub-bass hit and keep voice-over timed to the scene cuts.
+- Sound: narration is synthesized with edge-tts inside the microVM and muxed with an explicit stream map (-map 0:v:0 -map 1:a:0) as AAC 192k @ 44.1 kHz with +faststart; the final MP4 is ffprobe-verified to carry an active audio stream before /sendVideo posts it with supports_streaming=True so Telegram shows the unmute button. Keep voice-over timed to the scene cuts and pair impacts with a sub-bass hit.
 
 TRUTHFUL REPORTING
 Report only what the tools returned: sandbox paths, ffprobe frame counts, byte sizes, delivery status. If a step did not run, say which step and why. Never invent a file path or a result."""

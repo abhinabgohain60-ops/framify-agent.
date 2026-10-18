@@ -109,7 +109,13 @@ Inside the sandbox, one call does:
    Node 22 + Chrome's runtime libs + `hyperframes browser ensure`).
 3. **lint → `render . --skill=motion-graphics -f <fps> -q <quality>`** with the real HyperFrames
    CLI, then the MP4 is read back and delivered to Telegram.
-4. **Automatic fallback** — if the browser path fails (e.g. disk exhaustion), a Pillow + FFmpeg
+4. **Audio mux + verify** — `narration="…"` is synthesized in-sandbox with edge-tts and muxed
+   with an explicit stream map (`-map 0:v:0 -map 1:a:0`, AAC 192k @ 44.1 kHz, `-movflags
+   +faststart`) into `renders/final_output.mp4`; `ffprobe -show_streams -select_streams a` must
+   confirm an active audio stream before delivery (Telegram receives `video/mp4` with
+   `supports_streaming=True` so the unmute button appears). A failed mux delivers the silent
+   render instead of failing the turn.
+5. **Automatic fallback** — if the browser path fails (e.g. disk exhaustion), a Pillow + FFmpeg
    frame compiler (`_PILLOW_FALLBACK_TEMPLATE`) is written into the sandbox and executed there:
    it parses the composition's timed scenes and draws 1080x1920 frames with safe-zone
    typography, fade/slide motion and eased timing, with edge-tts narration muxed as AAC.
