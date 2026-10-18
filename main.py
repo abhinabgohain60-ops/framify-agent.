@@ -607,6 +607,61 @@ def _find_rendered_video(sbx: Any, directory: str) -> Optional[str]:
         return None
     return None
 
+def _find_mp4_in_sandbox(sbx: Any, slug: str = "") -> Optional[str]:
+    """Search recursively for MP4s in /home/user; return first final_output.mp4 or any .mp4 found."""
+    try:
+        # Prefer common slug paths first
+        candidates = []
+        if slug:
+            candidates.extend([
+                f"/home/user/videos/{slug}/renders/final_output.mp4",
+                f"/home/user/videos/{slug}/renders/video.mp4",
+                f"/home/user/videos/{slug}/final_output.mp4",
+                f"/home/user/videos/{slug}/video.mp4",
+            ])
+        candidates.extend([
+            "/home/user/final_output.mp4",
+            "/home/user/output/final_output.mp4",
+            "/home/user/videos/final_output.mp4",
+            "/home/user/renders/final_output.mp4",
+        ])
+        for c in candidates:
+            try:
+                sbx.files.read(c, format="bytes")
+                return c
+            except Exception:
+                continue
+        # Fallback: find in sandbox
+        res = sbx.commands.run("find /home/user -name 'final_output.mp4' -not -path '*/proc/*' 2>&1 | head -5")
+        out = getattr(res, "stdout", "") or ""
+        for line in out.splitlines():
+            p = line.strip()
+            if p and p.startswith("/home/user/"):
+                try:
+                    sbx.files.read(p, format="bytes")
+                    return p
+                except Exception:
+                    continue
+        res = sbx.commands.run("find /home/user -name '*.mp4' -not -path '*/proc/*' 2>&1 | head -5")
+        out = getattr(res, "stdout", "") or ""
+        for line in out.splitlines():
+            p = line.strip()
+            if p and p.startswith("/home/user/"):
+                try:
+                    sbx.files.read(p, format="bytes")
+                    return p
+                except Exception:
+                    continue
+        # Debug: list videos dir
+        try:
+            vlist = sbx.files.list("/home/user/videos")
+            logger.error(f"[E2B Debug] /home/user/videos: {[getattr(e,'name','') for e in vlist]}")
+        except Exception as e:
+            logger.error(f"[E2B Debug] could not list /home/user/videos: {e}")
+    except Exception as e:
+        logger.error(f"[E2B MP4 search] error: {e}")
+    return None
+
 SANDBOX_TIMEOUT_SECONDS = int(os.environ.get("E2B_SANDBOX_TIMEOUT", "900"))
 HYPERFRAMES_VERSION = os.environ.get("HYPERFRAMES_VERSION", "0.8.160")
 HYPERFRAMES_SKILL = os.environ.get("HYPERFRAMES_SKILL", "motion-graphics")
@@ -827,7 +882,7 @@ def _telegram_send_video(video_bytes: bytes, file_name: str, caption: str = "") 
     return False
 
 def _deliver_rendered_video(
-    sbx: Any, extra_dirs: Any = (), require_audio: bool = False
+    sbx: Any, extra_dirs: Any = (), require_audio: bool = False, slug: str = ""
 ) -> str:
     """Upload the rendered MP4 straight to Telegram. `final_output.mp4` ALWAYS
     wins when it exists; a narrated render is never allowed to fall back to the
@@ -848,8 +903,25 @@ def _deliver_rendered_video(
             d.rstrip("/") for d in list(extra_dirs) + list(SANDBOX_VIDEO_SCAN_DIRS)
         )
     )
+    if slug:
+        scan_dirs.append(f"/home/user/videos/{slug}/renders")
+        scan_dirs.append(f"/home/user/videos/{slug}")
+    scan_dirs = list(dict.fromkeys(scan_dirs))
+    if slug:
+        scan_dirs.append(f"/home/user/videos/{slug}/renders")
+        scan_dirs.append(f"/home/user/videos/{slug}")
+    scan_dirs = list(dict.fromkeys(scan_dirs))
     # 1) final_output.mp4 (the ffprobe-verified, narrated artifact) first,
     #    wherever it lives, under its own name so Telegram never shows video.mp4.
+    found_final = _find_mp4_in_sandbox(sbx, slug=slug)
+    if found_final and "final_output.mp4" in found_final:
+        try:
+            final_bytes = sbx.files.read(found_final, format="bytes")
+            if _telegram_send_video(final_bytes, "final_output.mp4"):
+                return "delivered"
+            return "post-failed"
+        except Exception:
+            pass
     for scan_dir in scan_dirs:
         final_path = f"{scan_dir}/final_output.mp4"
         try:
@@ -865,8 +937,24 @@ def _deliver_rendered_video(
             "[Audio mux] narration was required but no final_output.mp4 exists — "
             "refusing to deliver the silent capture."
         )
+        try:
+            vlist = sbx.files.list("/home/user/videos")
+            logger.error(f"[E2B Debug] /home/user/videos contents: {[getattr(e,'name','') for e in vlist]}")
+        except Exception as e:
+            logger.error(f"[E2B Debug] could not list /home/user/videos: {e}")
         return "no-audio"
     # 3) Un-narrated captures still ship, but never under the name video.mp4.
+    found_any = _find_mp4_in_sandbox(sbx, slug=slug)
+    if found_any:
+        try:
+            video_bytes = sbx.files.read(found_any, format="bytes")
+            display_name = found_any.rsplit("/", 1)[-1]
+            if display_name.lower() == "video.mp4":
+                display_name = "final_output.mp4"
+            if _telegram_send_video(video_bytes, display_name):
+                return "delivered"
+        except Exception as vid_err:
+            logger.warning(f"Video delivery warning: {vid_err}")
     for scan_dir in scan_dirs:
         video_path = _find_rendered_video(sbx, scan_dir)
         if not video_path:
@@ -1078,7 +1166,7 @@ def render_html_video(
                 )
             logger.info(f"[Audio mux] {audio_note}")
         deliver_status = _deliver_rendered_video(
-            sbx, extra_dirs=(f"{project_dir}/renders",), require_audio=wants_audio
+            sbx, extra_dirs=(f"{project_dir}/renders",), require_audio=wants_audio, slug=slug
         )
         report = (
             f"E2B HyperFrames render :: {slug}\n"
