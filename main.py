@@ -596,38 +596,125 @@ def prepare_task_source(code: str) -> str:
     logger.warning("[E2B Guard] Detected invalid Python syntax; wrapping task for safe shell execution.")
     return _wrap_shell_as_python(code)
 
-def _find_rendered_video(sbx: Any, directory: str, slug: str = "") -> Optional[str]:
-    """Locate the rendered MP4, trusting a live `find` over rigid folder guesses.
+# A delivered MP4 below either floor is almost certainly a rendering stub,
+# never a real composition: the incident that motivated these floors was a
+# 1-second black "TEST" clip passing straight through to Telegram.
+_MP4_MIN_BYTES = 50 * 1024
+_MP4_MIN_SECONDS = 2.0
 
-    The rigid-path class of failure ("path not found: lstat /home/user/videos")
-    came from hard-coded candidates; instead a bash find over /home/user and
-    /tmp discovers the artifact and the exact path printed to stdout is what
-    gets handed to the delivery/download step. A filesystem listing and a few
-    shell-verified candidates keep working as fallbacks, and when EVERYTHING
-    comes back empty the full /home/user tree is dumped into the logs so the
-    post-mortem is visible in Render logs.
+
+def _mp4_is_test_fixture(path: str) -> bool:
+    """A synthetic state/video test clip must never masquerade as a render."""
+    return "test" in (path or "").lower()
+
+
+def _mp4_sanity_ok(sbx: Any, path: str) -> bool:
+    """Gate every chosen MP4: > 50KB and > 2s, measured inside the sandbox.
+
+    When the sandbox shell cannot measure (no stat/ffprobe output), acceptance
+    is allowed but logged — refusing everything on a measurement gap would
+    strand real renders. A MEASURED value under the floor is always a reject.
     """
-    find_cmd = 'find /home/user /tmp -maxdepth 4 -name "*.mp4" 2>/dev/null'
+    if _mp4_is_test_fixture(path):
+        logger.error(f"[E2B san] rejected test fixture: {path}")
+        return False
+    quoted = f'"{path}"'
+    try:
+        res = sbx.commands.run(f"stat -c %s {quoted} 2>/dev/null", timeout=0)
+        val = (getattr(res, "stdout", "") or "").strip()
+        if val.isdigit():
+            size = int(val)
+            if size <= _MP4_MIN_BYTES:
+                logger.error(
+                    f"[E2B san] rejected {path}: size {size}B <= {_MP4_MIN_BYTES}B "
+                    "(almost certainly a stub)."
+                )
+                return False
+        else:
+            logger.warning(f"[E2B san] size unmeasurable for {path} ({val!r}); continuing.")
+    except Exception as stat_err:
+        logger.warning(f"[E2B san] size check skipped for {path}: {stat_err}")
+    try:
+        res = sbx.commands.run(
+            "ffprobe -v error -show_entries format=duration "
+            f"-of default=noprint_wrappers=1:nokey=1 {quoted} 2>/dev/null",
+            timeout=0,
+        )
+        val = (getattr(res, "stdout", "") or "").strip()
+        try:
+            duration = float(val.splitlines()[0]) if val else float("nan")
+        except (ValueError, IndexError):
+            duration = float("nan")
+        import math
+        if math.isfinite(duration):
+            if duration <= _MP4_MIN_SECONDS:
+                logger.error(
+                    f"[E2B san] rejected {path}: duration {duration:.3f}s <= "
+                    f"{_MP4_MIN_SECONDS}s (almost certainly a stub)."
+                )
+                return False
+        else:
+            logger.warning(
+                f"[E2B san] duration unmeasurable for {path} ({val[:60]!r}); continuing."
+            )
+    except Exception as probe_err:
+        logger.warning(f"[E2B san] duration check skipped for {path}: {probe_err}")
+    return True
+
+
+def _find_rendered_video(sbx: Any, directory: str, slug: str = "") -> Optional[str]:
+    """Locate the rendered MP4 by modification time, never by first match.
+
+    Two guards make 'delivered a synthetic stub' impossible:
+      1. The newest .mp4 by mtime wins (`find -printf %T@ | sort -n | tail -1`),
+         with an `ls -t` fallback for shells without `-printf`. Test-named
+         files ("*test*") are excluded outright.
+      2. Every candidate must pass a sanity gate: size > 50KB and duration
+         > 2s before it can be handed to delivery.
+    Candidate probes and a directory listing remain as last resorts (they are
+    what the harness fakes exercise), all filtered and sanity-gated the same
+    way. If EVERYTHING comes back empty the full /home/user tree is dumped
+    into the logs so the post-mortem is visible in Render logs.
+    """
+    find_cmd = ("find /home/user /tmp -maxdepth 4 -type f -name \"*.mp4\" ! -name \"*test*\" "
+                "-printf \"%T@ %p\n\" 2>/dev/null | sort -n | tail -n 1 | awk '{print $2}'")
+    # Shells/GNU find without -printf fall back to ls -t against the same file set.
+    find_all = (
+        'find /home/user /tmp -maxdepth 4 -type f -name "*.mp4" ! -name "*test*" 2>/dev/null'
+    )
+    ls_t_cmd = f'ls -t $({find_all}) 2>/dev/null | head -n 1'
+    find_stdout_empty = True
     try:
         res = sbx.commands.run(find_cmd, timeout=0)
-        find_stdout = (getattr(res, "stdout", "") or "").strip()
-    except Exception as find_err:
-        logger.error(f"[E2B find] find command failed: {find_err}")
-        find_stdout = ""
-    if find_stdout:
-        for line in find_stdout.splitlines():
-            p = line.strip()
-            if not p or not p.lower().endswith(".mp4"):
-                continue
-            # Download the exact file listed by the find stdout.
+        chosen = (getattr(res, "stdout", "") or "").strip()
+        if chosen and chosen.lower().endswith(".mp4"):
+            find_stdout_empty = False
             try:
-                sbx.files.read(p, format="bytes")
-                logger.info(f"[E2B find] verified first MP4: {p}")
-                return p
+                sbx.files.read(chosen, format="bytes")
+                if _mp4_sanity_ok(sbx, chosen):
+                    logger.info(f"[E2B find] verified newest MP4: {chosen}")
+                    return chosen
             except Exception as read_err:
-                logger.warning(f"[E2B find] {p} listed but not readable: {read_err}")
-                continue
-    # 2) Shell-verified candidates (slug-aware first), same ordering as before.
+                logger.warning(f"[E2B find] {chosen} listed but not readable: {read_err}")
+        else:
+            logger.info(f"[E2B find] newest-mp4 printf probe returned: {chosen!r}")
+    except Exception as find_err:
+        logger.error(f"[E2B find] printf find failed: {find_err}")
+    try:
+        res = sbx.commands.run(ls_t_cmd, timeout=0)
+        chosen = (getattr(res, "stdout", "") or "").strip()
+        if chosen and chosen.lower().endswith(".mp4") and not _mp4_is_test_fixture(chosen):
+            find_stdout_empty = False
+            try:
+                sbx.files.read(chosen, format="bytes")
+                if _mp4_sanity_ok(sbx, chosen):
+                    logger.info(f"[E2B find] verified newest MP4 (ls -t): {chosen}")
+                    return chosen
+            except Exception as read_err:
+                logger.warning(f"[E2B find] {chosen} listed but not readable: {read_err}")
+    except Exception as ls_err:
+        logger.warning(f"[E2B find] ls -t fallback failed: {ls_err}")
+    # 3) Shell-verified candidates (slug-aware first), filtered + sanity-gated.
     candidates = []
     if slug:
         candidates.extend([
@@ -644,21 +731,26 @@ def _find_rendered_video(sbx: Any, directory: str, slug: str = "") -> Optional[s
         "/home/user/final_output.mp4",
     ])
     for c in candidates:
+        if _mp4_is_test_fixture(c):
+            continue
         try:
             sbx.files.read(c, format="bytes")
-            return c
+            if _mp4_sanity_ok(sbx, c):
+                return c
         except Exception:
             pass
-    # 3) Directory listing fallback.
+    # 4) Directory listing fallback.
     try:
         for entry in sbx.files.list(directory):
             name = getattr(entry, "name", "") or ""
-            if name.lower().endswith(".mp4"):
-                return f"{directory.rstrip('/')}/{name}"
+            if name.lower().endswith(".mp4") and not _mp4_is_test_fixture(name):
+                p = f"{directory.rstrip('/')}/{name}"
+                if _mp4_sanity_ok(sbx, p):
+                    return p
     except Exception:
         pass
-    # 4) Nothing found anywhere: dump the exact file tree into the logs.
-    if not find_stdout:
+    # 5) Nothing found anywhere: dump the exact file tree into the logs.
+    if find_stdout_empty:
         try:
             ls_res = sbx.commands.run("ls -laR /home/user", timeout=0)
             logger.error(
@@ -688,30 +780,39 @@ def _find_mp4_in_sandbox(sbx: Any, slug: str = "") -> Optional[str]:
             "/home/user/renders/final_output.mp4",
         ])
         for c in candidates:
+            if _mp4_is_test_fixture(c):
+                continue
             try:
                 sbx.files.read(c, format="bytes")
-                return c
+                if _mp4_sanity_ok(sbx, c):
+                    return c
             except Exception:
                 continue
-        # Fallback: find in sandbox
+        # Fallback: find in sandbox (final_output first), newest-last names filtered,
+        # every hit gated through the same size/duration sanity check.
         res = sbx.commands.run("find /home/user -name 'final_output.mp4' -not -path '*/proc/*' 2>&1 | head -5")
         out = getattr(res, "stdout", "") or ""
         for line in out.splitlines():
             p = line.strip()
-            if p and p.startswith("/home/user/"):
+            if p and p.startswith("/home/user/") and not _mp4_is_test_fixture(p):
                 try:
                     sbx.files.read(p, format="bytes")
-                    return p
+                    if _mp4_sanity_ok(sbx, p):
+                        return p
                 except Exception:
                     continue
-        res = sbx.commands.run("find /home/user -name '*.mp4' -not -path '*/proc/*' 2>&1 | head -5")
+        res = sbx.commands.run(
+            "find /home/user /tmp -maxdepth 4 -type f -name '*.mp4' ! -name '*test*' "
+            "-printf '%T@ %p\n' 2>/dev/null | sort -n | tail -n 1 | awk '{print $2}'"
+        )
         out = getattr(res, "stdout", "") or ""
         for line in out.splitlines():
             p = line.strip()
-            if p and p.startswith("/home/user/"):
+            if p and p.startswith("/") and not _mp4_is_test_fixture(p):
                 try:
                     sbx.files.read(p, format="bytes")
-                    return p
+                    if _mp4_sanity_ok(sbx, p):
+                        return p
                 except Exception:
                     continue
         # Debug: list videos dir
