@@ -25,10 +25,12 @@ prompts = main.load_skill("motion_graphics_prompts")
 out = main.load_skill("hyperframes")
 check("hyperframes loads the router SKILL.md, not the README",
       "skills/hyperframes/SKILL.md" in out.splitlines()[0], out.splitlines()[0])
-# The router doc is 21,069 chars, i.e. inside the 24,000-char budget, so it must
-# come back whole: no paging header, no truncation marker.
+# The router doc grew upstream to 24,853 chars — past the 24,000-char budget —
+# so it pages now. A same-repo doc that still fits under budget must come back
+# whole: no paging header, no truncation marker.
+fits_whole = main.load_skill("hyperframes", "skills/hyperframes-core/SKILL.md")
 check("a doc that fits its budget is returned whole with no marker",
-      "TRUNCATED" not in out and "[chars 0-" not in out)
+      "TRUNCATED" not in fits_whole and "[chars 0-" not in fits_whole)
 check("a doc that fits is delivered in full (>20k chars)", len(out) > 20000, f"len={len(out)}")
 # The prompt library README is 90,967 chars and must page explicitly instead.
 check("an oversized doc pages with an explicit continuation hint",
