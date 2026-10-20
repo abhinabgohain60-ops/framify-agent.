@@ -12,3 +12,5 @@ PyGithub
 apscheduler
 praw
 composio
+yt-dlp
+agent-reach @ https://github.com/Panniantong/agent-reach/archive/main.zip

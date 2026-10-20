@@ -1646,6 +1646,465 @@ if __name__ == "__main__":
 '''
 
 
+# ============================================================ GAMEPLAY EDL EDIT
+# Silence + transient analysis runs INSIDE the E2B sandbox; the brain only
+# parses JSON, plans the EDL with pure functions and builds one ffmpeg command.
+_GAMEPLAY_ANALYSIS_TEMPLATE = r'''
+"""Silence + transient analysis for gameplay edits — runs INSIDE the E2B sandbox.
+
+Prints one machine-readable line:
+    GP_ANALYSIS {"duration": float, "has_audio": bool, "silences": [[s, e], ...],
+                 "moments": [[t, momentary_lufs], ...]}
+Everything heavy (ffmpeg/ffprobe) happens here; the Render brain only parses JSON.
+"""
+import json
+import os
+import re
+import subprocess
+
+SRC = os.environ["GP_SRC"]
+SILENCE_DB = os.environ.get("GP_SILDB", "-35dB")
+MIN_SIL = os.environ.get("GP_MINSIL", "0.6")
+
+
+def run(cmd):
+    p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    return (p.stdout or b"").decode("utf-8", "replace"), (p.stderr or b"").decode("utf-8", "replace")
+
+
+def main():
+    out, _ = run(["ffprobe", "-v", "error", "-show_entries", "format=duration",
+                  "-show_entries", "stream=codec_type", "-of", "json", SRC])
+    try:
+        meta = json.loads(out or "{}")
+        duration = float((meta.get("format") or {}).get("duration") or 0.0)
+    except Exception:
+        duration = 0.0
+    has_audio = "audio" in out
+    if duration <= 0:
+        print("GP_ERROR ffprobe could not measure duration")
+        return
+    silences = []
+    moments = []
+    if has_audio:
+        # 1) dead air: silencedetect marks the spans to CUT from the EDL.
+        _, derr = run(["ffmpeg", "-hide_banner", "-nostats", "-i", SRC,
+                       "-af", "silencedetect=n=" + SILENCE_DB + ":d=" + MIN_SIL,
+                       "-f", "null", "-"])
+        start = None
+        for line in derr.splitlines():
+            m = re.search(r"silence_start:\s*([0-9.]+)", line)
+            if m:
+                start = float(m.group(1))
+                continue
+            m = re.search(r"silence_end:\s*([0-9.]+)", line)
+            if m and start is not None:
+                silences.append([start, float(m.group(1))])
+                start = None
+        if start is not None:
+            silences.append([start, duration])
+        # 2) energy timeline: ebur128 momentary loudness separates speech and
+        #    gunfight transients (high M) from dead wandering (low M).
+        _, eerr = run(["ffmpeg", "-hide_banner", "-nostats", "-i", SRC,
+                       "-af", "ebur128=peak=true", "-f", "null", "-"])
+        for line in eerr.splitlines():
+            m = re.search(r"t:\s*([0-9.]+)\s+TARGET:.*?\bM:\s*(-?[0-9.]+|-inf|nan)", line)
+            if not m:
+                continue
+            try:
+                val = float(m.group(2))
+            except ValueError:
+                continue
+            if val == val:  # skip NaN; -inf is a real (silent) reading
+                moments.append([float(m.group(1)), val])
+    print("GP_ANALYSIS " + json.dumps(
+        {"duration": duration, "has_audio": has_audio,
+         "silences": silences, "moments": moments[:4000]}))
+
+
+if __name__ == "__main__":
+    main()
+'''
+
+
+def _parse_gameplay_analysis(output: str) -> Optional[Dict[str, Any]]:
+    """Extract the last GP_ANALYSIS JSON payload from the sandbox script output."""
+    for line in reversed((output or "").splitlines()):
+        if line.startswith("GP_ANALYSIS "):
+            try:
+                data = json.loads(line[len("GP_ANALYSIS "):])
+            except json.JSONDecodeError:
+                return None
+            if isinstance(data, dict):
+                try:
+                    valid = float(data.get("duration") or 0.0) > 0
+                except (TypeError, ValueError):
+                    valid = False
+                return data if valid else None
+    return None
+
+
+def _build_gameplay_edl(
+    duration: Any,
+    silences: Any,
+    moments: Any,
+    downtime_speed: float = 2.5,
+    highlight_lufs: float = -20.0,
+    speech_floor_lufs: float = -38.0,
+    min_segment: float = 0.35,
+    max_segments: int = 240,
+) -> List[Dict[str, Any]]:
+    """Pure EDL planner: cut dead silence, speed up downtime, keep highlights.
+
+    Returns [{"start", "end", "speed", "kind"}] covering [0, duration] minus the
+    silence spans that were cut. kind is "keep" (1x: speech, gunfights, any span
+    whose momentary loudness reaches highlight_lufs) or "downtime" (sped up).
+    A span containing ANY highlight is kept whole at 1x — a quiet stretch is
+    never allowed to eat a gunshot. No audible moments (no audio track) keeps
+    everything at 1x.
+    """
+    try:
+        duration = float(duration)
+    except (TypeError, ValueError):
+        duration = 0.0
+    if duration <= 0:
+        return []
+    try:
+        speed = max(1.0, min(float(downtime_speed or 2.5), 4.0))
+    except (TypeError, ValueError):
+        speed = 2.5
+    cuts = []
+    for s in silences or []:
+        try:
+            a, b = float(s[0]), float(s[1])
+        except (TypeError, ValueError, IndexError):
+            continue
+        a, b = max(0.0, a), min(duration, b)
+        if b - a > 0.05 and a < b:
+            cuts.append((a, b))
+    cuts.sort()
+    active = []
+    cursor = 0.0
+    for a, b in cuts:
+        if a > cursor:
+            active.append((cursor, a))
+        cursor = max(cursor, b)
+    if cursor < duration:
+        active.append((cursor, duration))
+    moments_f = []
+    for m in moments or []:
+        try:
+            moments_f.append((float(m[0]), float(m[1])))
+        except (TypeError, ValueError, IndexError):
+            continue
+    segments: List[Dict[str, Any]] = []
+    for a, b in active:
+        vals = [(t, v) for (t, v) in moments_f if a <= t <= b]
+        if not vals:
+            # No loudness readings inside this span: keep it whole at 1x rather
+            # than guess — an unreadable span is never chopped.
+            segments.append({"start": round(a, 3), "end": round(b, 3),
+                             "speed": 1.0, "kind": "keep"})
+            continue
+        # Classify every moment (speech/gunfire >= floor stays, dead air is
+        # sped up), then group consecutive same-kind moments into runs so an
+        # active span still loses its wandering stretches while a highlight
+        # inside the same span is preserved at 1x.
+        runs: List[List[Any]] = []
+        for t, v in vals:
+            kind = "keep" if (v >= highlight_lufs or v >= speech_floor_lufs) else "downtime"
+            if runs and runs[-1][0] == kind:
+                runs[-1][2] = t
+            else:
+                runs.append([kind, t, t])
+        # A segment ends where the next run's first loudness sample begins.
+        prev_end = a
+        for i, (kind, t0, t1) in enumerate(runs):
+            seg_end = b if i == len(runs) - 1 else float(runs[i + 1][1])
+            segments.append({
+                "start": round(prev_end, 3),
+                "end": round(seg_end, 3),
+                "speed": speed if kind == "downtime" else 1.0,
+                "kind": kind,
+            })
+            prev_end = seg_end
+    # Merge contiguous same-kind spans, then absorb sub-minimum slivers into the
+    # previous segment so the render never gets a stutter cut.
+    merged: List[Dict[str, Any]] = []
+    for seg in segments:
+        if merged and merged[-1]["kind"] == seg["kind"] and abs(merged[-1]["end"] - seg["start"]) < 1e-6:
+            merged[-1]["end"] = seg["end"]
+        else:
+            merged.append(seg)
+    out: List[Dict[str, Any]] = []
+    for seg in merged:
+        if out and (seg["end"] - seg["start"]) < min_segment:
+            prev = out[-1]
+            if prev["kind"] == seg["kind"]:
+                prev["end"] = seg["end"]
+            else:
+                # A sliver of a different kind is absorbed at the PREVIOUS
+                # segment's rate — never at the sped-up rate.
+                prev["end"] = seg["end"]
+            continue
+        out.append(seg)
+    while len(out) > max_segments:
+        idx = min(range(1, len(out)), key=lambda i: out[i]["end"] - out[i]["start"])
+        out[idx - 1]["end"] = out[idx]["end"]
+        del out[idx]
+    planned = sum((s["end"] - s["start"]) / max(0.5, s["speed"]) for s in out)
+    if not out or planned < 1.0:
+        # Safety: an over-aggressive cut plan must never ship an empty video.
+        out = [{"start": 0.0, "end": round(duration, 3), "speed": 1.0, "kind": "keep"}]
+    return out
+
+
+def _gameplay_atempo_chain(speed: float) -> str:
+    """atempo filter chain for a speed multiplier (each instance stays in 0.5-2.0)."""
+    try:
+        speed = max(0.5, min(float(speed), 4.0))
+    except (TypeError, ValueError):
+        return ""
+    factors = []
+    while speed > 2.0:
+        factors.append("atempo=2.0")
+        speed /= 2.0
+    if abs(speed - 1.0) > 1e-3:
+        factors.append(f"atempo={speed:.4g}")
+    return "," + ",".join(factors) if factors else ""
+
+
+def _gameplay_render_cmd(
+    src: str, out: str, edl: List[Dict[str, Any]], framing: str = "blur", has_audio: bool = True
+) -> str:
+    """One ffmpeg command: EDL trim/speedup + concat + 9:16 framing + audio ducking.
+
+    framing='crop' is a centered crosshair crop (crop=ih*9/16:ih); framing='blur'
+    pads with a mirrored, gaussian-blurred copy of the frame behind a fit-scaled
+    foreground. Audio is ducked with a speech-band-keyed sidechain compressor
+    (speech band 250-3400 Hz drives the compressor on the full mix), then muxed
+    AAC 192k @ 44.1 kHz with +faststart. The filter graph is single-quoted for
+    the sandbox shell (it contains ';' and '[]').
+    """
+    edl = [s for s in (edl or []) if (s.get("end", 0) > s.get("start", 0))]
+    if not edl:
+        return ""
+    filters = []
+    vlabels, alabels = [], []
+    for i, seg in enumerate(edl):
+        a, b = float(seg["start"]), float(seg["end"])
+        sp = float(seg.get("speed", 1.0) or 1.0)
+        filters.append(f"[0:v]trim=start={a:.3f}:end={b:.3f},setpts=(PTS-STARTPTS)/{sp:.4g}[v{i}]")
+        vlabels.append(f"[v{i}]")
+        if has_audio:
+            filters.append(
+                f"[0:a]atrim=start={a:.3f}:end={b:.3f},asetpts=PTS-STARTPTS"
+                f"{_gameplay_atempo_chain(sp)}[a{i}]"
+            )
+            alabels.append(f"[a{i}]")
+    n = len(edl)
+    if has_audio:
+        filters.append("".join(vlabels) + "".join(alabels) + f"concat=n={n}:v=1:a=1[vc][ac]")
+    else:
+        filters.append("".join(vlabels) + f"concat=n={n}:v=1:a=0[vc]")
+    if framing == "crop":
+        filters.append("[vc]crop=ih*9/16:ih,scale=1080:1920:flags=lanczos[vout]")
+    else:
+        filters.append("[vc]split[bg][fg]")
+        filters.append(
+            "[bg]scale=1080:1920:force_original_aspect_ratio=increase,"
+            "crop=1080:1920:0:0,hflip,gblur=sigma=25[bgz]"
+        )
+        filters.append(
+            "[fg]scale=w=1080:h=1920:force_original_aspect_ratio=decrease[fgz]"
+        )
+        filters.append("[bgz][fgz]overlay=x=(W-w)/2:y=(H-h)/2:format=auto[vout]")
+    if has_audio:
+        filters.append("[ac]asplit=2[amain][scin]")
+        filters.append("[scin]highpass=f=250,lowpass=f=3400[scband]")
+        filters.append(
+            "[amain][scband]sidechaincompress=threshold=0.02:ratio=6:"
+            "attack=25:release=400:makeup=1[aout]"
+        )
+    graph = ";".join(filters)
+    parts = [f"ffmpeg -y -i {src} -filter_complex '{graph}' -map '[vout]'"]
+    if has_audio:
+        parts.append("-map '[aout]' -c:a aac -b:a 192k -ar 44100")
+    else:
+        parts.append("-an")
+    parts.append("-c:v libx264 -preset veryfast -crf 21 -pix_fmt yuv420p "
+                 f"-movflags +faststart {out}")
+    return " ".join(parts)
+
+
+def edit_gameplay_footage(
+    video_path: str,
+    instructions: str = "",
+    framing: str = "blur",
+    downtime_speed: float = 2.5,
+    silence_db: str = "-35dB",
+    highlight_lufs: float = -20.0,
+) -> str:
+    """Edit uploaded gameplay/footage into a 9:16 vertical cut and deliver it to Telegram.
+
+    Runs entirely in the E2B microVM: silencedetect + ebur128 transient/loudness
+    analysis drives an EDL that CUTS dead silence, SPEEDS UP low-energy downtime
+    and KEEPS high-energy action clips at 1x. The cut is reframed to 1080x1920
+    (framing='blur' mirrored blurred background padding, or 'crop' centered
+    crosshair crop), audio is ducked with a speech-band sidechain compressor and
+    muxed AAC 192k, then delivered to Telegram as final_output.mp4. Pass the
+    staged local path from the [Attached media] note as video_path.
+
+    Args:
+        video_path: Absolute local path of the source clip (the [Attached media]
+            note from a Telegram upload provides it).
+        instructions: Optional user instruction to record with the EDL/report.
+        framing: 'blur' (mirrored blurred background, default) or 'crop'.
+        downtime_speed: Playback multiplier for low-energy stretches (1.0-4.0).
+        silence_db: silencedetect noise floor, e.g. '-35dB'.
+        highlight_lufs: Momentary loudness (LUFS) at/above which a span counts
+            as a highlight and is preserved at 1x.
+    """
+    if not E2B_API_KEY:
+        return "Error: E2B_API_KEY is not configured; the E2B microVM is the only render engine."
+    video_path = (video_path or "").strip()
+    if not video_path.startswith("/"):
+        return (
+            f"[FAILED] video_path '{video_path}' is not an absolute local file path. "
+            "Upload the clip to Telegram (caption = your instructions); the handler "
+            "stages it locally and the [Attached media] note carries the staged path."
+        )
+    if not os.path.isfile(video_path):
+        return (
+            f"[FAILED] Missing artifact: source video '{video_path}' does not exist on "
+            "this host. Re-upload the clip — the staged path is included in the "
+            "[Attached media] note; never invent a path."
+        )
+    max_bytes = 250 * 1024 * 1024
+    file_size = os.path.getsize(video_path)
+    if file_size > max_bytes:
+        return (
+            f"[FAILED] source clip is {file_size // (1024 * 1024)} MB (limit "
+            f"{max_bytes // (1024 * 1024)} MB); trim the clip and re-upload."
+        )
+    framing_key = "crop" if str(framing or "").strip().lower() in ("crop", "crosshair", "center") else "blur"
+    try:
+        downtime_speed = max(1.0, min(float(downtime_speed or 2.5), 4.0))
+    except (TypeError, ValueError):
+        downtime_speed = 2.5
+    try:
+        highlight_lufs = float(highlight_lufs if highlight_lufs is not None else -20.0)
+    except (TypeError, ValueError):
+        highlight_lufs = -20.0
+    silence_db = str(silence_db or "-35dB").strip()
+    if not re.fullmatch(r"-?\d+(\.\d+)?dB", silence_db):
+        silence_db = "-35dB"
+    emit_progress(55, PROGRESS_MILESTONES[2][1], video=True)
+    workdir = "/home/user/gameplay"
+    src = f"{workdir}/source.mp4"
+    out_path = f"{workdir}/final_output.mp4"
+    sbx = None
+    try:
+        from e2b_code_interpreter import Sandbox
+
+        logger.info(f"[Gameplay] starting EDL edit of {video_path} ({file_size} bytes)")
+        sbx = Sandbox.create(api_key=E2B_API_KEY, timeout=SANDBOX_TIMEOUT_SECONDS)
+        e2b_disk_prep(sbx)
+        _provision_render_toolchain(sbx, want_browser=False)
+        sbx.commands.run(_e2b_cmd_with_prep(f"mkdir -p {workdir}"), timeout=0)
+        # Upload in 4 MB chunks so the 512 MB brain never holds the clip whole.
+        part = 0
+        with open(video_path, "rb") as fh:
+            while True:
+                chunk = fh.read(4 * 1024 * 1024)
+                if not chunk:
+                    break
+                sbx.files.write(f"{workdir}/src_{part:04d}", chunk)
+                part += 1
+        if part == 0:
+            return f"[FAILED] source file '{video_path}' is empty; nothing to edit."
+        sbx.commands.run(
+            _e2b_cmd_with_prep(f"cat {workdir}/src_* > {src} && rm -f {workdir}/src_*"),
+            timeout=0,
+        )
+        # Analysis inside the sandbox: silence spans + momentary loudness timeline.
+        sbx.files.write(f"{workdir}/gameplay_analysis.py", _GAMEPLAY_ANALYSIS_TEMPLATE)
+        env = (f"GP_SRC={src} GP_SILDB={silence_db} GP_MINSIL=0.6 "
+               f"GP_OUT={workdir}")
+        res = sbx.commands.run(
+            _e2b_cmd_with_prep(f"cd {workdir} && {env} python3 gameplay_analysis.py"),
+            timeout=0,
+        )
+        raw = (getattr(res, "stdout", "") or "") + "\n" + (getattr(res, "stderr", "") or "")
+        analysis = _parse_gameplay_analysis(raw)
+        if not analysis:
+            return (
+                "[FAILED] gameplay analysis produced no parseable data — the clip "
+                f"could not be probed. Analysis output tail:\n{raw[-1500:]}"
+            )
+        edl = _build_gameplay_edl(
+            analysis.get("duration"),
+            analysis.get("silences"),
+            analysis.get("moments"),
+            downtime_speed=downtime_speed,
+            highlight_lufs=highlight_lufs,
+        )
+        if not edl:
+            return "[FAILED] EDL planning produced no segments; refusing to render an empty cut."
+        sbx.files.write(f"{workdir}/edl.json", json.dumps(edl, indent=2))
+        logger.info(f"[Gameplay] EDL: {len(edl)} segments; writing render command")
+        has_audio = bool(analysis.get("has_audio"))
+        rcmd = _gameplay_render_cmd(src, out_path, edl, framing=framing_key, has_audio=has_audio)
+        rres = sbx.commands.run(_e2b_cmd_with_prep(f"cd {workdir} && {rcmd}"), timeout=0)
+        rtail = ((getattr(rres, "stdout", "") or "") + (getattr(rres, "stderr", "") or ""))[-1500:]
+        if getattr(rres, "exit_code", 1) not in (0, None):
+            return (
+                f"[FAILED] gameplay render exited {getattr(rres, 'exit_code', '?')}; "
+                f"NOTHING was uploaded. ffmpeg tail:\n{rtail}"
+            )
+        if not _mp4_sanity_ok(sbx, out_path):
+            return (
+                "[FAILED] rendered MP4 failed the size/duration sanity gate "
+                "(<50KB or <2s) — refusing to deliver a stub. ffmpeg tail:\n" + rtail
+            )
+        deliver = _deliver_rendered_video(sbx, extra_dirs=(workdir,))
+        planned = sum((s["end"] - s["start"]) / max(0.5, s["speed"]) for s in edl)
+        report = (
+            f"Gameplay EDL edit :: {os.path.basename(video_path)}\n"
+            f"source duration: {float(analysis.get('duration') or 0):.1f}s, "
+            f"planned output: {planned:.1f}s\n"
+            f"EDL segments: {len(edl)} (cut {len(analysis.get('silences') or [])} silence "
+            f"spans, sped up downtime {downtime_speed}x, kept highlights at 1x)\n"
+            f"framing: {'centered crosshair crop' if framing_key == 'crop' else 'mirrored blurred background'} "
+            "1080x1920\n"
+            f"audio: {'speech-band sidechain ducking, AAC 192k/44.1kHz' if has_audio else 'no audio stream in source'}\n"
+        )
+        if (instructions or "").strip():
+            report += f"instructions: {instructions.strip()[:300]}\n"
+        if deliver == "delivered":
+            report += "[SUCCESS] final_output.mp4 delivered to Telegram."
+        elif deliver == "post-failed":
+            report += "[FAILED] final_output.mp4 exists but Telegram refused the upload; NOTHING was delivered."
+        elif deliver == "unbound":
+            report += f"[UNDELIVERED] final_output.mp4 ready at {out_path} (no Telegram chat bound)."
+        else:
+            report += (
+                "[FAILED] Missing artifact: no final_output.mp4 could be retrieved "
+                f"(delivery status: {deliver}). NOTHING was uploaded to Telegram - "
+                "do NOT report this action as successful."
+            )
+        return report
+    except Exception as e:
+        logger.error(f"Gameplay edit error: {e}", exc_info=True)
+        return f"[FAILED] gameplay edit error:\n{traceback.format_exc()}"
+    finally:
+        if sbx is not None:
+            try:
+                sbx.kill()
+            except Exception as kill_err:
+                logger.warning(f"Sandbox cleanup warning: {kill_err}")
+
+
 def execute_in_cloud_microvm(code: str) -> str:
     global CURRENT_CHAT_ID
     if not E2B_API_KEY:
@@ -1873,6 +2332,265 @@ def web_search_research(query: str) -> str:
     except Exception as e:
         return f"Search error: {str(e)}"
 
+# ------------------------------------------------------- web eyes & script ears
+_YT_FETCH_TEMPLATE = r'''
+"""Fetch a YouTube transcript inside the sandbox using the yt-dlp python API."""
+import glob
+import json
+import os
+import re
+import sys
+
+TASK = json.load(open("/home/user/ytdl_task.json", encoding="utf-8"))
+URL = TASK["url"]
+LANGS = [l for l in TASK.get("langs", "en,en-US,en-GB").split(",") if l.strip()]
+WORK = "/home/user/ytdl"
+os.makedirs(WORK, exist_ok=True)
+
+_TS_RE = re.compile(r"^\d{1,2}:\d{2}(:\d{2})?[.,]\d{3}")
+
+
+def _sub_text(path):
+    """vtt/srt -> plain prose: drop headers, cue ids, timestamps and rolling caps."""
+    out, seen = [], set()
+    with open(path, "r", encoding="utf-8", errors="replace") as fh:
+        for raw in fh:
+            line = raw.strip()
+            if not line or line == "WEBVTT" or "-->" in line or _TS_RE.match(line):
+                continue
+            if line.isdigit():
+                continue
+            line = re.sub(r"<[^>]+>", "", line).strip()
+            if not line or line in seen:
+                continue
+            if len(out) > 2 and line == out[-1]:
+                continue
+            seen.add(line)
+            out.append(line)
+    return " ".join(out)
+
+
+def main():
+    try:
+        from yt_dlp import YoutubeDL
+    except Exception as imp_err:
+        print("YT_ERROR yt-dlp unavailable in sandbox: %s" % imp_err)
+        return
+    opts = {
+        "skip_download": True,
+        "writesubtitles": True,
+        "writeautomaticsub": True,
+        "subtitleslangs": LANGS,
+        "subtitlesformat": "vtt/srt/best",
+        "outtmpl": os.path.join(WORK, "%(id)s.%(ext)s"),
+        "quiet": True,
+        "noprogress": True,
+        "socket_timeout": 30,
+    }
+    try:
+        with YoutubeDL(opts) as ydl:
+            info = ydl.extract_info(URL, download=True)
+    except Exception as e:
+        print("YT_ERROR %s" % str(e)[:500])
+        return
+    vid = info.get("id") or ""
+    sub_path, sub_lang = None, ""
+    for lang in LANGS:
+        hit = sorted(glob.glob(os.path.join(WORK, vid + "." + lang + ".vtt"))) \
+            or sorted(glob.glob(os.path.join(WORK, vid + "." + lang + "*")))
+        if hit:
+            sub_path, sub_lang = hit[0], lang
+            break
+    if not sub_path:
+        hits = sorted(glob.glob(os.path.join(WORK, vid + "*.vtt"))) \
+            or sorted(glob.glob(os.path.join(WORK, vid + "*.srt")))
+        if hits:
+            sub_path = hits[0]
+            base = os.path.basename(sub_path)
+            sub_lang = base[len(vid) + 1: base.rfind(".")] if len(vid) + 1 < base.rfind(".") else ""
+    if not sub_path:
+        found = ",".join(sorted((info.get("subtitles") or {}).keys()))
+        auto = ",".join(sorted((info.get("automatic_captions") or {}).keys()))
+        print("YT_RESULT " + json.dumps({
+            "video_id": vid, "title": info.get("title"),
+            "duration": info.get("duration"), "uploader": info.get("uploader"),
+            "chars": 0, "truncated": False,
+            "note": "no subtitle/caption file written; manual=%s auto_langs=%s" % (found[:120], auto[:120]),
+        }))
+        return
+    text = _sub_text(sub_path)
+    MAX = 24000
+    truncated = len(text) > MAX
+    if truncated:
+        text = text[:MAX]
+    print("YT_RESULT " + json.dumps({
+        "video_id": vid, "title": info.get("title"),
+        "duration": info.get("duration"), "uploader": info.get("uploader"),
+        "lang": sub_lang, "chars": len(text), "truncated": truncated,
+        "note": "",
+    }))
+    print("YT_TEXT " + text)
+
+
+if __name__ == "__main__":
+    main()
+'''
+
+
+def _parse_yt_fetch(output: str) -> "tuple[Optional[dict], str, Optional[str]]":
+    """Pull YT_RESULT metadata, YT_TEXT transcript and YT_ERROR out of sandbox output."""
+    meta: Optional[Dict[str, Any]] = None
+    text = ""
+    error = None
+    for line in reversed((output or "").splitlines()):
+        if line.startswith("YT_TEXT ") and not text:
+            text = line[len("YT_TEXT "):]
+        elif line.startswith("YT_RESULT "):
+            try:
+                meta = json.loads(line[len("YT_RESULT "):])
+            except json.JSONDecodeError:
+                meta = None
+        elif line.startswith("YT_ERROR "):
+            error = line[len("YT_ERROR "):]
+    return meta, text, error
+
+
+def inspect_web_content(url: str, max_chars: int = 4000, raw_html: bool = False) -> str:
+    """Read any public web page as clean text — Chintu's web eyes.
+
+    Primary route is the general-page reader the agent-reach install configures
+    (a server-side text-extraction proxy, reached over https like every other
+    request from this 512 MB brain); the fallback is a direct fetch with HTML
+    stripped to text. No subprocess, no media imports: this is brain-safe.
+
+    Args:
+        url: Absolute http(s) URL of the page to read.
+        max_chars: How much text to return (200-20000, default 4000).
+        raw_html: Return the raw response body instead of cleaned text.
+    """
+    url = (url or "").strip()
+    if not re.match(r"^https?://", url):
+        return (
+            f"[FAILED] '{url}' is not an absolute http(s) URL — "
+            "`inspect_web_content` needs the full link, e.g. https://example.com/article"
+        )
+    try:
+        max_chars = min(max(int(max_chars or 4000), 200), 20000)
+    except (TypeError, ValueError):
+        max_chars = 4000
+    body, source = "", "agent-reach reader"
+    try:
+        # agent-reach's documented route for general pages (Jina Reader): text
+        # extraction happens upstream, so this brain never parses heavy HTML.
+        res = requests.get(
+            f"https://r.jina.ai/{url}", headers={"User-Agent": "Mozilla/5.0"}, timeout=30
+        )
+        if res.status_code == 200 and len(res.text.strip()) > 40:
+            body = res.text
+    except Exception as jin_err:
+        logger.info(f"[WebEyes] reader miss for {url}: {jin_err}")
+    if not body:
+        source = "direct-fetch"
+        try:
+            res = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=20)
+            if res.status_code == 200:
+                body = res.text
+                if not raw_html:
+                    body = _strip_html(body, limit=max_chars + 2000)
+        except Exception as fetch_err:
+            return f"[FAILED] could not read '{url}': {fetch_err}"
+    if not body.strip():
+        return f"[FAILED] '{url}' returned no readable content (reader and direct fetch)."
+    total = len(body)
+    shown = body[:max_chars]
+    header = f"WEBCONTENT '{url}'\nsource: {source}; showing {len(shown)} of {total} chars"
+    if total > max_chars:
+        header += " [TRUNCATED — raise max_chars to read more]"
+    return header + "\n\n" + shown
+
+
+def fetch_youtube_transcript(url: str, langs: str = "en,en-US,en-GB") -> str:
+    """Fetch the transcript/captions of a YouTube URL with yt-dlp inside the E2B microVM.
+
+    yt-dlp runs sandbox-side (writesubs + writeautomaticsub for the requested
+    languages, VTT preferred), timestamps are stripped into plain prose, and the
+    result is returned with title/duration/uploader metadata. Any yt-dlp
+    supported site works, not just YouTube.
+
+    Args:
+        url: Full video URL, e.g. https://www.youtube.com/watch?v=...
+        langs: Comma-separated subtitle language preference, first match wins.
+    """
+    if not E2B_API_KEY:
+        return "Error: E2B_API_KEY is not configured; yt-dlp runs inside the E2B microVM, which is the only shell Chintu has."
+    url = (url or "").strip()
+    if not re.match(r"^https?://", url):
+        return (
+            f"[FAILED] '{url}' is not an absolute http(s) URL — pass the full video "
+            "link (YouTube watch/shorts/youtu.be or any yt-dlp supported site)."
+        )
+    langs = ",".join(
+        l.strip() for l in str(langs or "en,en-US,en-GB").split(",") if l.strip()
+    ) or "en,en-US,en-GB"
+    emit_progress(30, PROGRESS_MILESTONES[1][1])
+    sbx = None
+    try:
+        from e2b_code_interpreter import Sandbox
+
+        logger.info(f"[YtDlp] fetching transcript for {url} (langs={langs})")
+        sbx = Sandbox.create(api_key=E2B_API_KEY, timeout=SANDBOX_TIMEOUT_SECONDS)
+        e2b_disk_prep(sbx)
+        sbx.commands.run(
+            _e2b_cmd_with_prep(
+                "python3 -m pip install --quiet --no-input --disable-pip-version-check yt-dlp"
+            ),
+            timeout=0,
+        )
+        sbx.files.write(
+            "/home/user/ytdl_task.json",
+            json.dumps({"url": url, "langs": langs}),
+        )
+        sbx.files.write("/home/user/ytdl_fetch.py", _YT_FETCH_TEMPLATE)
+        res = sbx.commands.run(
+            _e2b_cmd_with_prep("cd /home/user && python3 ytdl_fetch.py"),
+            timeout=0,
+        )
+        raw = (getattr(res, "stdout", "") or "") + "\n" + (getattr(res, "stderr", "") or "")
+        meta, text, yterr = _parse_yt_fetch(raw)
+        if meta is None and yterr is None:
+            yterr = raw[-500:]
+        if yterr and not meta:
+            return (
+                f"[FAILED] yt-dlp could not fetch '{url}'. Tail:\n{yterr}\n"
+                "Note: some videos are region/age restricted or carry no captions — "
+                "try `inspect_web_content` on the watch page or another source."
+            )
+        if not meta or not (meta.get("chars") or 0):
+            note = (meta or {}).get("note") or (yterr or "unknown")
+            return (
+                f"[FAILED] no caption track could be fetched for '{url}'.\n{note}\n"
+                "Try different `langs`, or use `inspect_web_content` on the watch page."
+            )
+        header = (
+            f"TRANSCRIPT {meta.get('video_id') or url}\n"
+            f"title: {meta.get('title')}\n"
+            f"duration: {meta.get('duration')}s\n"
+            f"uploader: {meta.get('uploader')}\n"
+            f"language: {meta.get('lang')}; transcript chars: {meta.get('chars')}"
+            + (" [TRUNCATED — the full transcript is longer]" if meta.get("truncated") else "")
+        )
+        return header + "\n\n" + text
+    except Exception as e:
+        logger.error(f"[YtDlp] transcript fetch error: {e}", exc_info=True)
+        return f"[FAILED] transcript fetch error:\n{traceback.format_exc()}\ntail: "
+    finally:
+        if sbx is not None:
+            try:
+                sbx.kill()
+            except Exception as kill_err:
+                logger.warning(f"Sandbox cleanup warning: {kill_err}")
+
+
 def list_skills() -> str:
     """List every external skill/knowledge repository Chintu can draw on."""
     emit_progress(30, PROGRESS_MILESTONES[1][1])
@@ -1956,9 +2674,12 @@ ALL_TOOLS_LIST = [
     render_service_manager,
     create_golden_state_backup,
     web_search_research,
+    inspect_web_content,
+    fetch_youtube_transcript,
     list_skills,
     load_skill,
     render_html_video,
+    edit_gameplay_footage,
 ]
 
 # One line per tool, used to build the self-inventory in SYSTEM_INSTRUCTION. The
@@ -1975,9 +2696,12 @@ TOOL_CAPABILITIES: Dict[str, str] = {
     "render_service_manager": "Inspect or restart the Render service through its API.",
     "create_golden_state_backup": "Snapshot main.py into backups/ on GitHub before risky changes.",
     "web_search_research": "Search the web and return readable text for grounding.",
+    "inspect_web_content": "Web eyes: read any public web page as clean text through the agent-reach reader route (direct-fetch fallback with HTML stripping) — this is how Chintu scrapes and audits pages for research.",
+    "fetch_youtube_transcript": "Script ears: fetch a video's captions/transcript with yt-dlp inside the E2B microVM and return plain prose plus title/duration/uploader metadata — the tool for script and content analysis.",
     "list_skills": "Enumerate the motion-graphics skill library with repos and doc paths.",
     "load_skill": "Load and page the real documentation of one skill (HyperFrames, GSAP, Whisper, Remotion, prompt and motion libraries).",
     "render_html_video": "Dispatch a single-file HTML/CSS/GSAP composition to the E2B microVM render engine (synchronous; disk-prepped, with an automatic Pillow+FFmpeg fallback) — Hugging Face render backends were retired, so never use backend='space'/'huggingface'.",
+    "edit_gameplay_footage": "Edit uploaded gameplay/footage into a 9:16 vertical cut on the E2B microVM: silencedetect+ebur128 analysis builds an EDL that cuts dead silence, speeds up downtime and keeps high-energy action, then 9:16 reframing (blurred mirror or centered crop), speech-band sidechain audio ducking and delivery of final_output.mp4 to Telegram.",
 }
 
 _MISSING_TOOL_DOCS = [fn.__name__ for fn in ALL_TOOLS_LIST if fn.__name__ not in TOOL_CAPABILITIES]
@@ -1999,10 +2723,10 @@ SKILL_INVENTORY = "\n".join(
     for name, meta in SKILL_REGISTRY.items()
 )
 
-SYSTEM_INSTRUCTION = f"""You are Chintu — an autonomous audiovisual motion engineer, running as a distributed agent.
+SYSTEM_INSTRUCTION = f"""You are Chintu — an autonomous general AI agent, running as a distributed agent. You are a researcher, web scraper and script analyst first — read pages, fetch transcripts, analyse and summarise — and in motion work you are the autonomous audiovisual motion engineer. You are not limited to video; any research, scraping, background-check or script-analysis task is squarely yours, using the web tools below. Either way: the Render brain orchestrates, executes and reports; the E2B microVM renders; Telegram delivers.
 
 IDENTITY AND COMPUTE TOPOLOGY (hard boundaries)
-- You are Chintu — an autonomous audiovisual motion engineer, running as a distributed agent: the Render brain orchestrates, executes and reports; the E2B microVM renders; Telegram delivers.
+- You are Chintu — a general AI agent and, for motion work, the autonomous audiovisual motion engineer, running as a distributed agent: the Render brain orchestrates, executes and reports; the E2B microVM renders; Telegram delivers.
 - This process is the Render brain: about 512 MB of RAM hosting FastAPI, the Telegram polling lifecycle, the status card, tool routing and LLM orchestration. That is ALL it does.
 - You must NEVER render video locally. No Pillow frame buffers, no Playwright/Chromium launch, no FFmpeg subprocess, no NumPy frame loops in this process. A local render is a failed turn, not a shortcut.
 - The Hugging Face render backends (Docker Space and cpu-basic Jobs) were RETIRED — compute Spaces now require a paid PRO plan — so the ONLY render engine is the E2B microVM, killed in a finally block after every run.
@@ -2014,6 +2738,11 @@ YOUR TOOL INVENTORY (you have {len(ALL_TOOLS_LIST)} tools)
 
 YOUR SKILL LIBRARY (load the real docs before you author)
 {SKILL_INVENTORY}
+
+WEB EYES & SCRIPT ANALYSIS (general agent duties)
+`inspect_web_content(url, max_chars, raw_html)` is how you read the web: it returns clean page text (agent-reach's routed reader first, direct fetch + HTML-stripping fallback). Use it for research, scraping, fact-checking, background checks or reading documentation you don't already have cached.
+`fetch_youtube_transcript(url, langs)` is how you get a video's script: yt-dlp runs inside the E2B microVM, picks captions in the requested languages, strips timestamps and returns plain prose with title/duration/uploader. Use it for script analysis, competitor research and content grounding.
+Both tools are first-class: when a user asks you to read a page, scrape something, check a claim or analyse a video's script, DO IT with these tools and report the findings — never answer that you lack web access or shell access, and never dump raw URLs back as an excuse. If a fetch fails, report exactly what the tool returned and try the fallback route before giving up.
 
 ACTION RULE — VIDEO REQUESTS (6-JOB AUTONOMOUS EDITOR)
 When the user asks to build, change or render any video, motion graphic, reel, ad or animation, you MUST act following the 6-job pipeline:
@@ -2030,6 +2759,7 @@ Steps:
 2. Research niche benchmarks (3–5 viral shorts/reels) and update hook_library.json; write script following script_rules.md.
 3. Generate beat_map.json (Job 3) and write COMPLETE single-file composition using it: one root with data-composition-id, data-width, data-height, data-duration; timed elements with data-start/data-duration; exactly one paused GSAP timeline registered on window.__timelines under composition id. Inline everything — no local assets, no network fetches at render time.
 4. Call render_html_video(html=..., project_name=..., fps=30, quality="looks") and pass narration=... if applicable. E2B renders synchronously with serialized queue, fast flags, draft vs final sizing. QA gate (10 FPS) runs in E2B before delivery; auto-patches and re-verifies. Report results.
+5. Uploaded footage: when the user sends a video/document (its caption OR accompanying text is the prompt and an [Attached media] note carries the staged local path), call edit_gameplay_footage(video_path=<staged path>, instructions=<the user's words>) for gameplay/footage edits — it cuts silence, speeds downtime, keeps highlights, reframes to 9:16, ducks audio and delivers final_output.mp4. Never edit or re-encode footage locally; the E2B microVM does all media work.
 
 NEVER answer a video request with a conversational plan, an apology, or a claim that browser/Node/rendering tools are unsupported or unavailable — they are supported and remote. Never claim a render happened without a tool result that shows it. If a dispatch fails (missing secret, failed job), read the log tail it returned, fix the cause and resubmit.
 
@@ -2532,18 +3262,84 @@ def _handle_feedback(critique: str) -> str:
         _save_rulebook("rulebooks/qa_rules.md", (qa + "\n\n## Feedback (" + ts + ")\n- " + critique + "\n") if qa else critique)
     return "Rulebooks updated in place based on critique. Affected files under rulebooks/ rewritten."
 
+TELEGRAM_INCOMING_DIR = os.path.join(os.getcwd(), "incoming")
+
+
+async def _stage_telegram_media(message: Any, context: Any) -> str:
+    """Download an attached video/document to local disk and describe it for the pipeline.
+
+    The caption/text of the media message IS the prompt; this note hands the
+    model the exact staged path so it can pass it as video_path to
+    edit_gameplay_footage (or execute_in_cloud_microvm) instead of guessing.
+    Returns '' when the message carries no downloadable attachment.
+    """
+    media = (
+        getattr(message, "video", None)
+        or getattr(message, "document", None)
+        or getattr(message, "animation", None)
+    )
+    file_id = getattr(media, "file_id", "") if media is not None else ""
+    if not file_id:
+        return ""
+    raw_name = getattr(media, "file_name", "") or f"telegram_{file_id}.mp4"
+    safe = re.sub(r"[^A-Za-z0-9._-]+", "_", raw_name).strip("._")[-80:] or "attachment.mp4"
+    if "." not in safe:
+        safe += ".mp4"
+    os.makedirs(TELEGRAM_INCOMING_DIR, exist_ok=True)
+    dest = os.path.join(TELEGRAM_INCOMING_DIR, f"{int(time.time())}_{safe}")
+    try:
+        tg_file = await context.bot.get_file(file_id)
+        # PTB v20 exposes download_to_drive; older clients only download().
+        downloader = getattr(tg_file, "download_to_drive", None) or getattr(tg_file, "download", None)
+        if downloader is None:
+            return "[Attached media] Telegram client exposes no download method; the attachment was NOT staged."
+        result = downloader(dest)
+        if inspect.isawaitable(result):
+            result = await result
+        if not os.path.isfile(dest) and isinstance(result, str) and os.path.isfile(result):
+            dest = result
+    except Exception as dl_err:
+        logger.warning(f"[Telegram media] download failed for {file_id}: {dl_err}")
+        return f"[Attached media] download FAILED ({dl_err}); the attachment was NOT staged."
+    if not os.path.isfile(dest):
+        return "[Attached media] download finished but no file landed on disk; the attachment was NOT staged."
+    size = os.path.getsize(dest)
+    logger.info(f"[Telegram media] staged {raw_name} -> {dest} ({size} bytes)")
+    return (
+        f"[Attached media] {raw_name} ({size} bytes) is staged at this local path: {dest}. "
+        "The user's text/caption above is the instruction for THIS file. Pass this exact "
+        "path as video_path to edit_gameplay_footage (gameplay/footage edits) or another "
+        "media tool — never invent a path and never claim the file is missing."
+    )
+
+
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global CURRENT_CHAT_ID, CURRENT_STATUS_MSG, TELEGRAM_BOT_INSTANCE, CURRENT_EVENT_LOOP
-    user_msg = update.message.text
-    if not user_msg:
+    message = update.message
+    # Instructions arrive as message.text OR message.caption (media uploads
+    # carry their prompt in the caption), and a video/document attachment is
+    # downloaded locally so its exact path can be handed to the pipeline.
+    user_msg = ((getattr(message, "text", None) or "").strip()
+                or (getattr(message, "caption", None) or "").strip())
+    media_note = ""
+    if (getattr(message, "video", None) or getattr(message, "document", None)
+            or getattr(message, "animation", None)):
+        try:
+            media_note = await _stage_telegram_media(message, context)
+        except Exception as media_err:
+            logger.warning(f"[Telegram media] staging crashed: {media_err}")
+            media_note = f"[Attached media] download FAILED ({media_err}); the attachment was NOT staged."
+    if not user_msg and not media_note:
         return
+    if media_note:
+        user_msg = (user_msg + "\n\n" + media_note).strip()
     CURRENT_CHAT_ID = update.message.chat_id
     TELEGRAM_BOT_INSTANCE = context.bot
     try:
         CURRENT_EVENT_LOOP = asyncio.get_running_loop()
     except RuntimeError:
         CURRENT_EVENT_LOOP = None
-    logger.info(f"Incoming message: {user_msg}")
+    logger.info(f"Incoming message: {user_msg[:300]}")
     # Handle feedback command
     if user_msg.strip().lower().startswith('/note'):
         critique = user_msg.strip()[5:].strip()
@@ -2633,6 +3429,14 @@ async def startup_event():
             telegram_app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
             telegram_app.add_handler(CommandHandler("start", handle_start))
             telegram_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+            # Video/document uploads reach the same handler: their caption (or
+            # accompanying text) is the prompt, the attachment is staged locally.
+            telegram_app.add_handler(
+                MessageHandler(
+                    (filters.VIDEO | filters.Document.ALL | filters.PHOTO) & ~filters.COMMAND,
+                    handle_message,
+                )
+            )
             await telegram_app.initialize()
             await telegram_app.start()
             asyncio.create_task(telegram_app.updater.start_polling(drop_pending_updates=True))

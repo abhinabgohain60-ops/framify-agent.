@@ -36,6 +36,16 @@ RUN npx --yes hyperframes@${HYPERFRAMES_VERSION} browser ensure \
       || echo "WARN: Chrome pre-fetch failed; the worker retries at render time"
 RUN npx --yes hyperframes@${HYPERFRAMES_VERSION} doctor || true
 
+# agent-reach installs the web/shell reachability tooling (web read backend,
+# GitHub CLI, search router); yt-dlp covers media-site metadata and transcripts.
+# Both are build-tolerant: the E2B microVM remains the primary media engine.
+RUN python3 -m pip install --break-system-packages --no-cache-dir yt-dlp \
+      "agent-reach @ https://github.com/Panniantong/agent-reach/archive/main.zip" \
+      || echo "WARN: agent-reach/yt-dlp install failed; web tools degrade"
+RUN agent-reach install --env=auto --system \
+      || agent-reach install --env=auto \
+      || echo "WARN: agent-reach env probe only"
+
 WORKDIR /app
 COPY app.py /app/app.py
 

@@ -1106,6 +1106,473 @@ check("/note handler wired", "_handle_feedback" in dir(main))
 bm = main._generate_beat_map("Hello world. How are you.", duration=4.0)
 check("beat_map has beats with timestamps", "beats" in bm and len(bm["beats"]) > 0 and "start" in bm["beats"][0] and "end" in bm["beats"][0])
 
+
+# ---------------------------- 6i. caption listening + gameplay EDL editing
+print("\n--- caption listening + gameplay edit ---")
+import tempfile
+
+# Tool registration is checked by the generic loops above; pin the workflow bits.
+check("edit_gameplay_footage is registered and described",
+      "edit_gameplay_footage" in main.TOOL_REGISTRY
+      and "edit_gameplay_footage" in main.TOOL_CAPABILITIES
+      and "`edit_gameplay_footage`" in main.SYSTEM_INSTRUCTION)
+check("the media handler registration survives",
+      "filters.VIDEO | filters.Document.ALL | filters.PHOTO" in open("main.py").read())
+
+# ---------------------------------------------------------- analysis parsing
+parsed = main._parse_gameplay_analysis(
+    "noise\nGP_ANALYSIS " + json.dumps(
+        {"duration": 60.0, "has_audio": True,
+         "silences": [[10.0, 20.0]], "moments": [[5.0, -12.0]]}))
+check("GP_ANALYSIS json is parsed from the sandbox output",
+      parsed and parsed["duration"] == 60.0 and parsed["silences"] == [[10.0, 20.0]],
+      str(parsed)[:120])
+check("garbage without GP_ANALYSIS parses to None",
+      main._parse_gameplay_analysis("ran: ffmpeg ...") is None)
+check("a zero-duration analysis is rejected",
+      main._parse_gameplay_analysis('GP_ANALYSIS {"duration": 0}') is None)
+
+# ------------------------------------------------------------- EDL planning
+edl = main._build_gameplay_edl(
+    60.0, [[10.0, 20.0]],
+    [[5.0, -12.0], [25.0, -45.0], [40.0, -10.0], [55.0, -50.0]])
+kinds = [(seg["kind"], seg["speed"]) for seg in edl]
+check("silence is cut out of the EDL",
+      not any(seg["start"] < 20.0 and seg["end"] > 10.0 and seg["end"] - seg["start"] > 10.5
+              for seg in edl), json.dumps(edl))
+check("speech and gunfire spans are kept at 1x",
+      edl[0]["kind"] == "keep" and edl[0]["speed"] == 1.0, json.dumps(edl))
+check("dead wandering is classified as downtime at the speedup rate",
+      any(seg["kind"] == "downtime" and seg["speed"] == 2.5 for seg in edl),
+      json.dumps(edl))
+check("a highlight inside an active span is preserved at 1x",
+      any(seg["kind"] == "keep" and seg["start"] >= 40.0 for seg in edl), json.dumps(edl))
+check("EDL never extends past the source duration",
+      max(seg["end"] for seg in edl) == 60.0, json.dumps(edl))
+no_audio_edl = main._build_gameplay_edl(30.0, [], [])
+check("a clip without loudness readings keeps everything at 1x",
+      len(no_audio_edl) == 1 and no_audio_edl[0]["speed"] == 1.0, json.dumps(no_audio_edl))
+everything_cut = main._build_gameplay_edl(10.0, [[0.0, 10.0]], [])
+check("a plan that would ship an empty video falls back to the whole clip",
+      len(everything_cut) == 1 and everything_cut[0]["start"] == 0.0
+      and everything_cut[0]["end"] == 10.0, json.dumps(everything_cut))
+check("atempo chains split multipliers above 2.0",
+      main._gameplay_atempo_chain(1.0) == ""
+      and main._gameplay_atempo_chain(2.5) == ",atempo=2.0,atempo=1.25"
+      and main._gameplay_atempo_chain(3.0) == ",atempo=2.0,atempo=1.5",
+      f"{main._gameplay_atempo_chain(2.5)!r} {main._gameplay_atempo_chain(3.0)!r}")
+
+# --------------------------------------------------------- render command
+rcmd = main._gameplay_render_cmd(
+    "/in.mp4", "/out.mp4", edl, framing="crop", has_audio=True)
+check("the render command trims, speeds and concats the EDL",
+      "trim=start=" in rcmd and "atempo=2.0" in rcmd and "concat=n=" in rcmd, rcmd[:200])
+check("crop framing is the centered crosshair crop to 9:16",
+      "crop=ih*9/16:ih" in rcmd and "scale=1080:1920" in rcmd, rcmd[-300:])
+check("audio is ducked with a speech-band sidechain compressor",
+      "sidechaincompress" in rcmd and "highpass=f=250,lowpass=f=3400" in rcmd, rcmd[-300:])
+check("the mux carries AAC 192k + faststart",
+      "-c:a aac -b:a 192k -ar 44100" in rcmd and "-movflags +faststart" in rcmd, rcmd[-200:])
+check("the filter graph is shell-quoted (it contains ; and brackets)",
+      "-filter_complex '" in rcmd and rcmd.count("'") % 2 == 0, rcmd[:160])
+blur_cmd = main._gameplay_render_cmd("/in.mp4", "/out.mp4", edl, framing="blur", has_audio=False)
+check("blur framing pads with a mirrored blurred background",
+      "gblur=sigma=25" in blur_cmd and "hflip" in blur_cmd and "overlay=" in blur_cmd
+      and "-an" in blur_cmd, blur_cmd[-300:])
+check("an empty EDL builds no render command",
+      main._gameplay_render_cmd("/in.mp4", "/out.mp4", []) == "")
+
+# -------------------------------------------------- loud input guardrails
+saved_e2b_key = main.E2B_API_KEY
+main.E2B_API_KEY = "test-key"
+out = main.edit_gameplay_footage("clip.mp4")
+check("a relative video_path is rejected with a staged-path hint",
+      out.startswith("[FAILED]") and "absolute local file path" in out, out[:160])
+out = main.edit_gameplay_footage("/no/such/clip.mp4")
+check("a missing source file is a loud missing-artifact failure",
+      "[FAILED] Missing artifact" in out and "does not exist" in out, out[:160])
+main.E2B_API_KEY = ""
+
+# ------------------------------------------------- caption-only turn end-to-end
+class _CapMessage:
+    def __init__(self, text=None, caption=None, video=None, document=None, animation=None):
+        self.text, self.caption = text, caption
+        self.video, self.document, self.animation = video, document, animation
+        self.chat_id = 909
+        self.replies = []
+        self.card = _Card()
+        self.card_created = False
+    async def reply_text(self, text):
+        self.replies.append(text)
+        self.card_created = self.card_created or text.startswith("Task/Project Progress")
+        return self.card
+
+
+class _CapUpdate:
+    def __init__(self, message):
+        self.message = message
+
+
+main.TELEGRAM_BOT_TOKEN = "TESTTOKEN"
+cap_msg = _CapMessage(text=None, caption="cut the dead air and make it 9:16")
+saved_reasoning4 = main.generate_reasoning_response
+captured = {}
+
+
+async def cap_reasoning(message):
+    captured["prompt"] = message
+    return "On it — editing the clip."
+
+
+main.generate_reasoning_response = cap_reasoning
+
+
+async def drive_cap():
+    await main.handle_message(_CapUpdate(cap_msg), _TgContext())
+
+
+asyncio.run(drive_cap())
+main.generate_reasoning_response = saved_reasoning4
+check("a caption-only message drives the pipeline (text OR caption)",
+      captured.get("prompt", "").startswith("cut the dead air and make it 9:16"),
+      str(captured.get("prompt"))[:120])
+
+empty_msg = _CapMessage(text=None, caption=None)
+captured.pop("prompt", None)
+
+
+async def drive_empty():
+    await main.handle_message(_CapUpdate(empty_msg), _TgContext())
+
+
+asyncio.run(drive_empty())
+check("a message with neither text nor caption nor media is ignored",
+      "prompt" not in captured, str(captured)[:80])
+
+# ------------------------------------------------ video upload staged to disk
+class _FakeTgFile:
+    def __init__(self, file_id):
+        self.file_id = file_id
+    async def download_to_drive(self, path):
+        with open(path, "wb") as f:
+            f.write(b"\x00" * 2048)
+        return path
+
+
+class _FakeBot:
+    async def get_file(self, file_id):
+        return _FakeTgFile(file_id)
+
+
+class _MediaCtx:
+    def __init__(self):
+        self.bot = _FakeBot()
+
+
+vid_msg = _CapMessage(
+    text=None, caption="turn this into a vertical highlight",
+    video=types.SimpleNamespace(file_id="VID123", file_name="gameplay clip.mp4"))
+saved_dir = main.TELEGRAM_INCOMING_DIR
+inco_tmp = tempfile.mkdtemp(prefix="tg_incoming_")
+main.TELEGRAM_INCOMING_DIR = inco_tmp
+main.generate_reasoning_response = cap_reasoning
+
+
+async def drive_video():
+    await main.handle_message(_CapUpdate(vid_msg), _MediaCtx())
+
+
+asyncio.run(drive_video())
+main.generate_reasoning_response = saved_reasoning4
+main.TELEGRAM_INCOMING_DIR = saved_dir
+prompt = captured.get("prompt", "")
+staged = [name for name in os.listdir(inco_tmp)] if os.path.isdir(inco_tmp) else []
+check("the video caption is treated as the prompt",
+      "turn this into a vertical highlight" in prompt, prompt[:160])
+check("the uploaded video is downloaded to a local path",
+      len(staged) == 1 and staged[0].endswith(".mp4"), str(staged))
+check("the staged path is handed to the pipeline",
+      any(name in prompt for name in staged) or
+      (os.path.join(inco_tmp, staged[0]) in prompt if staged else False),
+      prompt[-200:])
+check("the prompt tells the model which tool consumes the file",
+      "edit_gameplay_footage" in prompt and "video_path" in prompt, prompt[-200:])
+
+# ------------------------------------- full gameplay edit over a fake sandbox
+class _GameRun:
+    def __init__(self, cmd):
+        if "gameplay_analysis.py" in cmd:
+            self.exit_code = 0
+            self.stdout = "GP_ANALYSIS " + json.dumps(
+                {"duration": 60.0, "has_audio": True, "silences": [[10.0, 20.0]],
+                 "moments": [[5.0, -12.0], [25.0, -45.0], [40.0, -10.0], [55.0, -50.0]]})
+            self.stderr = ""
+        else:
+            self.exit_code, self.stdout, self.stderr = 0, f"ran: {cmd[:120]}", ""
+
+
+class _GameFiles:
+    def __init__(self, sbx):
+        self.sbx = sbx
+        self.written = {}
+    def write(self, path, content):
+        self.written[path] = content
+        self.sbx.written[path] = content
+    def read(self, path, format=None):
+        if path.endswith("final_output.mp4") and any(
+            "ffmpeg -y" in c and "final_output.mp4" in c for c in self.sbx.cmds):
+            return b"MP4BYTES"
+        raise FileNotFoundError(path)
+    def list(self, directory):
+        return [types.SimpleNamespace(name="video.mp4")]
+
+
+class _GameSbx:
+    def __init__(self):
+        self.cmds, self.written, self.killed = [], {}, False
+        self.files = _GameFiles(self)
+        class _Cmds:
+            def __init__(self, sbx): self.sbx = sbx
+            def run(self, cmd, timeout=0):
+                self.sbx.cmds.append(cmd)
+                return _GameRun(cmd)
+        self.commands = _Cmds(self)
+    def kill(self): self.killed = True
+
+
+src_clip = os.path.join(tempfile.mkdtemp(prefix="gp_src_"), "clip.mp4")
+with open(src_clip, "wb") as f:
+    f.write(b"\x00" * (64 * 1024))
+
+game_sbx = _GameSbx()
+game_mod = types.ModuleType("e2b_code_interpreter")
+
+
+class _GameSB:
+    @staticmethod
+    def create(api_key=None, timeout=None):
+        return game_sbx
+
+
+game_mod.Sandbox = _GameSB
+main.E2B_API_KEY = "TESTKEY"
+prev_mod = sys.modules.get("e2b_code_interpreter")
+sys.modules["e2b_code_interpreter"] = game_mod
+main.CURRENT_CHAT_ID = 911
+main.TELEGRAM_BOT_TOKEN = "TESTTOKEN"
+game_uploads = []
+
+
+def game_post(url, **kw):
+    game_uploads.append(kw.get("files", {}).get("video", ("",))[0])
+    return types.SimpleNamespace(status_code=200, text="ok")
+
+
+saved_post2 = main.requests.post
+main.requests.post = game_post
+game_report = main.edit_gameplay_footage(src_clip, instructions="keep the kills")
+main.requests.post = saved_post2
+sys.modules["e2b_code_interpreter"] = prev_mod
+main.E2B_API_KEY = saved_e2b_key
+render_cmds = [c for c in game_sbx.cmds if "ffmpeg -y" in c]
+check("the edit ran analysis inside the sandbox",
+      any("gameplay_analysis.py" in c for c in game_sbx.cmds), str(game_sbx.cmds[:2]))
+check("the EDL was persisted into the sandbox",
+      "/home/user/gameplay/edl.json" in game_sbx.written, str(list(game_sbx.written)))
+check("the rendered cut uses the planned EDL (trim/speedup/concat)",
+      render_cmds and "concat=n=4" in render_cmds[0] and "atempo=2.0" in render_cmds[0],
+      render_cmds[0][:200] if render_cmds else "no ffmpeg cmd")
+check("the report states the EDL segment plan",
+      "EDL segments: 4" in game_report, game_report[:300])
+check("the delivered cut went to Telegram as final_output.mp4",
+      game_uploads == ["final_output.mp4"] and "[SUCCESS]" in game_report,
+      f"{game_uploads} {game_report[-160:]}")
+check("the instructions were recorded in the report",
+      "instructions: keep the kills" in game_report, game_report[-200:])
+check("the gameplay sandbox is always killed", game_sbx.killed)
+
+# --------------------------------------- 9. web eyes & script ears (agent-reach)
+# inspect_web_content reads pages without leaving the brain (no subprocess, no
+# media imports); fetch_youtube_transcript runs yt-dlp inside the fake E2B
+# sandbox, exactly like the established engine tests do.
+
+check("the web-eyes tools are registered with one-line capability notes",
+      "inspect_web_content" in main.TOOL_REGISTRY
+      and "fetch_youtube_transcript" in main.TOOL_REGISTRY
+      and "inspect_web_content" in main.TOOL_CAPABILITIES
+      and "fetch_youtube_transcript" in main.TOOL_CAPABILITIES,
+      str(sorted(main.TOOL_CAPABILITIES)))
+web_schemas = {s["function"]["name"] for s in main.build_tool_schemas()}
+check("the web-eyes tools reach external providers via schema introspection",
+      {"inspect_web_content", "fetch_youtube_transcript"} <= web_schemas,
+      str(sorted(web_schemas)))
+_web_instruction = main.SYSTEM_INSTRUCTION
+check("the instruction grants the general web-research role",
+      "researcher, web scraper and script analyst" in _web_instruction
+      and "`inspect_web_content`" in _web_instruction
+      and "`fetch_youtube_transcript`" in _web_instruction)
+
+# --- inspect_web_content ------------------------------------------------------
+saved_get = main.requests.get
+try:
+    check("inspect_web_content rejects non-URLs",
+          main.inspect_web_content("not a url").startswith("[FAILED]"))
+
+    class _Res:
+        def __init__(self, status_code, text):
+            self.status_code, self.text = status_code, text
+
+    def reader_post(url, **kw):
+        if url.startswith("https://r.jina.ai/"):
+            return _Res(200, "READER TEXT of the article body. " + "Body sentence sits here. " * 14)
+        return _Res(0, "")
+
+    main.requests.get = reader_post
+    out = main.inspect_web_content("https://example.com/article")
+    check("inspect_web_content reads through the agent-reach reader route",
+          out.startswith("WEBCONTENT") and "READER TEXT" in out
+          and "source: agent-reach reader" in out, out[:200])
+
+    out = main.inspect_web_content("https://example.com/article", max_chars=205)
+    check("reader text is truncated exactly at max_chars with a TRUNCATED note",
+          len(out.split("\n\n", 1)[1]) == 205 and "TRUNCATED" in out, out[:220])
+
+    def reader_fails(url, **kw):
+        if url.startswith("https://r.jina.ai/"):
+            raise requests.RequestException("reader down")
+        return _Res(200, "<html><body><h1>Direct page</h1><p>Solid text body plus nav.</p></body></html>")
+
+    main.requests.get = reader_fails
+    out = main.inspect_web_content("https://example.com/article")
+    check("inspect_web_content falls back to a direct fetch and strips HTML",
+          "source: direct-fetch" in out and "<html" not in out
+          and "Solid text body" in out, out[:200])
+
+    def both_fail(url, **kw):
+        raise requests.RequestException("no net")
+
+    main.requests.get = both_fail
+    out = main.inspect_web_content("https://example.com/article")
+    check("a total fetch failure is reported, not invented",
+          out.startswith("[FAILED] could not read"), out[:200])
+finally:
+    main.requests.get = saved_get
+
+# --- fetch_youtube_transcript ---------------------------------------------------
+yt_sbx_cmdHist = []
+
+
+class _YtRun:
+    stdout = ""
+    stderr = ""
+    exit_code = 0
+
+
+class _YtSbx:
+    """Fake E2B sandbox shaped like the engine fakes: .files.write + .commands.run."""
+
+    def __init__(self, fail_fetch=False):
+        self.written = {}
+        self.killed = False
+        self.fail_fetch = fail_fetch
+        self.files = types.SimpleNamespace(write=self.write)
+        self.commands = types.SimpleNamespace(run=self._run)
+
+    def write(self, path, data):
+        self.written[path] = data
+
+    def _run(self, command, timeout=None):
+        yt_sbx_cmdHist.append(command)
+        out = _YtRun()
+        out.__class__ = _YtRun
+        if getattr(self, "fail_fetch", False):
+            if "ytdl_fetch.py" in command:
+                out.stdout = "ffmpeg noise\nno result here\n"
+        elif "ytdl_fetch.py" in command:
+            out.stdout = (
+                'YT_RESULT {"video_id": "dQw4w9WgXcQ", "title": "Great Talk",'
+                ' "duration": 615.0, "uploader": "Example Channel",'
+                ' "lang": "en", "chars": 39, "truncated": false, "note": ""}\n'
+                "YT_TEXT hello world from the transcript lines"
+            )
+        return out
+
+    def kill(self):
+        self.killed = True
+_yt_mod = types.ModuleType("e2b_code_interpreter")
+
+
+_yt_sbx = _YtSbx()
+
+
+class _YtSbFactory:
+    @staticmethod
+    def create(api_key=None, timeout=None):
+        return _yt_sbx
+
+
+_yt_mod.Sandbox = _YtSbFactory
+prev_web_mod = sys.modules.get("e2b_code_interpreter")
+saved_yt_key = main.E2B_API_KEY
+saved_fallback_key = main.E2B_API_KEY
+
+main.E2B_API_KEY = ""
+try:
+    check("yt-dlp needs the E2B key (it runs in the microVM, not the brain)",
+          "E2B_API_KEY is not configured"
+          in main.fetch_youtube_transcript("https://www.youtube.com/watch?v=abc"))
+finally:
+    main.E2B_API_KEY = "TESTKEY"
+
+try:
+    check("fetch_youtube_transcript rejects non-URLs",
+          main.fetch_youtube_transcript("youtube.com/watch?v=x").startswith("[FAILED]"))
+finally:
+    sys.modules["e2b_code_interpreter"] = _yt_mod
+    main.E2B_API_KEY = "TESTKEY"
+
+try:
+    rep = main.fetch_youtube_transcript(
+        "https://www.youtube.com/watch?v=dQw4w9WgXcQ", langs="en,en-US"
+    )
+    check("the transcript fetch pipes the task through a JSON file (no shell injection)",
+          any("ytdl_task.json" in w for w in _yt_sbx.written), str(list(_yt_sbx.written)))
+    check("the sandbox installs and runs yt-dlp",
+          any("pip install" in c and "yt-dlp" in c for c in yt_sbx_cmdHist), str(yt_sbx_cmdHist[:2]))
+    check("the transcript report carries title/duration/uploader metadata",
+          "TRANSCRIPT dQw4w9WgXcQ" in rep and "title: Great Talk" in rep
+          and "duration: 615.0s" in rep and "uploader: Example Channel" in rep,
+          rep[:300])
+    check("the transcript text is returned as plain prose",
+          "hello world from the transcript lines" in rep)
+    check("the yt sandbox is always killed", _yt_sbx.killed)
+finally:
+    sys.modules["e2b_code_interpreter"] = prev_web_mod
+    main.E2B_API_KEY = saved_yt_key
+
+# Failure path: no YT_RESULT/YT_ERROR in the sandbox output -> loud [FAILED] tail,
+# never a fake transcript.
+_yt_fail_sbx = _YtSbx(fail_fetch=True)
+_yt_fail_mod = types.ModuleType("e2b_code_interpreter")
+
+
+class _YtFailSbFactory:
+    @staticmethod
+    def create(api_key=None, timeout=None):
+        return _yt_fail_sbx
+
+
+_yt_fail_mod.Sandbox = _YtFailSbFactory
+main.E2B_API_KEY = "TESTKEY"
+try:
+    sys.modules["e2b_code_interpreter"] = _yt_fail_mod
+    rep = main.fetch_youtube_transcript("https://www.youtube.com/watch?v=zQw4w9WgXcQ")
+    check("an unreadable yt outcome is a loud [FAILED], never a fake transcript",
+          rep.startswith("[FAILED]"), rep[:220])
+finally:
+    sys.modules["e2b_code_interpreter"] = prev_web_mod
+    main.E2B_API_KEY = saved_yt_key
+
 print(f"\n===== {len(PASS)} passed, {len(FAIL)} failed =====")
 for f in FAIL: print("FAILED:", f)
 sys.exit(1 if FAIL else 0)
