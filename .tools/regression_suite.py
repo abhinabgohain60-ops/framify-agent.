@@ -31,21 +31,49 @@ check("hyperframes loads the router SKILL.md, not the README",
 fits_whole = main.load_skill("hyperframes", "skills/hyperframes-core/SKILL.md")
 check("a doc that fits its budget is returned whole with no marker",
       "TRUNCATED" not in fits_whole and "[chars 0-" not in fits_whole)
-check("a doc that fits is delivered in full (>20k chars)", len(out) > 20000, f"len={len(out)}")
-# The prompt library README is 90,967 chars and must page explicitly instead.
-check("an oversized doc pages with an explicit continuation hint",
+check("a live skill doc returns real content", len(out) > 500, f"len={len(out)}")
+# The prompt library README is ~91k chars and must page explicitly instead.
+check("an oversized live doc pages with an explicit continuation hint",
       "TRUNCATED" in prompts and "offset=40000" in prompts, prompts.splitlines()[1])
 
-page2 = main.load_skill("hyperframes", "skills/hyperframes/SKILL.md", offset=24000)
-check("page 2 resumes at the given offset", "[chars 24000-" in page2)
-check("page 2 content differs from page 1", page2[-800:] != out[-800:])
+# Paging is a contract of load_skill, not a property of whatever upstream ships
+# this week: upstream SKILL.md files shrink and grow, so the budget/offset logic
+# is exercised against deterministic documents instead of pinned byte counts.
+_fit_doc = "x" * 5000
+_big_doc = "".join(f"line {i:04d}\n" for i in range(3000))
+_saved_reader = main.github_read_file
 
-cli = main.load_skill("hyperframes", "skills/hyperframes-cli/SKILL.md", max_chars=6000)
-check("per-call max_chars is honoured", "[chars 0-6000 of 25961]" in cli, cli.splitlines()[1])
-cli_default = main.load_skill("hyperframes", "skills/hyperframes-cli/SKILL.md")
-check("per-skill max_chars is used when no override is given",
-      "[chars 0-24000 of 25961]" in cli_default, cli_default.splitlines()[1])
-check("prompt library reports its true size (91k)", "of 90967" in prompts, prompts.splitlines()[1])
+
+def _fake_reader(repo, path):
+    return _fit_doc if path.endswith("fit.md") else _big_doc
+
+
+main.github_read_file = _fake_reader
+try:
+    whole = main.load_skill("hyperframes", "fit.md")
+    check("a doc under budget is delivered in full with no marker",
+          whole.endswith(_fit_doc) and "TRUNCATED" not in whole and "[chars 0-" not in whole,
+          whole.splitlines()[0])
+    paged = main.load_skill("hyperframes", "big.md", max_chars=6000)
+    check("per-call max_chars is honoured",
+          paged.splitlines()[1] == f"[chars 0-6000 of {len(_big_doc)}]",
+          paged.splitlines()[1])
+    check("the paged slice is exactly max_chars long",
+          paged.endswith(_big_doc[:6000]) and not paged.endswith(_big_doc[:6001]),
+          str(len(paged)))
+    defaulted = main.load_skill("hyperframes", "big.md")
+    check("per-skill max_chars is used when no override is given",
+          defaulted.splitlines()[1] == f"[chars 0-24000 of {len(_big_doc)}]",
+          defaulted.splitlines()[1])
+    page2 = main.load_skill("hyperframes", "big.md", offset=24000)
+    check("page 2 resumes at the given offset",
+          page2.startswith("SKILL 'hyperframes'") and page2.splitlines()[1].startswith("[chars 24000-"),
+          page2.splitlines()[:2])
+    check("page 2 content differs from page 1",
+          page2.split("]\n", 1)[1] != defaulted.split("]\n", 1)[1])
+finally:
+    main.github_read_file = _saved_reader
+
 check("unknown skill is rejected cleanly", "Unknown skill" in main.load_skill("nope"))
 
 # ------------------------------------------------------------ 2. github cache
@@ -194,6 +222,14 @@ check("project slug is sanitised from 'Chintu Motion!'",
 check("render runs the real hyperframes CLI with the skill flag",
       "hyperframes@0.8.160 render . --skill=motion-graphics" in render_cmd, render_cmd)
 check("render passes fps and quality", "-f 30 -q delivery" in render_cmd, render_cmd)
+_render_timeouts = [t for c, t in s.cmds if " render " in c]
+check("the long render command carries the strict sandbox timeout",
+      _render_timeouts and _render_timeouts[0] == main.SANDBOX_RUN_TIMEOUT_SECONDS
+      and main.SANDBOX_RUN_TIMEOUT_SECONDS > 0,
+      str(_render_timeouts))
+check("the sandbox timeout is bounded by the sandbox lifetime",
+      main.SANDBOX_RUN_TIMEOUT_SECONDS <= main.SANDBOX_TIMEOUT_SECONDS,
+      f"{main.SANDBOX_RUN_TIMEOUT_SECONDS} vs {main.SANDBOX_TIMEOUT_SECONDS}")
 check("composition and project config are written",
       "/home/user/videos/chintu-motion/index.html" in s.written
       and "/home/user/videos/chintu-motion/hyperframes.json" in s.written)
@@ -610,14 +646,30 @@ check("the card never rewinds when callbacks arrive out of order",
 asyncio.run(main.update_progress_card(20, "forced reset", force=True))
 check("force allows an explicit rewind", "20%" in card.edits[-1])
 
-stage_texts = {value: text for value, text in main.PROGRESS_MILESTONES}
-check("all six directive milestones exist in order",
-      [v for v, _ in main.PROGRESS_MILESTONES] == [15, 30, 55, 80, 95, 100],
-      str([v for v, _ in main.PROGRESS_MILESTONES]))
-check("the render milestones carry the mandated wording",
-      stage_texts[55].startswith("Compiling layouts") and stage_texts[80].startswith("Headless Chromium")
-      and stage_texts[95].startswith("Finalizing MP4") and stage_texts[100] == "Complete! Video delivered.",
-      str(stage_texts))
+general_texts = {value: text for value, text in main.GENERAL_PROGRESS_MILESTONES}
+video_texts = {value: text for value, text in main.VIDEO_PROGRESS_MILESTONES}
+check("both milestone tracks cover the same six percentages",
+      [v for v, _ in main.GENERAL_PROGRESS_MILESTONES] == [15, 30, 55, 80, 95, 100]
+      and [v for v, _ in main.VIDEO_PROGRESS_MILESTONES] == [15, 30, 55, 80, 95, 100],
+      f"{[v for v, _ in main.GENERAL_PROGRESS_MILESTONES]} / "
+      f"{[v for v, _ in main.VIDEO_PROGRESS_MILESTONES]}")
+check("the general track never shows render stages",
+      general_texts[55].startswith("Executing locally")
+      and general_texts[80].startswith("Verifying results")
+      and general_texts[95].startswith("Finalizing the answer")
+      and general_texts[100] == "Task complete."
+      and "Chromium" not in str(general_texts) and "MP4" not in str(general_texts),
+      str(general_texts))
+check("the video track carries the real render stages",
+      video_texts[30].startswith("Loading video skills")
+      and video_texts[55].startswith("Compiling layouts")
+      and "E2B render engine" in video_texts[55]
+      and video_texts[80].startswith("Headless Chromium")
+      and video_texts[95].startswith("Finalizing MP4")
+      and video_texts[100] == "Complete! Video delivered.",
+      str(video_texts))
+check("the active track follows the turn route",
+      main.PROGRESS_MILESTONES is main.GENERAL_PROGRESS_MILESTONES)
 
 
 async def _beat():
@@ -673,9 +725,11 @@ saved_reasoning = main.generate_reasoning_response
 async def fake_reasoning(message):
     # Real tool calls take seconds between phases; yield so the scheduled card
     # edits run exactly as they do in production.
-    main.emit_progress(55, main.PROGRESS_MILESTONES[2][1], video=True)
+    check("a reel request is routed to the video track",
+          main.TASK_CONTEXT.get("mode") == "video", str(main.TASK_CONTEXT))
+    main.emit_progress(55, main.VIDEO_PROGRESS_MILESTONES[2][1], video=True)
     await asyncio.sleep(0.02)
-    main.emit_progress(80, main.PROGRESS_MILESTONES[3][1], video=True)
+    main.emit_progress(80, main.VIDEO_PROGRESS_MILESTONES[3][1], video=True)
     await asyncio.sleep(0.02)
     return "Rendered 270 frames."
 
@@ -866,7 +920,8 @@ check("startup and shutdown handlers are still wired",
       '@api.on_event("startup")' in source and '@api.on_event("shutdown")' in source)
 check("both telegram lifecycle functions still exist",
       "def handle_start(" in source and "def handle_message(" in source
-      and "start_polling(drop_pending_updates=True)" in source)
+      and "start_polling(drop_pending_updates=True" in source
+      and "error_callback=_on_polling_error" in source)
 check("telegram handlers are still registered",
       'CommandHandler("start", handle_start)' in source
       and "MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message)" in source)
@@ -877,18 +932,47 @@ check("multi-slot key rotation is intact", callable(main.rotate_to_next_gemini_k
       and callable(main.get_current_gemini_client))
 check("no heavy media module is imported by the render brain",
       main.BRAIN_BOUNDARY_VIOLATIONS == [], str(main.BRAIN_BOUNDARY_VIOLATIONS))
-check("the boundary auditor really detects a planted violation",
-      main.brain_boundary_violations("import PIL\nimport subprocess\n") == ["PIL", "subprocess"])
+check("the boundary auditor really detects a planted media import",
+      main.brain_boundary_violations("import PIL\nimport subprocess\nimport numpy\n")
+      == ["PIL", "numpy"])
+check("ordinary subprocess execution is allowed on the brain",
+      main.brain_boundary_violations("import subprocess\n") == [])
 check("the E2B path still guarantees a kill in finally",
       "finally:" in source and "sbx.kill()" in source)
 
 instruction = main.SYSTEM_INSTRUCTION
-check("the instruction names the distributed identity",
-      "autonomous audiovisual motion engineer" in instruction)
+check("the instruction names the general software-agent identity",
+      "general-purpose software engineer and automation agent" in instruction
+      and "Do NOT refuse coding tasks" in instruction,
+      instruction[:220])
+check("the hardcoded motion-engineer persona is gone",
+      "audiovisual motion engineer" not in instruction
+      and "motion designer" not in instruction
+      and "6-JOB" not in instruction and "6-job" not in instruction,
+      instruction[:220])
+check("video work is explicitly conditional on a user request",
+      "ONLY ON AN EXPLICIT REQUEST" in instruction
+      and "Never dispatch a coding, scraping, analysis or automation request" in instruction)
+_persona_phrases = (
+    "audiovisual motion engineer", "motion designer",
+    "6-job", "6-job pipeline", "hyperframes/gsap/remotion specialist",
+)
+_persona_files = ["main.py", "ARCHITECTURE.md"] + [
+    os.path.join("rulebooks", name)
+    for name in sorted(os.listdir("rulebooks"))
+    if name.endswith((".md", ".json"))
+]
+_persona_hits = []
+for _path in _persona_files:
+    _body = open(_path, encoding="utf-8").read().lower()
+    _persona_hits += [f"{_path}:{phrase}" for phrase in _persona_phrases if phrase in _body]
+check("no prompt, architecture doc or rulebook carries the motion persona",
+      not _persona_hits, str(_persona_hits))
 check("the instruction states the Render brain memory budget",
       "512 MB" in instruction and "Render brain" in instruction)
 check("the instruction forbids local rendering outright",
-      "NEVER render video locally" in instruction and "Pillow frame buffers" in instruction)
+      "must NEVER do locally" in instruction and "Pillow frame buffers" in instruction
+      and "no Playwright/Chromium launch" in instruction)
 check("the instruction names the E2B-only engine after the HF retirement",
       "E2B microVM" in instruction and "RETIRED" in instruction)
 check("the instruction forbids claiming tools are unsupported",
@@ -928,9 +1012,10 @@ print("\n--- external fallback tool loop ---")
 import logging
 
 CRITICAL_LINE = (
-    "CRITICAL: Do not dump skill markdown or READMEs to the user. "
-    "Inspect skills concisely, generate the HTML/CSS/GSAP composition, and call "
-    "`render_html_video` immediately to produce and deliver the video."
+    "CRITICAL: Do not dump skill markdown, READMEs or file contents to the user. "
+    "Do the requested work with the available tools — run code locally, read pages, "
+    "or call a video tool only if the user explicitly asked for a video — then answer "
+    "concisely with what actually happened."
 )
 check("the external fallback allows 12 tool rounds", main.EXTERNAL_MAX_TOOL_ROUNDS == 12,
       str(main.EXTERNAL_MAX_TOOL_ROUNDS))
@@ -1027,8 +1112,8 @@ main.generate_reasoning_response = saved_reasoning2
 main.requests.post = real_post
 f_card = "\n".join(f_update.message.card.edits)
 main.logger.removeHandler(err_cap)
-check("the failure turn logs an error about ending with no video",
-      any("ending with NO video produced" in r for r in err_cap.records),
+check("the failure turn logs an error about the failed ending",
+      any("ending failed" in r for r in err_cap.records),
       str(err_cap.records[-2:])[:200])
 check("the ceiling turn's card shows the honest failure stage",
       "Stopped — no video produced" in f_card, f_card[-200:])
@@ -1077,13 +1162,17 @@ src = open("main.py").read()
 check("@api.get(\"/health\") present", '@api.get("/health")' in src)
 check("render webhook present", '@api.post("/render-webhook")' in src)
 check("telemetry listener present", '@api.post("/telemetry-error")' in src)
-check("telegram polling present", "start_polling(drop_pending_updates=True)" in src)
+check("telegram polling present with a loud conflict callback",
+      "start_polling(drop_pending_updates=True" in src
+      and "error_callback=_on_polling_error" in src)
 check("15% progress card present", "15%" in src)
 check("100% completion card present", "100%" in src)
 check("every declared tool is in the runtime registry",
       set(main.TOOL_REGISTRY) == {f.__name__ for f in main.ALL_TOOLS_LIST})
 check("the render and preflight tools are exposed to the model",
       {"render_html_video", "execute_in_cloud_microvm"} <= set(main.TOOL_REGISTRY))
+check("the local executors are exposed to the model",
+      {"run_local_command", "run_local_python"} <= set(main.TOOL_REGISTRY))
 health = main.health_check()
 check("health reports the E2B primary and the HF retirement notice",
       health["render_backends"]["primary"] == "e2b_sandbox"
@@ -1096,11 +1185,11 @@ check("health still reports the tool count", health["tools_count"] == len(main.A
 check("no literal credential values committed",
       not any(k in src for k in ["Bearer sk-", "AIza", "sk-or-v1-"]))
 
-# 6-job editor contracts
+# video production contracts (used only on an explicit video request)
 check("rulebooks directory exists", os.path.isdir("rulebooks"))
 for rb in ["rulebooks/script_rules.md", "rulebooks/visual_rules.md", "rulebooks/audio_rules.md", "rulebooks/qa_rules.md", "rulebooks/hook_library.json"]:
     check(f"{rb} exists", os.path.exists(rb))
-check("helpers for 6-job pipeline exist",
+check("video production helpers exist (beat map, hooks, whisper, QA, queue)",
       all(hasattr(main, fn) for fn in ["_generate_beat_map", "_research_hooks", "_process_whisper_timestamps", "_qa_10fps_check", "_serialize_render_queue"]))
 check("/note handler wired", "_handle_feedback" in dir(main))
 bm = main._generate_beat_map("Hello world. How are you.", duration=4.0)
@@ -1572,6 +1661,365 @@ try:
 finally:
     sys.modules["e2b_code_interpreter"] = prev_web_mod
     main.E2B_API_KEY = saved_yt_key
+
+
+# ------------------------------- 10. general-agent routing + local execution
+print("\n--- task routing + local execution ---")
+import time
+
+_turn_instruction = main.SYSTEM_INSTRUCTION
+check("the instruction states the general-agent duties",
+      "general-purpose software engineer and automation agent" in _turn_instruction
+      and "`run_local_command`" in _turn_instruction
+      and "`run_local_python`" in _turn_instruction)
+check("the fallback directive is general-purpose, not video-only",
+      "render_html_video" not in main.FALLBACK_TOOL_ROUND_DIRECTIVE
+      and "Do the requested work" in main.FALLBACK_TOOL_ROUND_DIRECTIVE,
+      main.FALLBACK_TOOL_ROUND_DIRECTIVE[:160])
+
+routing_cases = [
+    ("write a python script that parses csv files", "general"),
+    ("refactor main.py and run the test suite", "general"),
+    ("scrape example.com and summarise the article", "general"),
+    ("build me a landing page with tailwind", "general"),
+    ("start a dev server on port 3000", "general"),
+    ("make me a 9:16 reel about espresso", "video"),
+    ("render a 1080x1920 animation", "video"),
+    ("edit this gameplay footage into a vertical cut", "video"),
+]
+for _prompt, _expected in routing_cases:
+    check(f"classify_task routes {_prompt[:34]!r} to {_expected}",
+          main.classify_task(_prompt) == _expected, main.classify_task(_prompt))
+check("an uploaded clip routes to video even with a terse caption",
+      main.classify_task("fix this", has_video_media=True) == "video")
+check("ambiguous words alone do not route to video",
+      main.classify_task("print the shortest path through the graph") == "general",
+      main.classify_task("print the shortest path through the graph"))
+
+# ---------------------------------------------------------- dispatch guard
+_saved_mode = dict(main.TASK_CONTEXT)
+_saved_router_key = main.E2B_API_KEY
+try:
+    main.E2B_API_KEY = "TESTKEY"
+    main.TASK_CONTEXT.update(active=True, mode="general", blocked_dispatches=0)
+    blocked_render = main.render_html_video("<html></html>")
+    check("a general turn cannot dispatch the video renderer",
+          blocked_render.startswith("[ROUTED]"), blocked_render[:180])
+    blocked_edit = main.edit_gameplay_footage("/tmp/staged-clip.mp4", "edit it")
+    check("a general turn cannot dispatch the footage editor",
+          blocked_edit.startswith("[ROUTED]"), blocked_edit[:180])
+    check("the router counts the blocked dispatches",
+          main.TASK_CONTEXT.get("blocked_dispatches") == 2,
+          str(main.TASK_CONTEXT.get("blocked_dispatches")))
+    main.TASK_CONTEXT.update(active=True, mode="video", blocked_dispatches=0)
+    video_pass = main.render_html_video("<html></html>")
+    check("a video turn reaches the renderer's own validation, not the router",
+          video_pass.startswith("Composition rejected"), video_pass[:180])
+finally:
+    main.TASK_CONTEXT.update(
+        active=_saved_mode["active"], mode=_saved_mode["mode"], blocked_dispatches=0
+    )
+    main.E2B_API_KEY = _saved_router_key
+
+# ------------------------------------------------------------ local commands
+local_out = main.run_local_command("printf 'hello-local'")
+check("run_local_command executes locally and reports exit 0",
+      "LOCAL-CMD exit=0" in local_out and "hello-local" in local_out, local_out[:220])
+local_err = main.run_local_command("echo oops >&2; exit 3")
+check("run_local_command reports the real exit code and stderr",
+      "exit=3" in local_err and "oops" in local_err, local_err[:220])
+local_to = main.run_local_command("sleep 5", timeout=1)
+check("a foreground command is killed at its timeout",
+      local_to.startswith("[FAILED]") and "timed out after 1s" in local_to, local_to[:220])
+check("an empty command is rejected",
+      main.run_local_command("").startswith("[FAILED]"))
+check("a nonexistent cwd is rejected",
+      main.run_local_command("pwd", cwd="/definitely/not/here").startswith("[FAILED]"))
+
+bg_out = main.run_local_command("sleep 0.4; echo done-bg", background=True)
+check("background commands return a pid and log path immediately",
+      "LOCAL-BG started pid=" in bg_out and "log:" in bg_out, bg_out[:220])
+_bg_pid = int(re.search(r"pid=(\d+)", bg_out).group(1))
+_bg_log = re.search(r"log: (\S+)", bg_out).group(1)
+_deadline = time.time() + 10
+_bg_body = ""
+while time.time() < _deadline:
+    if os.path.exists(_bg_log):
+        _bg_body = open(_bg_log, encoding="utf-8", errors="replace").read()
+        if "done-bg" in _bg_body:
+            break
+    time.sleep(0.1)
+check("the detached process keeps running and writes to its log",
+      "done-bg" in _bg_body, _bg_body[:200])
+main.BACKGROUND_TASKS.pop(_bg_pid, None)
+
+py_out = main.run_local_python("print(2 + 2)\nimport sys; print(sys.version_info[0])")
+check("run_local_python executes code in this container",
+      "LOCAL-PY exit=0" in py_out and "4" in py_out, py_out[:220])
+py_exit = main.run_local_python("raise SystemExit(7)")
+check("run_local_python surfaces the child exit code",
+      "LOCAL-PY exit=7" in py_exit, py_exit[:220])
+py_to = main.run_local_python("import time; time.sleep(5)", timeout=1)
+check("a Python snippet is killed at its timeout",
+      py_to.startswith("[FAILED]") and "timed out after 1s" in py_to, py_to[:220])
+
+# ------------------------------------------------- general turn end-to-end
+route_update = _TgUpdate("write a python script that renames the csv files")
+_saved_reasoning_general = main.generate_reasoning_response
+_observed_modes = []
+
+
+async def general_reasoning(message):
+    _observed_modes.append(main.TASK_CONTEXT.get("mode"))
+    main.emit_progress(55, main.GENERAL_PROGRESS_MILESTONES[2][1])
+    await asyncio.sleep(0.02)
+    main.emit_progress(80, main.GENERAL_PROGRESS_MILESTONES[3][1])
+    await asyncio.sleep(0.02)
+    return "Renamed 12 files."
+
+
+main.generate_reasoning_response = general_reasoning
+try:
+    asyncio.run(main.handle_message(route_update, _TgContext()))
+finally:
+    main.generate_reasoning_response = _saved_reasoning_general
+_general_card = "\n".join(route_update.message.card.edits)
+check("a coding request runs as a general turn",
+      _observed_modes == ["general"], str(_observed_modes))
+check("the general card shows local-execution stages, never render stages",
+      "Executing locally" in _general_card and "Verifying results" in _general_card
+      and "Compiling layouts" not in _general_card
+      and "Headless Chromium" not in _general_card,
+      _general_card[-260:])
+check("the general turn finishes at 100% Task complete, not a video claim",
+      "100%" in _general_card and "Task complete." in _general_card
+      and "Complete! Video delivered." not in _general_card, _general_card[-200:])
+check("the route is cleared when the turn ends", main.TASK_CONTEXT.get("active") is False)
+
+# A PDF (or any non-video attachment) with a general caption must stay general even
+# though the staging note handed to the model mentions video_path/ gameplay tools.
+class _PdfDoc:
+    file_id = "pdf-1"
+    file_name = "report.pdf"
+
+
+class _PdfMessage:
+    def __init__(self):
+        self.text = None
+        self.caption = "summarise this report"
+        self.chat_id = 99
+        self.video = None
+        self.document = _PdfDoc()
+        self.animation = None
+        self.replies = []
+        self.card = _Card()
+        self.card_created = False
+
+    async def reply_text(self, text):
+        self.replies.append(text)
+        self.card_created = self.card_created or text.startswith("Task/Project Progress")
+        return self.card
+
+
+class _PdfUpdate:
+    def __init__(self):
+        self.message = _PdfMessage()
+
+
+_saved_stager = main._stage_telegram_media
+_saved_reasoning_pdf = main.generate_reasoning_response
+_pdf_modes = []
+
+
+async def _fake_stager(message, context):
+    return (
+        "[Attached media] report.pdf is staged at /tmp/report.pdf. Pass this exact "
+        "path as video_path to edit_gameplay_footage (gameplay/footage edits)."
+    )
+
+
+async def _pdf_reasoning(message):
+    _pdf_modes.append(main.TASK_CONTEXT.get("mode"))
+    return "Here is the summary."
+
+
+main._stage_telegram_media = _fake_stager
+main.generate_reasoning_response = _pdf_reasoning
+try:
+    asyncio.run(main.handle_message(_PdfUpdate(), _TgContext()))
+finally:
+    main._stage_telegram_media = _saved_stager
+    main.generate_reasoning_response = _saved_reasoning_pdf
+check("a non-video document with a general caption stays general",
+      _pdf_modes == ["general"], str(_pdf_modes))
+
+
+# ------------------------------------------------ failure reporting contract
+class _NotifyBot:
+    def __init__(self):
+        self.sent = []
+
+    async def send_message(self, chat_id=None, text=""):
+        self.sent.append((chat_id, text))
+        return None
+
+
+async def _failure_case():
+    loop = asyncio.get_running_loop()
+    main.CURRENT_EVENT_LOOP = loop
+    main.CURRENT_CHAT_ID = 4242
+    main.CURRENT_STATUS_MSG = _Card()
+    _bot = _NotifyBot()
+    main.TELEGRAM_BOT_INSTANCE = _bot
+    main.reset_progress()
+    main.PROGRESS_STATE.update(percent=55, stage="Executing locally (code, shell, files)...")
+
+    def worker():
+        try:
+            raise RuntimeError("microVM exploded (exit 137)")
+        except RuntimeError as dispatch_err:
+            return main.report_dispatch_failure("render_html_video", dispatch_err)
+
+    result = await asyncio.to_thread(worker)
+    await asyncio.sleep(0.1)
+    return result, _bot.sent, main.CURRENT_STATUS_MSG.edits
+
+
+_fail_text, _fail_sent, _fail_edits = asyncio.run(_failure_case())
+check("a dispatch failure returns the real error log to the model",
+      _fail_text.startswith("[FAILED] render_html_video failed: RuntimeError")
+      and "microVM exploded (exit 137)" in _fail_text, _fail_text[:200])
+check("the failure is pushed to the Telegram chat immediately",
+      bool(_fail_sent) and "microVM exploded" in _fail_sent[0][1]
+      and _fail_sent[0][0] == 4242, str(_fail_sent)[:200])
+check("the progress card freezes on an explicit failure stage",
+      _fail_edits and "Failed — render_html_video failed" in _fail_edits[-1],
+      str(_fail_edits[-2:])[:220])
+check("the failure flags the turn so it cannot claim completion",
+      "render_html_video failed" in str(main.PROGRESS_STATE.get("turn_failed")),
+      str(main.PROGRESS_STATE.get("turn_failed")))
+check("the failure never posts a 100% completion card",
+      all("100%" not in edit for edit in _fail_edits), str(_fail_edits)[:200])
+
+main.TELEGRAM_BOT_INSTANCE = None
+main.CURRENT_CHAT_ID = None
+main.CURRENT_STATUS_MSG = None
+main.PROGRESS_STATE["turn_failed"] = ""
+
+class _PollingConflict(Exception):
+    pass
+
+
+class _PollLogCapture(logging.Handler):
+    def __init__(self):
+        super().__init__()
+        self.records = []
+
+    def emit(self, record):
+        self.records.append(record.getMessage())
+
+
+_poll_capture = _PollLogCapture()
+main.logger.addHandler(_poll_capture)
+try:
+    asyncio.run(main._on_polling_error(
+        _PollingConflict("Conflict: terminated by other getUpdates request")
+    ))
+finally:
+    main.logger.removeHandler(_poll_capture)
+check("a duplicate getUpdates poller is reported as an operator error",
+      any("getUpdates CONFLICT" in r and "another process" in r for r in _poll_capture.records),
+      str(_poll_capture.records[-1:])[:200])
+
+
+# ------------------------------------------- 11. telegram listener lifecycle
+print("\n--- telegram listener lifecycle ---")
+_saved_builder = main.ApplicationBuilder
+_saved_token = main.TELEGRAM_BOT_TOKEN
+_saved_app = main.telegram_app
+
+
+class _FakeUpdater:
+    def __init__(self):
+        self.polling_kwargs = []
+        self.stopped = False
+
+    async def start_polling(self, **kwargs):
+        self.polling_kwargs.append(kwargs)
+
+    async def stop(self):
+        self.stopped = True
+
+
+class _FakeTelegramApp:
+    def __init__(self):
+        self.handlers = []
+        self.initialized = False
+        self.started = False
+        self.stopped = False
+        self.shut = False
+        self.updater = _FakeUpdater()
+        self.bot = object()
+
+    def add_handler(self, handler):
+        self.handlers.append(handler)
+
+    async def initialize(self):
+        self.initialized = True
+
+    async def start(self):
+        self.started = True
+
+    async def stop(self):
+        self.stopped = True
+
+    async def shutdown(self):
+        self.shut = True
+
+
+class _FakeBuilder:
+    def __init__(self):
+        self.app = _FakeTelegramApp()
+
+    def token(self, *args, **kwargs):
+        return self
+
+    def build(self):
+        return self.app
+
+
+_startup_builder = _FakeBuilder()
+main.ApplicationBuilder = lambda: _startup_builder
+main.TELEGRAM_BOT_TOKEN = "TESTTOKEN"
+
+async def _startup_case():
+    await main.startup_event()
+    await asyncio.sleep(0.05)
+
+
+asyncio.run(_startup_case())
+_started_app = main.telegram_app
+check("the listener initializes, starts and registers its handlers cleanly",
+      _started_app is _startup_builder.app
+      and _started_app.initialized and _started_app.started
+      and len(_started_app.handlers) == 3,
+      f"handlers={len(_started_app.handlers)}")
+check("one poller is started with pending updates dropped",
+      len(_started_app.updater.polling_kwargs) == 1
+      and _started_app.updater.polling_kwargs[0].get("drop_pending_updates") is True,
+      str(_started_app.updater.polling_kwargs))
+check("the poller carries the conflict/error callback",
+      callable(_started_app.updater.polling_kwargs[0].get("error_callback")),
+      str(_started_app.updater.polling_kwargs))
+
+try:
+    asyncio.run(main.shutdown_event())
+finally:
+    main.ApplicationBuilder = _saved_builder
+    main.TELEGRAM_BOT_TOKEN = _saved_token
+    main.telegram_app = _saved_app
+check("shutdown stops the updater and the application without raising",
+      _started_app.updater.stopped and _started_app.stopped and _started_app.shut)
 
 print(f"\n===== {len(PASS)} passed, {len(FAIL)} failed =====")
 for f in FAIL: print("FAILED:", f)

@@ -1,20 +1,52 @@
 # Chintu — architecture
 
-Chintu is a distributed agent, not a monolith. The process that answers Telegram is
-deliberately too small to render anything; the hardware that renders is deliberately
-ephemeral and disposable.
+Chintu is an autonomous, general-purpose software and automation agent. It executes
+code, builds applications, runs background tasks, processes data and researches the
+web; video/motion rendering is one capability it reaches for only when the user asks
+for it. The process that answers Telegram is deliberately small, and the hardware
+that renders video is deliberately ephemeral and disposable.
 
 ## 1. Brain vs. engine
 
-| | Render brain (`main.py`) | Render engine (E2B microVM) |
+| | Brain (`main.py`) | Render engine (E2B microVM) |
 | --- | --- | --- |
 | Hardware | ~512 MB service | isolated disposable sandbox (FFmpeg + Chromium-capable) |
-| Owns | FastAPI, Telegram lifecycle, status card, tool routing, LLM orchestration | layout evaluation, headless Chromium, GSAP scrubbing, frame buffers, FFmpeg, voice-over muxing |
-| Must never | import Pillow/NumPy/Playwright/spawn FFmpeg | answer Telegram or hold chat state |
+| Owns | FastAPI, Telegram lifecycle, status card, task routing, LLM orchestration, **local command/script execution** | layout evaluation, headless Chromium, GSAP scrubbing, frame buffers, FFmpeg, voice-over muxing |
+| Must never | import Pillow/NumPy/Playwright or run a local FFmpeg render loop | answer Telegram or hold chat state |
 
 `brain_boundary_violations()` parses `main.py` at startup and logs an error if any
-heavy-media module appears in its import graph. It is asserted empty in the suite,
-and the auditor itself is tested against a planted `import PIL` / `import subprocess`.
+media module appears in its import graph. It is asserted empty in the suite, and the
+auditor itself is tested against a planted `import PIL`. `subprocess` is intentionally
+allowed: ordinary shell/Python work runs on the brain (see §1a), while the media
+import guard is what keeps local rendering impossible.
+
+### 1a. Task routing and local execution
+
+Every Telegram turn is classified before any tool runs, and `TASK_CONTEXT` is the
+single source of truth for the rest of the turn:
+
+| Mode | Chosen when | Effect |
+| --- | --- | --- |
+| `video` | the request contains explicit video vocabulary (`render`, `reel`, `mp4`, `footage`, `9:16`, …) or carries an uploaded clip | `render_html_video` / `edit_gameplay_footage` may run, and the video milestone track is used |
+| `general` | everything else — code, shell, data, research, web builds | the video tools return a `[ROUTED]` notice without touching E2B, and the general milestone track is used |
+
+`video_dispatch_block()` is the hard guard inside the video tools. It is what stops an
+arbitrary prompt, script or command from being pushed into the render pipeline (the
+ghost-progress bug): a non-video turn can never dispatch a render, however the model
+phrases its tool call.
+
+General work is executed locally with `run_local_command` (`bash -lc`, hard timeout,
+default 120 s, maximum 600 s) or `run_local_python` (child interpreter, same budget).
+Anything long-running must use `run_local_command(..., background=True)`, which starts
+the process in its own session with stdin closed and stdout/stderr redirected to
+`local_tasks/<id>.log`; the call returns immediately with the PID and log path, so the
+Telegram polling listener never blocks. `execute_in_cloud_microvm` stays available as
+an isolated throwaway sandbox but is no longer the default executor.
+
+When an external dispatch raises or times out, `report_dispatch_failure()` pushes the
+real error log to the chat immediately, freezes the progress card on a `Failed — …`
+stage, flags `PROGRESS_STATE["turn_failed"]`, and returns the same `[FAILED]` text to
+the model, so a stalled percentage can never be mistaken for progress.
 
 Transport: the composition is written into the sandbox over the file API and
 rendered synchronously with the real `hyperframes` CLI; the finished MP4 is read
@@ -77,9 +109,9 @@ before anything is uploaded. Delivery rules:
    `cohere/north-mini-code:free` (all verified against the live OpenRouter catalog
    so a rate-limited cascade never hits a 404), 600 s per request, up to 12 tool rounds.
    Every external session carries `FALLBACK_TOOL_ROUND_DIRECTIVE` as a second system
-   message: *CRITICAL: Do not dump skill markdown or READMEs to the user. Inspect
-   skills concisely, generate the HTML/CSS/GSAP composition, and call
-   `render_html_video` immediately to produce and deliver the video.*
+   message, which forbids dumping docs and tells the model to do the requested work
+   with the tools — running code locally, reading pages, or calling a video tool only
+   when the user explicitly asked for a video.
 3. Freebuff (OpenAI-compatible) as the last resort.
 
 If a provider still exhausts the 12-round ceiling, it returns the
@@ -93,25 +125,42 @@ of failovers; `/health` exposes it.
 
 `update_progress_card(percent, stage)` edits the bound Telegram message and is
 monotonic: out-of-order tool callbacks can never rewind the bar. Milestones are
-emitted by the phase that reaches them:
+emitted by the phase that reaches them, on the track selected by the turn's route.
+
+General track (`GENERAL_PROGRESS_MILESTONES`, the default):
 
 | % | Stage |
 | --- | --- |
 | 15 | Initializing reasoning & tool pipeline... |
-| 30 | Loading motion skills & synthesizing voiceover... |
-| 55 | Compiling layouts & dispatching to 16 GB worker... |
+| 30 | Planning the task & loading references... |
+| 55 | Executing locally (code, shell, files)... |
+| 80 | Verifying results & running checks... |
+| 95 | Finalizing the answer... |
+| 100 | Task complete. |
+
+Video track (`VIDEO_PROGRESS_MILESTONES`, only when the turn was routed to video):
+
+| % | Stage |
+| --- | --- |
+| 15 | Initializing reasoning & tool pipeline... |
+| 30 | Loading video skills & synthesizing voiceover... |
+| 55 | Compiling layouts & dispatching to the E2B render engine... |
 | 80 | Headless Chromium / FFmpeg rendering frames... |
 | 95 | Finalizing MP4 muxing & binary upload... |
 | 100 | Complete! Video delivered. |
 
 `progress_heartbeat()` advances the bar inside the current phase every 15 s, so a long
-reasoning or render call never leaves the card frozen. Every milestone is also appended
-to `PROGRESS_STATE["history"]` synchronously, so a phase cannot be lost between loop ticks.
+reasoning or dispatch call never leaves the card frozen. Every milestone is also
+appended to `PROGRESS_STATE["history"]` synchronously, so a phase cannot be lost
+between loop ticks.
 
 The forced 100% "Complete! Video delivered." card is reserved for turns that actually
 produced a video. A turn that ends with `PROGRESS_STATE["turn_failed"]` set (tool-round
-ceiling, reasoning pipeline error) logs the error and finishes the card with
-`Stopped — no video produced (...)` at its held percentage instead.
+ceiling, dispatch error, reasoning timeout) logs the error and finishes the card at its
+held percentage with `Stopped — no video produced (...)` on a video turn and
+`Stopped — task failed (...)` on a general turn. The whole reasoning phase is bounded by
+`REASONING_TIMEOUT_SECONDS` (default 900 s) so a hung provider call cannot park the card
+mid-percentage.
 
 ## 4. Environment
 
@@ -123,6 +172,8 @@ ceiling, reasoning pipeline error) logs the error and finishes the card with
 | `GEMINI_API_KEY[_2/_3]` | Render | Gemini pool |
 | `OPENROUTER_API_KEY` | Render | frontier fallback |
 | `TELEGRAM_BOT_TOKEN` | Render | chat transport |
+| `REASONING_TIMEOUT_SECONDS` | Render | hard ceiling for one turn's reasoning phase (default 900) |
+| `LOCAL_EXEC_TIMEOUT` | Render | default timeout for a foreground `run_local_command` (default 120) |
 
 `HF_TOKEN` remains only for `huggingface_task_runner` (model inference, not rendering).
 
@@ -142,7 +193,11 @@ the failover cascade.
   retirement notices for `backend='space'/'huggingface'/'jobs'` with no HTTP call,
 - OpenRouter cascade order (the verified free models), JSON tool schemas, tool
   execution and provider telemetry,
-- progress card monotonicity, heartbeat, and a full simulated Telegram turn,
+- task routing: general prompts never dispatch video tools, video prompts do,
+- local execution: foreground timeout, detached background log, Python snippets,
+- dispatch failures surface the real log and freeze the card on a failure stage,
+- progress card monotonicity, heartbeat, and full simulated Telegram turns on both
+  the general and the video track,
 - the archived Space worker still parses and runs standalone (reference code).
 
 ```bash

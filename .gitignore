@@ -11,3 +11,6 @@ venv/
 # Rendered video output
 renders/
 *.mp4
+
+# Detached local task logs (run_local_command background)
+local_tasks/

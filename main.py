@@ -6,9 +6,9 @@ import json
 import logging
 import asyncio
 import inspect
-import io
 import re
 import contextlib
+import subprocess
 import time
 import traceback
 from datetime import datetime
@@ -59,6 +59,9 @@ OPENROUTER_MODELS: List[str] = [
 ]
 EXTERNAL_REQUEST_TIMEOUT = 600
 EXTERNAL_MAX_TOOL_ROUNDS = 12
+# Hard ceiling for one Telegram turn's reasoning phase. Without it a hung
+# provider call leaves the progress card parked mid-percentage forever.
+REASONING_TIMEOUT_SECONDS = int(os.environ.get("REASONING_TIMEOUT_SECONDS", "900"))
 FREEBUFF_API_KEY = os.environ.get("FREEBUFF_API_KEY", "")
 FREEBUFF_BASE_URL = os.environ.get("FREEBUFF_BASE_URL", "https://api.freebuff.com/v1")
 DEFAULT_REPO = os.environ.get("DEFAULT_REPO", "abhinabgohain60-ops/framify-agent.")
@@ -353,13 +356,19 @@ TELEGRAM_BOT_INSTANCE = None
 CURRENT_EVENT_LOOP: Optional[asyncio.AbstractEventLoop] = None
 
 # --------------------------------------------------------- render-brain boundary
-# Render runs on ~512 MB. It hosts the API, the Telegram lifecycle, the status
-# card, tool routing and LLM orchestration — and nothing else. Frame buffers,
-# headless Chromium and FFmpeg belong to the E2B microVM render engine, so
-# importing any of these locally is an operational defect, not a style choice.
+# The brain runs on ~512 MB. It hosts the API, the Telegram lifecycle, the status
+# card, tool routing, LLM orchestration and ordinary local execution (Python,
+# bash, git, builds, data work). Frame buffers, headless Chromium and FFmpeg
+# render loops belong to the E2B microVM render engine, so importing the media
+# stack locally is an operational defect, not a style choice.
+#
+# `subprocess` is deliberately NOT in this list any more: general command and
+# script execution is a first-class product requirement (see run_local_command /
+# run_local_python), so the brain may spawn ordinary processes. The media guard
+# stays import-based, which is what actually keeps local rendering impossible.
 LOCAL_MEDIA_IMPORTS = (
     "PIL", "playwright", "moviepy", "cv2", "imageio",
-    "numpy", "matplotlib", "subprocess", "ffmpeg",
+    "numpy", "matplotlib", "ffmpeg",
 )
 
 
@@ -412,19 +421,102 @@ def record_provider(provider: str, model: str) -> None:
     logger.info(f"[Provider] served by {provider} model={model}")
 
 
+# ------------------------------------------------------------- task routing
+# Chintu serves BOTH general software work and (on request) video renders. The
+# route is decided from the user's own words before any tool runs, so an
+# arbitrary prompt/script/command can never drift into the E2B video pipeline,
+# while an explicit render request still reaches it. TASK_CONTEXT is the single
+# source of truth: the progress card, the video-tool guard and the endgame read it.
+VIDEO_TASK_KEYWORDS = (
+    "render", "re-render", "rerender", "video", "videos", "reel", "reels",
+    "shorts", "mp4", "animation", "animate", "animated", "motion graphic",
+    "motion graphics", "kinetic typography", "b-roll", "footage", "gameplay",
+    "montage", "storyboard", "voiceover", "voice-over", "hyperframes",
+    "remotion", "9:16", "1080x1920", "vertical cut", "edit this clip",
+    "cut this clip",
+)
+VIDEO_MEDIA_SUFFIXES = (
+    ".mp4", ".mov", ".mkv", ".webm", ".avi", ".m4v", ".mpeg", ".mpg", ".gif",
+)
+# A bare "clip" or "short" is not enough: those words are everywhere in ordinary
+# coding requests, and a false positive used to mean an E2B dispatch nobody asked
+# for. Only explicit video vocabulary (or an uploaded clip) routes to video.
+TASK_CONTEXT: Dict[str, Any] = {
+    "active": False,
+    "mode": "general",
+    "prompt": "",
+    "has_video_media": False,
+    "blocked_dispatches": 0,
+    "started": 0.0,
+}
+
+
+def classify_task(prompt: str, has_video_media: bool = False) -> str:
+    """Return 'video' only when the request is actually about video work.
+
+    'video' is a permission, not an obligation: it lets the render tools run, but
+    the instruction still only calls them when the user asked for a video. Every
+    other request is 'general' — code, shell, data, web builds, research.
+    """
+    text = f" {(prompt or '').lower()} "
+    if any(keyword in text for keyword in VIDEO_TASK_KEYWORDS):
+        return "video"
+    if has_video_media:
+        # An uploaded clip plus a caption is itself a footage-edit request.
+        return "video"
+    return "general"
+
+
+def video_dispatch_block(tool_name: str) -> str:
+    """Return a routing notice when a video tool is called on a non-video turn.
+
+    This is the dispatch guard behind the ghost-progress bug: prompts, scripts
+    and commands that merely mentioned a word like "render" used to be pushed
+    into the E2B video pipeline by default and then stall on render milestones.
+    """
+    if not TASK_CONTEXT.get("active"):
+        # No turn in progress (direct tool use / tests): nothing to guard.
+        return ""
+    if TASK_CONTEXT.get("mode") == "video":
+        return ""
+    TASK_CONTEXT["blocked_dispatches"] = int(TASK_CONTEXT.get("blocked_dispatches") or 0) + 1
+    logger.warning(
+        f"[Routing] blocked {tool_name} on a general task; local execution required."
+    )
+    return (
+        f"[ROUTED] {tool_name} is the video render pipeline, but this request was not a "
+        "video request. Nothing was dispatched. Do the work locally instead — "
+        "`run_local_command` for shell/git/builds, `run_local_python` for Python — then "
+        "answer normally. Only use video tools when the user explicitly asks for a "
+        "video, reel, animation or footage edit."
+    )
+
+
 # ------------------------------------------------------------- progress card
 # The status card is a live object, not a 15%-and-freeze banner. Every milestone
 # below is emitted by the phase that actually reached it, and a heartbeat nudges
-# the bar forward while a single long phase (render, model reasoning) runs.
+# the bar forward while a single long phase (model reasoning, a dispatch) runs.
+# There are two tracks: ordinary engineering work must never show Chromium or MP4
+# stages, and a real render turn still shows its true phases. The active track is
+# chosen from TASK_CONTEXT.
 PROGRESS_BAR_WIDTH = 30
-PROGRESS_MILESTONES = (
+GENERAL_PROGRESS_MILESTONES = (
     (15, "Initializing reasoning & tool pipeline..."),
-    (30, "Loading motion skills & synthesizing voiceover..."),
-    (55, "Compiling layouts & dispatching to 16 GB worker..."),
+    (30, "Planning the task & loading references..."),
+    (55, "Executing locally (code, shell, files)..."),
+    (80, "Verifying results & running checks..."),
+    (95, "Finalizing the answer..."),
+    (100, "Task complete."),
+)
+VIDEO_PROGRESS_MILESTONES = (
+    (15, "Initializing reasoning & tool pipeline..."),
+    (30, "Loading video skills & synthesizing voiceover..."),
+    (55, "Compiling layouts & dispatching to the E2B render engine..."),
     (80, "Headless Chromium / FFmpeg rendering frames..."),
     (95, "Finalizing MP4 muxing & binary upload..."),
     (100, "Complete! Video delivered."),
 )
+PROGRESS_MILESTONES = GENERAL_PROGRESS_MILESTONES
 PROGRESS_STATE: Dict[str, Any] = {
     "percent": 0,
     "stage": "",
@@ -434,13 +526,26 @@ PROGRESS_STATE: Dict[str, Any] = {
 }
 
 
+def active_milestones():
+    """The milestone track for the current turn (video only when routed there)."""
+    if TASK_CONTEXT.get("active") and TASK_CONTEXT.get("mode") == "video":
+        return VIDEO_PROGRESS_MILESTONES
+    return GENERAL_PROGRESS_MILESTONES
+
+
+def stage_text(index: int) -> str:
+    """Stage wording for the active track at `index` (0-5)."""
+    track = active_milestones()
+    return track[index][1]
+
+
 def progress_bar(percent: int) -> str:
     filled = max(0, min(PROGRESS_BAR_WIDTH, int(percent / 100.0 * PROGRESS_BAR_WIDTH)))
     return "=" * filled + "-" * (PROGRESS_BAR_WIDTH - filled)
 
 
 def next_milestone(percent: int) -> Optional[int]:
-    for value, _ in PROGRESS_MILESTONES:
+    for value, _ in active_milestones():
         if value > percent:
             return value
     return None
@@ -540,6 +645,65 @@ async def progress_heartbeat(interval: float = 15.0) -> None:
             await update_progress_card(current + 1, PROGRESS_STATE.get("stage") or "Working...", force=True)
     except asyncio.CancelledError:
         raise
+
+
+# ------------------------------------------------- dispatch failure reporting
+TELEGRAM_SEND_TIMEOUT_SECONDS = 15
+
+
+def notify_chat(text: str) -> bool:
+    """Best-effort immediate Telegram push from a synchronous tool thread.
+
+    A dispatch failure has to reach the user the moment it happens — not through
+    a stalled progress card, and not only as a tool result the model may
+    paraphrase into something cheerful.
+    """
+    loop = CURRENT_EVENT_LOOP
+    bot = TELEGRAM_BOT_INSTANCE
+    chat_id = CURRENT_CHAT_ID
+    if loop is None or bot is None or chat_id is None or not (text or "").strip():
+        return False
+    try:
+        future = asyncio.run_coroutine_threadsafe(
+            bot.send_message(chat_id=chat_id, text=text[:3900]), loop
+        )
+        future.result(timeout=TELEGRAM_SEND_TIMEOUT_SECONDS)
+        return True
+    except Exception as send_err:
+        logger.warning(f"[Telegram] failure notice not delivered: {send_err}")
+        return False
+
+
+def report_dispatch_failure(tool: str, err: BaseException, detail: str = "") -> str:
+    """Surface an external dispatch failure immediately: chat + card + tool text.
+
+    A VM that dies or times out used to leave the card parked at a percentage
+    forever. Now the real error log goes straight to the chat, the card freezes on
+    an explicit failure stage, the turn is flagged as failed, and the same log is
+    returned to the model so it cannot report success.
+    """
+    headline = f"{tool} failed: {type(err).__name__}: {str(err)[:300] or 'no message'}"
+    tail = (detail or "").strip()
+    if not tail:
+        tail = traceback.format_exc()
+        if not tail.strip() or tail.strip() == "NoneType: None":
+            tail = f"{type(err).__name__}: {err}"
+    message = f"[FAILED] {headline}\n\n{tail[-1800:]}"
+    logger.error(f"[Dispatch] {headline}")
+    PROGRESS_STATE["turn_failed"] = headline
+    percent = int(PROGRESS_STATE.get("percent") or 0)
+    loop = CURRENT_EVENT_LOOP
+    if loop is not None and loop.is_running():
+        try:
+            asyncio.run_coroutine_threadsafe(
+                update_progress_card(percent, f"Failed — {headline[:160]}", force=True),
+                loop,
+            )
+        except Exception as card_err:
+            logger.debug(f"[Progress] failure card not scheduled: {card_err}")
+    notify_chat(message)
+    return message
+
 
 # Root-level shell binaries that must never be handed to the Python interpreter raw.
 _ROOT_SHELL_RE = re.compile(
@@ -826,6 +990,14 @@ def _find_mp4_in_sandbox(sbx: Any, slug: str = "") -> Optional[str]:
     return None
 
 SANDBOX_TIMEOUT_SECONDS = int(os.environ.get("E2B_SANDBOX_TIMEOUT", "900"))
+# Long sandbox commands are bounded too: without a timeout a hung
+# FFmpeg/Chromium call blocks the Python client forever, the finally block
+# never runs and the progress card stalls at a percentage. On expiry the
+# command raises, report_dispatch_failure() pushes the real log to Telegram
+# and the sandbox is still killed.
+SANDBOX_RUN_TIMEOUT_SECONDS = int(
+    os.environ.get("E2B_RUN_TIMEOUT", str(SANDBOX_TIMEOUT_SECONDS))
+)
 HYPERFRAMES_VERSION = os.environ.get("HYPERFRAMES_VERSION", "0.8.160")
 HYPERFRAMES_SKILL = os.environ.get("HYPERFRAMES_SKILL", "motion-graphics")
 
@@ -967,7 +1139,7 @@ def _synthesize_narration_audio(sbx: Any, project_dir: str, narration: str) -> s
                 f"cd {project_dir} && python3 -m edge_tts --voice {NARRATION_VOICE} "
                 f"--file narration.txt --write-media narration.mp3"
             ),
-            timeout=0,
+            timeout=SANDBOX_RUN_TIMEOUT_SECONDS,
         )
         if getattr(tts_res, "exit_code", 1) not in (0, None):
             logger.warning(
@@ -994,7 +1166,7 @@ def _mux_narration_and_verify(sbx: Any, video_path: str, audio_path: str) -> Opt
     try:
         mux_res = sbx.commands.run(
             _e2b_cmd_with_prep(_e2b_audio_mux_cmd(video_path, audio_path, final_path)),
-            timeout=0,
+            timeout=SANDBOX_RUN_TIMEOUT_SECONDS,
         )
         if getattr(mux_res, "exit_code", 1) not in (0, None):
             logger.warning(
@@ -1003,7 +1175,8 @@ def _mux_narration_and_verify(sbx: Any, video_path: str, audio_path: str) -> Opt
             )
             return None
         probe_res = sbx.commands.run(
-            _e2b_cmd_with_prep(_e2b_audio_verify_cmd(final_path)), timeout=0
+            _e2b_cmd_with_prep(_e2b_audio_verify_cmd(final_path)),
+            timeout=SANDBOX_RUN_TIMEOUT_SECONDS,
         )
         probe_text = (getattr(probe_res, "stdout", "") or "") + (
             getattr(probe_res, "stderr", "") or ""
@@ -1022,7 +1195,7 @@ def _telegram_send_video(video_bytes: bytes, file_name: str, caption: str = "") 
     """Post MP4 bytes to the bound Telegram chat. Returns True only on HTTP 200."""
     if not (CURRENT_CHAT_ID and TELEGRAM_BOT_TOKEN):
         return False
-    emit_progress(95, PROGRESS_MILESTONES[4][1], video=True)
+    emit_progress(95, VIDEO_PROGRESS_MILESTONES[4][1], video=True)
     try:
         send_url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendVideo"
         # The explicit video/mp4 MIME type is what Telegram checks to enable the
@@ -1037,7 +1210,7 @@ def _telegram_send_video(video_bytes: bytes, file_name: str, caption: str = "") 
         res = requests.post(send_url, data=data, files=upload_files, timeout=120)
         if res.status_code == 200:
             logger.info(f"Directly uploaded {file_name} to Telegram via HTTP API!")
-            emit_progress(100, PROGRESS_MILESTONES[5][1], video=True)
+            emit_progress(100, VIDEO_PROGRESS_MILESTONES[5][1], video=True)
             return True
         logger.error(f"Telegram upload failed: {res.text[:300]}")
     except Exception as vid_err:
@@ -1218,6 +1391,9 @@ def render_html_video(
         narration: Optional voice-over script; synthesized inside the sandbox
             with edge-tts and muxed into the MP4.
     """
+    blocked = video_dispatch_block("render_html_video")
+    if blocked:
+        return blocked
     backend = (backend or "auto").strip().lower()
     if backend in ("space", "huggingface", "hf", "jobs"):
         return (
@@ -1236,7 +1412,7 @@ def render_html_video(
             "Error: E2B_API_KEY is not configured, and the E2B microVM is now "
             "the only render engine (Hugging Face was retired)."
         )
-    emit_progress(55, PROGRESS_MILESTONES[2][1], video=True)
+    emit_progress(55, VIDEO_PROGRESS_MILESTONES[2][1], video=True)
     slug = re.sub(r"[^a-z0-9-]+", "-", (project_name or "chintu-motion").lower()).strip("-")
     slug = slug or "chintu-motion"
     project_dir = f"/home/user/videos/{slug}"
@@ -1274,7 +1450,7 @@ def render_html_video(
                     f"cd {project_dir} && {hf} render . --skill={HYPERFRAMES_SKILL} "
                     f"-f {int(fps)} -q {quality} -o ./renders/video.mp4"
                 ),
-                timeout=0,
+                timeout=SANDBOX_RUN_TIMEOUT_SECONDS,
             )
             render_exit = getattr(render, "exit_code", "unknown")
             render_output = (
@@ -1367,7 +1543,7 @@ def render_html_video(
         return report
     except Exception as e:
         logger.error(f"E2B render error: {e}", exc_info=True)
-        return f"E2B render error:\n{traceback.format_exc()}"
+        return report_dispatch_failure("render_html_video", e)
     finally:
         if sbx is not None:
             try:
@@ -1396,7 +1572,7 @@ def _run_pillow_fallback(sbx: Any, project_dir: str, slug: str, fps: int, narrat
         env_bits += f" FALLBACK_NARRATION={narration_path}"
     res = sbx.commands.run(
         _e2b_cmd_with_prep(f"cd {project_dir} && {env_bits} python3 {script_path}"),
-        timeout=0,
+        timeout=SANDBOX_RUN_TIMEOUT_SECONDS,
     )
     code = getattr(res, "exit_code", "unknown")
     output = (getattr(res, "stdout", "") or "") + (getattr(res, "stderr", "") or "")
@@ -1965,6 +2141,9 @@ def edit_gameplay_footage(
         highlight_lufs: Momentary loudness (LUFS) at/above which a span counts
             as a highlight and is preserved at 1x.
     """
+    blocked = video_dispatch_block("edit_gameplay_footage")
+    if blocked:
+        return blocked
     if not E2B_API_KEY:
         return "Error: E2B_API_KEY is not configured; the E2B microVM is the only render engine."
     video_path = (video_path or "").strip()
@@ -1999,7 +2178,7 @@ def edit_gameplay_footage(
     silence_db = str(silence_db or "-35dB").strip()
     if not re.fullmatch(r"-?\d+(\.\d+)?dB", silence_db):
         silence_db = "-35dB"
-    emit_progress(55, PROGRESS_MILESTONES[2][1], video=True)
+    emit_progress(55, VIDEO_PROGRESS_MILESTONES[2][1], video=True)
     workdir = "/home/user/gameplay"
     src = f"{workdir}/source.mp4"
     out_path = f"{workdir}/final_output.mp4"
@@ -2033,7 +2212,7 @@ def edit_gameplay_footage(
                f"GP_OUT={workdir}")
         res = sbx.commands.run(
             _e2b_cmd_with_prep(f"cd {workdir} && {env} python3 gameplay_analysis.py"),
-            timeout=0,
+            timeout=SANDBOX_RUN_TIMEOUT_SECONDS,
         )
         raw = (getattr(res, "stdout", "") or "") + "\n" + (getattr(res, "stderr", "") or "")
         analysis = _parse_gameplay_analysis(raw)
@@ -2055,7 +2234,10 @@ def edit_gameplay_footage(
         logger.info(f"[Gameplay] EDL: {len(edl)} segments; writing render command")
         has_audio = bool(analysis.get("has_audio"))
         rcmd = _gameplay_render_cmd(src, out_path, edl, framing=framing_key, has_audio=has_audio)
-        rres = sbx.commands.run(_e2b_cmd_with_prep(f"cd {workdir} && {rcmd}"), timeout=0)
+        rres = sbx.commands.run(
+            _e2b_cmd_with_prep(f"cd {workdir} && {rcmd}"),
+            timeout=SANDBOX_RUN_TIMEOUT_SECONDS,
+        )
         rtail = ((getattr(rres, "stdout", "") or "") + (getattr(rres, "stderr", "") or ""))[-1500:]
         if getattr(rres, "exit_code", 1) not in (0, None):
             return (
@@ -2096,7 +2278,7 @@ def edit_gameplay_footage(
         return report
     except Exception as e:
         logger.error(f"Gameplay edit error: {e}", exc_info=True)
-        return f"[FAILED] gameplay edit error:\n{traceback.format_exc()}"
+        return report_dispatch_failure("edit_gameplay_footage", e)
     finally:
         if sbx is not None:
             try:
@@ -2109,7 +2291,7 @@ def execute_in_cloud_microvm(code: str) -> str:
     global CURRENT_CHAT_ID
     if not E2B_API_KEY:
         return "Error: E2B_API_KEY is not configured."
-    emit_progress(55, PROGRESS_MILESTONES[2][1], video=True)
+    emit_progress(55, stage_text(2))
     sbx = None
     try:
         from e2b_code_interpreter import Sandbox
@@ -2127,7 +2309,8 @@ def execute_in_cloud_microvm(code: str) -> str:
         safe_source = prepare_task_source(code)
         sbx.files.write("/home/user/run_task.py", safe_source)
         exec_res = sbx.commands.run(
-            _e2b_cmd_with_prep("python /home/user/run_task.py"), timeout=0
+            _e2b_cmd_with_prep("python /home/user/run_task.py"),
+            timeout=SANDBOX_RUN_TIMEOUT_SECONDS,
         )
 
         found_video = _deliver_rendered_video(sbx)
@@ -2149,7 +2332,7 @@ def execute_in_cloud_microvm(code: str) -> str:
         return out_msg
     except Exception as e:
         logger.error(f"E2B Execution error: {e}", exc_info=True)
-        return f"Sandbox Execution Error:\n{traceback.format_exc()}"
+        return report_dispatch_failure("execute_in_cloud_microvm", e)
     finally:
         if sbx is not None:
             try:
@@ -2522,7 +2705,10 @@ def fetch_youtube_transcript(url: str, langs: str = "en,en-US,en-GB") -> str:
         langs: Comma-separated subtitle language preference, first match wins.
     """
     if not E2B_API_KEY:
-        return "Error: E2B_API_KEY is not configured; yt-dlp runs inside the E2B microVM, which is the only shell Chintu has."
+        return (
+            "Error: E2B_API_KEY is not configured; yt-dlp runs inside the E2B microVM. "
+            "General shell work still runs locally through `run_local_command`."
+        )
     url = (url or "").strip()
     if not re.match(r"^https?://", url):
         return (
@@ -2532,7 +2718,7 @@ def fetch_youtube_transcript(url: str, langs: str = "en,en-US,en-GB") -> str:
     langs = ",".join(
         l.strip() for l in str(langs or "en,en-US,en-GB").split(",") if l.strip()
     ) or "en,en-US,en-GB"
-    emit_progress(30, PROGRESS_MILESTONES[1][1])
+    emit_progress(30, stage_text(1))
     sbx = None
     try:
         from e2b_code_interpreter import Sandbox
@@ -2553,7 +2739,7 @@ def fetch_youtube_transcript(url: str, langs: str = "en,en-US,en-GB") -> str:
         sbx.files.write("/home/user/ytdl_fetch.py", _YT_FETCH_TEMPLATE)
         res = sbx.commands.run(
             _e2b_cmd_with_prep("cd /home/user && python3 ytdl_fetch.py"),
-            timeout=0,
+            timeout=SANDBOX_RUN_TIMEOUT_SECONDS,
         )
         raw = (getattr(res, "stdout", "") or "") + "\n" + (getattr(res, "stderr", "") or "")
         meta, text, yterr = _parse_yt_fetch(raw)
@@ -2582,7 +2768,7 @@ def fetch_youtube_transcript(url: str, langs: str = "en,en-US,en-GB") -> str:
         return header + "\n\n" + text
     except Exception as e:
         logger.error(f"[YtDlp] transcript fetch error: {e}", exc_info=True)
-        return f"[FAILED] transcript fetch error:\n{traceback.format_exc()}\ntail: "
+        return report_dispatch_failure("fetch_youtube_transcript", e)
     finally:
         if sbx is not None:
             try:
@@ -2591,9 +2777,178 @@ def fetch_youtube_transcript(url: str, langs: str = "en,en-US,en-GB") -> str:
                 logger.warning(f"Sandbox cleanup warning: {kill_err}")
 
 
+# --------------------------------------------------------- local execution
+# General work (Python, bash, git, builds, data) belongs here, in this container —
+# not in the video microVM and not in a render pipeline. Foreground runs are
+# hard-timeout bounded so a Telegram turn can never hang on them; long jobs are
+# detached into their own session with stdout/stderr in a log file, so the
+# polling listener keeps running instead of dropping into a ghost loop.
+LOCAL_EXEC_TIMEOUT_SECONDS = int(os.environ.get("LOCAL_EXEC_TIMEOUT", "120"))
+LOCAL_EXEC_MAX_TIMEOUT_SECONDS = 600
+LOCAL_EXEC_MAX_OUTPUT = 16000
+LOCAL_TASK_DIR = os.path.join(os.getcwd(), "local_tasks")
+BACKGROUND_TASKS: Dict[int, Any] = {}
+
+
+def _local_exec_budget(timeout: Any) -> int:
+    """Clamp a requested timeout into a strict, always-finite budget."""
+    try:
+        budget = int(timeout or LOCAL_EXEC_TIMEOUT_SECONDS)
+    except (TypeError, ValueError):
+        budget = LOCAL_EXEC_TIMEOUT_SECONDS
+    return max(1, min(budget, LOCAL_EXEC_MAX_TIMEOUT_SECONDS))
+
+
+def run_local_command(
+    command: str,
+    cwd: str = "",
+    timeout: int = 0,
+    background: bool = False,
+) -> str:
+    """Run a shell command in this container and return its output.
+
+    This is the default executor for ordinary work: Python, bash, git, package
+    installs, builds, tests, data processing. It never touches the video
+    microVM.
+
+    Args:
+        command: Shell command, executed with `bash -lc`.
+        cwd: Working directory (defaults to the project root). Must exist.
+        timeout: Hard timeout in seconds for a foreground run (default
+            LOCAL_EXEC_TIMEOUT, clamped to 600). The process is killed on expiry.
+        background: Start the command detached (own session, stdin closed,
+            output to local_tasks/<id>.log) and return immediately with the PID
+            and log path. Use this for servers, daemons and long jobs.
+    """
+    command = (command or "").strip()
+    if not command:
+        return "[FAILED] empty command; pass the shell command to run."
+    workdir = os.path.abspath(cwd.strip()) if (cwd or "").strip() else os.getcwd()
+    if not os.path.isdir(workdir):
+        return f"[FAILED] cwd '{cwd}' is not a directory on this host."
+    if background:
+        os.makedirs(LOCAL_TASK_DIR, exist_ok=True)
+        log_path = os.path.join(
+            LOCAL_TASK_DIR, f"task_{int(time.time() * 1000)}_{os.getpid()}.log"
+        )
+        try:
+            with open(log_path, "wb") as log:
+                proc = subprocess.Popen(
+                    ["bash", "-lc", command],
+                    cwd=workdir,
+                    stdin=subprocess.DEVNULL,
+                    stdout=log,
+                    stderr=subprocess.STDOUT,
+                    start_new_session=True,
+                    env=os.environ.copy(),
+                )
+        except Exception as spawn_err:
+            return f"[FAILED] could not start background command: {spawn_err}"
+        # Keep the registry small: finished background jobs stay readable in
+        # their log files, but their Popen handles are dropped.
+        for finished_pid in [pid for pid, child in BACKGROUND_TASKS.items() if child.poll() is not None]:
+            BACKGROUND_TASKS.pop(finished_pid, None)
+        BACKGROUND_TASKS[proc.pid] = proc
+        emit_progress(55, stage_text(2))
+        logger.info(f"[LocalExec] background pid={proc.pid} log={log_path}")
+        return (
+            f"LOCAL-BG started pid={proc.pid} cwd={workdir}\n"
+            f"log: {log_path}\n"
+            f"command: {command}\n"
+            "Detached: own session, stdin closed, this turn does not wait for it. "
+            f"Read output with run_local_command('tail -n 60 {log_path}', timeout=20) and "
+            f"check liveness with run_local_command('ps -p {proc.pid} -o pid=,stat=,cmd=', timeout=20)."
+        )
+    budget = _local_exec_budget(timeout)
+    emit_progress(55, stage_text(2))
+    try:
+        completed = subprocess.run(
+            ["bash", "-lc", command],
+            cwd=workdir,
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            timeout=budget,
+            env=os.environ.copy(),
+        )
+    except subprocess.TimeoutExpired as timeout_err:
+        partial = ""
+        for stream in (timeout_err.stdout, timeout_err.stderr):
+            if isinstance(stream, bytes):
+                partial += stream.decode("utf-8", "replace")
+            elif isinstance(stream, str):
+                partial += stream
+        return (
+            f"[FAILED] command timed out after {budget}s and was killed; nothing is still "
+            f"running.\ncwd: {workdir}\ncommand: {command}\npartial output:\n{partial[-2000:]}"
+        )
+    except Exception as exec_err:
+        return f"[FAILED] could not run command: {exec_err}"
+    stdout = (completed.stdout or "").strip()
+    stderr = (completed.stderr or "").strip()
+    report = (
+        f"LOCAL-CMD exit={completed.returncode} cwd={workdir}\n"
+        f"timeout budget: {budget}s\ncommand: {command}\n"
+    )
+    if stdout:
+        report += "\nSTDOUT:\n" + stdout[-LOCAL_EXEC_MAX_OUTPUT:]
+    if stderr:
+        report += "\nSTDERR:\n" + stderr[-LOCAL_EXEC_MAX_OUTPUT:]
+    if not stdout and not stderr:
+        report += "\n(no output)"
+    return report
+
+
+def run_local_python(code: str, timeout: int = 0) -> str:
+    """Execute a Python snippet in this container and return stdout/stderr.
+
+    The snippet runs in a child interpreter (`sys.executable -`) with the same
+    environment as the brain, so imports, credentials and the project tree are
+    available. No file is written; stdin carries the code and the run is bounded
+    by the same hard timeout as run_local_command.
+
+    Args:
+        code: Python source to execute.
+        timeout: Hard timeout in seconds (default LOCAL_EXEC_TIMEOUT, max 600).
+    """
+    body = (code or "").rstrip()
+    if not body.strip():
+        return "[FAILED] empty code; pass the Python source to execute."
+    budget = _local_exec_budget(timeout)
+    emit_progress(55, stage_text(2))
+    try:
+        completed = subprocess.run(
+            [sys.executable, "-"],
+            input=body + "\n",
+            cwd=os.getcwd(),
+            capture_output=True,
+            text=True,
+            timeout=budget,
+            env=os.environ.copy(),
+        )
+    except subprocess.TimeoutExpired as timeout_err:
+        partial = timeout_err.stdout if isinstance(timeout_err.stdout, str) else ""
+        return (
+            f"[FAILED] Python snippet timed out after {budget}s and was killed.\n"
+            f"partial output:\n{partial[-2000:]}"
+        )
+    except Exception as exec_err:
+        return f"[FAILED] could not run Python snippet: {exec_err}"
+    stdout = (completed.stdout or "").strip()
+    stderr = (completed.stderr or "").strip()
+    report = f"LOCAL-PY exit={completed.returncode}\ntimeout budget: {budget}s\n"
+    if stdout:
+        report += "\nSTDOUT:\n" + stdout[-LOCAL_EXEC_MAX_OUTPUT:]
+    if stderr:
+        report += "\nSTDERR:\n" + stderr[-LOCAL_EXEC_MAX_OUTPUT:]
+    if not stdout and not stderr:
+        report += "\n(no output)"
+    return report
+
+
 def list_skills() -> str:
     """List every external skill/knowledge repository Chintu can draw on."""
-    emit_progress(30, PROGRESS_MILESTONES[1][1])
+    emit_progress(30, stage_text(1))
     lines = []
     for name, meta in SKILL_REGISTRY.items():
         docs = meta.get("docs") or [meta.get("entrypoint", "README.md")]
@@ -2630,7 +2985,7 @@ def load_skill(
     if not meta:
         return f"Unknown skill '{skill_name}'. Available skills: {', '.join(SKILL_REGISTRY)}"
     target = (file_path or meta.get("entrypoint") or "README.md").strip().strip("/")
-    emit_progress(30, PROGRESS_MILESTONES[1][1])
+    emit_progress(30, stage_text(1))
     content = github_read_file(meta["repo"], target)
     if content.startswith("GitHub Read Error") or content.startswith("Error reading"):
         return content
@@ -2676,6 +3031,8 @@ ALL_TOOLS_LIST = [
     web_search_research,
     inspect_web_content,
     fetch_youtube_transcript,
+    run_local_command,
+    run_local_python,
     list_skills,
     load_skill,
     render_html_video,
@@ -2698,6 +3055,8 @@ TOOL_CAPABILITIES: Dict[str, str] = {
     "web_search_research": "Search the web and return readable text for grounding.",
     "inspect_web_content": "Web eyes: read any public web page as clean text through the agent-reach reader route (direct-fetch fallback with HTML stripping) — this is how Chintu scrapes and audits pages for research.",
     "fetch_youtube_transcript": "Script ears: fetch a video's captions/transcript with yt-dlp inside the E2B microVM and return plain prose plus title/duration/uploader metadata — the tool for script and content analysis.",
+    "run_local_command": "Default executor for ordinary work: run a shell command (bash -lc) in this container with a hard timeout, or background=True for a detached long-running process whose output goes to a log file.",
+    "run_local_python": "Run a Python snippet in this container in a child interpreter with a hard timeout and return stdout/stderr — the default path for scripts, data work and quick checks.",
     "list_skills": "Enumerate the motion-graphics skill library with repos and doc paths.",
     "load_skill": "Load and page the real documentation of one skill (HyperFrames, GSAP, Whisper, Remotion, prompt and motion libraries).",
     "render_html_video": "Dispatch a single-file HTML/CSS/GSAP composition to the E2B microVM render engine (synchronous; disk-prepped, with an automatic Pillow+FFmpeg fallback) — Hugging Face render backends were retired, so never use backend='space'/'huggingface'.",
@@ -2723,61 +3082,60 @@ SKILL_INVENTORY = "\n".join(
     for name, meta in SKILL_REGISTRY.items()
 )
 
-SYSTEM_INSTRUCTION = f"""You are Chintu — an autonomous general AI agent, running as a distributed agent. You are a researcher, web scraper and script analyst first — read pages, fetch transcripts, analyse and summarise — and in motion work you are the autonomous audiovisual motion engineer. You are not limited to video; any research, scraping, background-check or script-analysis task is squarely yours, using the web tools below. Either way: the Render brain orchestrates, executes and reports; the E2B microVM renders; Telegram delivers.
+SYSTEM_INSTRUCTION = f"""You are Chintu, an autonomous, general-purpose software engineer and automation agent. You execute code, build applications, run background tasks, process data, and solve problems across full-stack development, Python, and web technologies. Do NOT refuse coding tasks, and do NOT default to video mockups or motion-graphics renders.
 
-IDENTITY AND COMPUTE TOPOLOGY (hard boundaries)
-- You are Chintu — a general AI agent and, for motion work, the autonomous audiovisual motion engineer, running as a distributed agent: the Render brain orchestrates, executes and reports; the E2B microVM renders; Telegram delivers.
-- This process is the Render brain: about 512 MB of RAM hosting FastAPI, the Telegram polling lifecycle, the status card, tool routing and LLM orchestration. That is ALL it does.
-- You must NEVER render video locally. No Pillow frame buffers, no Playwright/Chromium launch, no FFmpeg subprocess, no NumPy frame loops in this process. A local render is a failed turn, not a shortcut.
-- The Hugging Face render backends (Docker Space and cpu-basic Jobs) were RETIRED — compute Spaces now require a paid PRO plan — so the ONLY render engine is the E2B microVM, killed in a finally block after every run.
-- Delivery: the finished MP4 streams back to the brain and is posted straight to Telegram with /sendVideo to CURRENT_CHAT_ID. You do not need to save it anywhere.
+IDENTITY AND COMPUTE TOPOLOGY
+- You are Chintu — a general-purpose autonomous agent: engineer, researcher, web scraper and script analyst. You write and run real code. Video/motion work is one capability you use only when the user asks for it: it is not your identity and never your default.
+- This process is the Render brain: about 512 MB hosting FastAPI, the Telegram polling lifecycle, the status card, tool routing, LLM orchestration and ordinary local execution (Python, bash, git, builds, data work).
+- Heavy media rendering is the ONE thing this process must NEVER do locally: no Pillow frame buffers, no Playwright/Chromium launch, no FFmpeg render loop, no NumPy frame loops. Ordinary commands, scripts, servers and builds are expected here and are perfectly safe.
+- The Hugging Face render backends (Docker Space and cpu-basic Jobs) were RETIRED — compute Spaces now require a paid PRO plan — so the ONLY video render engine is the E2B microVM, killed in a finally block after every run.
 - Tool results are the only source of truth about what happened.
+
+ROUTING — DECIDE THIS BEFORE YOU PICK A TOOL
+- Ordinary work (code, scripts, shell, git, package installs, web builds, data processing, tests, research) runs HERE: `run_local_command` for shell commands, `run_local_python` for Python snippets. This is the default path for every task that is not a video render.
+- Anything long-running — a dev server, a watcher, a batch job, a daemon — MUST use `run_local_command(..., background=True)`. It returns a pid and a log path immediately, in a detached session, so the Telegram listener never freezes. Never block a turn on a process that does not exit.
+- `execute_in_cloud_microvm` is an isolated throwaway E2B sandbox, not the default executor. Use it only when a task genuinely needs a disposable sandbox or the user asks for it.
+- `render_html_video` and `edit_gameplay_footage` are the ONLY video tools, and they may run ONLY when the user explicitly asked for a video, reel, animation or footage edit. Never dispatch a coding, scraping, analysis or automation request into the video pipeline.
+- If a video tool answers `[ROUTED]`, this was not a video request: do the work locally with the tools above and answer normally. Do not retry the video tool.
+- When an external dispatch fails or times out, the returned `[FAILED]` line carries the real error log. Report that cause to the user verbatim (trimmed); never hide it, never claim the step succeeded.
 
 YOUR TOOL INVENTORY (you have {len(ALL_TOOLS_LIST)} tools)
 {TOOL_INVENTORY}
 
-YOUR SKILL LIBRARY (load the real docs before you author)
+YOUR SKILL LIBRARY (load the real docs before you author video work)
 {SKILL_INVENTORY}
 
 WEB EYES & SCRIPT ANALYSIS (general agent duties)
 `inspect_web_content(url, max_chars, raw_html)` is how you read the web: it returns clean page text (agent-reach's routed reader first, direct fetch + HTML-stripping fallback). Use it for research, scraping, fact-checking, background checks or reading documentation you don't already have cached.
 `fetch_youtube_transcript(url, langs)` is how you get a video's script: yt-dlp runs inside the E2B microVM, picks captions in the requested languages, strips timestamps and returns plain prose with title/duration/uploader. Use it for script analysis, competitor research and content grounding.
 Both tools are first-class: when a user asks you to read a page, scrape something, check a claim or analyse a video's script, DO IT with these tools and report the findings — never answer that you lack web access or shell access, and never dump raw URLs back as an excuse. If a fetch fails, report exactly what the tool returned and try the fallback route before giving up.
+For repository work that needs a local checkout, clone and inspect it with `run_local_command` (git clone / ls / grep / tests), not with a browser.
 
-ACTION RULE — VIDEO REQUESTS (6-JOB AUTONOMOUS EDITOR)
-When the user asks to build, change or render any video, motion graphic, reel, ad or animation, you MUST act following the 6-job pipeline:
+VIDEO WORK — ONLY ON AN EXPLICIT REQUEST
+When, and only when, the user asks for a video, motion graphic, reel, ad, animation or a footage edit:
+1. load_skill("hyperframes") for the composition contract and CLI; load_skill("motion_skills") plus the relevant category module. Use load_skill("gsap") for timeline/easing, load_skill("whisper") for caption timing, load_skill("remotion") for composition/data-driven concepts, load_skill("motion_graphics_prompts") for camera/lighting.
+2. Research 3–5 benchmark videos in the niche and record the winning hooks in rulebooks/hook_library.json; follow rulebooks/script_rules.md for the script.
+3. Build beat_map.json (sentence → start/end, assets, layout hierarchy, kinetic-type triggers, SFX cues) and write ONE complete single-file composition from it: a root with data-composition-id, data-width, data-height, data-duration; timed elements with data-start/data-duration; exactly one paused GSAP timeline registered on window.__timelines under the composition id. Inline everything — no local assets, no network fetches at render time.
+4. Call render_html_video(html=..., project_name=..., fps=30, quality="looks"), passing narration=... when there is voice-over. The E2B microVM renders synchronously, serializes the queue, runs the 10 FPS QA gate, auto-patches and re-verifies before delivery.
+5. Uploaded footage: when the user sends a clip (its caption or accompanying text is the prompt, and the [Attached media] note carries the staged local path), call edit_gameplay_footage(video_path=<staged path>, instructions=<the user's words>) for gameplay/footage edits — it cuts silence, speeds up downtime, keeps highlights, reframes to 9:16, ducks audio and delivers final_output.mp4. Never edit or re-encode footage locally.
 
-Job 1 - Scripting & Outlier Hooks: Benchmark against 3–5 viral shorts/reels in the exact niche (web/video search). Extract opening hooks, retention mechanics, pacing. Synthesize an original script that refines/counters benchmarks. Append winning hooks to rulebooks/hook_library.json.
-Job 2 - Recording Processing (if audio input): Use Whisper word-level timestamps; drop pauses > 0.5s; keep only last take of repeated lines; correct mic-to-camera drift before cuts.
-Job 3 - Granular Beat Mapping: Generate beat_map.json mapping each sentence to start/end timestamps, visual assets, layout hierarchy, kinetic typography triggers, SFX cues.
-Job 4 - Heavy Motion Builder & Render Queue: Build composition using beat_map. E2B executes HyperFrames/GSAP/Three.js with serialized render queue (one render at a time), fast rendering flags (disable artificial motion blur), draft mode 540x960 for iteration, full 1080x1920 only on final export.
-Job 5 - 10 FPS QA Inspection Gate: Before delivery, extract frames at 10 FPS in E2B to verify: animation loops play twice, no sub-second flash frames, captions aligned to audio timestamps, no occlusion of safe-zone boundaries, audio-sync alignment. Auto-patch issues before final AAC mux.
-Job 6 - Rulebooks Self-Update: Persist rulebooks/ (script_rules.md, visual_rules.md, audio_rules.md, qa_rules.md). Feedback via /note <critique> rewrites rules in place (no stacking/bloat).
-
-Steps:
-1. load_skill("hyperframes") for composition contract/CLI, load_skill("motion_skills") + relevant modules. Use load_skill("gsap") for timeline/easing, load_skill("whisper") for caption timing, load_skill("remotion") for composition/data-driven concepts, load_skill("motion_graphics_prompts") for camera/lighting.
-2. Research niche benchmarks (3–5 viral shorts/reels) and update hook_library.json; write script following script_rules.md.
-3. Generate beat_map.json (Job 3) and write COMPLETE single-file composition using it: one root with data-composition-id, data-width, data-height, data-duration; timed elements with data-start/data-duration; exactly one paused GSAP timeline registered on window.__timelines under composition id. Inline everything — no local assets, no network fetches at render time.
-4. Call render_html_video(html=..., project_name=..., fps=30, quality="looks") and pass narration=... if applicable. E2B renders synchronously with serialized queue, fast flags, draft vs final sizing. QA gate (10 FPS) runs in E2B before delivery; auto-patches and re-verifies. Report results.
-5. Uploaded footage: when the user sends a video/document (its caption OR accompanying text is the prompt and an [Attached media] note carries the staged local path), call edit_gameplay_footage(video_path=<staged path>, instructions=<the user's words>) for gameplay/footage edits — it cuts silence, speeds downtime, keeps highlights, reframes to 9:16, ducks audio and delivers final_output.mp4. Never edit or re-encode footage locally; the E2B microVM does all media work.
-
-NEVER answer a video request with a conversational plan, an apology, or a claim that browser/Node/rendering tools are unsupported or unavailable — they are supported and remote. Never claim a render happened without a tool result that shows it. If a dispatch fails (missing secret, failed job), read the log tail it returned, fix the cause and resubmit.
+NEVER answer a video request with a conversational plan, an apology, or a claim that browser/Node/rendering tools are unsupported or unavailable — they are supported and remote. Never claim a render happened without a tool result that shows it. If a dispatch fails (missing secret, failed job, timeout), read the `[FAILED]` log it returned, fix the cause and resubmit.
 
 VIDEO STANDARDS (non-negotiable for every render)
-- Canvas 1080x1920 (9:16 vertical) for final export, 540x960 (draft mode) for iterative previews; 30 fps unless brief says otherwise, 6-15 seconds for short-form.
-- Render queue is serialized (one render at a time) to prevent RAM exhaustion. Fast rendering flags: disable artificial motion blur to avoid 4x frame draws.
-- 10 FPS QA gate: extract frames at 10 FPS inside E2B before delivery; verify: animation loops play twice, no sub-second flash frames, captions aligned to audio timestamps, no occlusion of safe-zone boundaries, audio-sync alignment. Auto-patch and re-verify before final AAC mux.
-- Beat mapping (beat_map.json) drives all timing, kinetic typography, layout hierarchy, SFX cues, and visual assets.
-- Competitive benchmarking: research 3–5 viral shorts/reels in exact niche before scripting; update rulebooks/hook_library.json with winning hooks.
+- Canvas 1080x1920 (9:16 vertical) for final export, 540x960 (draft mode) for iterative previews; 30 fps unless the brief says otherwise; 6-15 seconds for short-form.
+- The render queue is serialized (one render at a time) to prevent RAM exhaustion. Fast rendering flags: disable artificial motion blur to avoid 4x frame draws.
+- 10 FPS QA gate: extract frames at 10 FPS inside the E2B microVM before delivery; verify loops play twice, no sub-second flash frames, captions aligned to audio timestamps, no occlusion of safe-zone boundaries, audio-sync alignment. Auto-patch and re-verify before the final AAC mux.
+- beat_map.json drives all timing, kinetic typography, layout hierarchy, SFX cues and visual assets.
+- Competitive benchmarking: research 3–5 viral videos in the exact niche before scripting; keep rulebooks/hook_library.json current.
 - Headlines at 80pt or larger; body copy at least 32pt. Keep an 80px title-safe margin and never place type inside the top 120px or the bottom 220px where platform UI covers it.
-- Typography carries the message: one or two emphasis words per scene, deliberate weights, and letter-spacing that snaps to whole pixels rather than tweening.
+- Typography carries the message: one or two emphasis words per scene, deliberate weights, letter-spacing that snaps to whole pixels rather than tweening.
 - Motion uses real easing curves (power2-4, back, expo, sine) with entrances and exits timed so transitions never overlap. One motion motif per scene. Never hand-animate a CSS transform on a node GSAP is tweening.
 - Build ambient depth: a soft radial or gradient glow behind the subject, a subtle vignette, and a gradient sweep or grain. Never a flat black frame.
-- Sound: narration is synthesized with edge-tts inside the microVM and muxed with an explicit stream map (-map 0:v:0 -map 1:a:0) as AAC 192k @ 44.1 kHz with +faststart; the final MP4 is ffprobe-verified to carry an active audio stream before /sendVideo posts it with supports_streaming=True so Telegram shows the unmute button. Keep voice-over timed to the scene cuts and pair impacts with a sub-bass hit. Whisper word-level timestamps drive caption timing; correct mic-to-camera drift, drop pauses > 0.5s, keep only last take of repeated lines.
+- Sound: narration is synthesized with edge-tts inside the microVM and muxed with an explicit stream map (-map 0:v:0 -map 1:a:0) as AAC 192k @ 44.1 kHz with +faststart; the final MP4 is ffprobe-verified to carry an active audio stream before it is posted with supports_streaming=True. Pair impacts with a sub-bass hit. Whisper word-level timestamps drive caption timing; drop pauses > 0.5s and keep only the last take of repeated lines.
 - Self-updating rulebooks under rulebooks/ (script_rules.md, visual_rules.md, audio_rules.md, qa_rules.md); /note <critique> rewrites rules in place (no stacking/bloat).
 
 TRUTHFUL REPORTING
-Report only what the tools returned: sandbox paths, ffprobe frame counts, byte sizes, delivery status. If a step did not run, say which step and why. Never invent a file path or a result."""
+Report only what the tools returned: exit codes, sandbox paths, ffprobe facts, byte sizes, pids, log paths, delivery status. If a step did not run, say which step and why. Never invent a file path or a result."""
 
 def _generate_beat_map(script: str, duration: float = 10.0) -> Dict[str, Any]:
     """Generate structured beat_map.json mapping each sentence to timing/cues (stub)."""
@@ -2966,9 +3324,10 @@ def execute_tool_call(name: str, arguments: Any) -> str:
 # markdown (`load_skill` READMEs) back to the user instead of dispatching the
 # render, so the ceiling hit with no final answer and no video.
 FALLBACK_TOOL_ROUND_DIRECTIVE = (
-    "CRITICAL: Do not dump skill markdown or READMEs to the user. "
-    "Inspect skills concisely, generate the HTML/CSS/GSAP composition, and call "
-    "`render_html_video` immediately to produce and deliver the video."
+    "CRITICAL: Do not dump skill markdown, READMEs or file contents to the user. "
+    "Do the requested work with the available tools — run code locally, read pages, "
+    "or call a video tool only if the user explicitly asked for a video — then answer "
+    "concisely with what actually happened."
 )
 
 
@@ -3040,11 +3399,11 @@ def _chat_with_tools(
     logger.error(
         f"[External Fallback] TOOL-ROUND CEILING: {provider}/{model} exhausted "
         f"{EXTERNAL_MAX_TOOL_ROUNDS} tool rounds without a final answer "
-        f"(last tool output: {str(last_tool_output)[:300]!r}). No video was produced."
+        f"(last tool output: {str(last_tool_output)[:300]!r}). No final answer was produced."
     )
     PROGRESS_STATE["turn_failed"] = (
         f"tool-round ceiling after {EXTERNAL_MAX_TOOL_ROUNDS} rounds "
-        f"({provider}/{model}); no final answer, no video"
+        f"({provider}/{model}); no final answer produced"
     )
     return (
         f"{provider} stopped after {EXTERNAL_MAX_TOOL_ROUNDS} tool rounds without a final "
@@ -3166,7 +3525,7 @@ async def generate_reasoning_response(user_message: str) -> str:
         last_error = f"{last_error}; external fallback: {ext_err}"
         return f"All verified cascade models and external fallback failed. Details:\n{last_error}"
 
-api = FastAPI(title="Chintu HMAS AI Engineer")
+api = FastAPI(title="Chintu — autonomous software & automation agent")
 
 @api.get("/")
 @api.get("/health")
@@ -3180,6 +3539,12 @@ def health_check():
         "openrouter_cascade": OPENROUTER_MODELS,
         "last_provider": PROVIDER_TELEMETRY,
         "tools_count": len(ALL_TOOLS_LIST),
+        "task_routing": {
+            "mode": TASK_CONTEXT.get("mode"),
+            "video_tools_guarded": True,
+            "local_exec_timeout": LOCAL_EXEC_TIMEOUT_SECONDS,
+            "background_tasks": len(BACKGROUND_TASKS),
+        },
         "skills": list(SKILL_REGISTRY.keys()),
         "skills_count": len(SKILL_REGISTRY),
         "render_backends": {
@@ -3220,7 +3585,29 @@ telegram_app = None
 
 async def handle_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.message:
-        await update.message.reply_text("Chintu HMAS AI Engineer online. Systems operational.")
+        await update.message.reply_text(
+            "Chintu online — general software and automation agent. Send a task: "
+            "code, scripts, shell, research, data or a video render (on request)."
+        )
+
+
+async def _on_polling_error(exc: BaseException) -> None:
+    """Log Telegram polling faults loudly instead of leaving a silent dead listener.
+
+    A getUpdates conflict means a second process is polling the same bot token
+    (usually a stale deploy): that produces the "terminated by other getUpdates
+    request" loop. It is reported as an operator action, not swallowed.
+    """
+    name = type(exc).__name__
+    text = str(exc)
+    if "Conflict" in name or "Conflict" in text or "other getUpdates" in text:
+        logger.error(
+            "[Telegram Bot] getUpdates CONFLICT: another process is polling this bot "
+            "token. Stop the duplicate (old deploy/instance) — this process keeps its "
+            f"listener. Detail: {name}: {text}"
+        )
+        return
+    logger.error(f"[Telegram Bot] polling error: {name}: {text}")
 
 def _load_rulebook(path: str) -> str:
     try:
@@ -3307,9 +3694,11 @@ async def _stage_telegram_media(message: Any, context: Any) -> str:
     logger.info(f"[Telegram media] staged {raw_name} -> {dest} ({size} bytes)")
     return (
         f"[Attached media] {raw_name} ({size} bytes) is staged at this local path: {dest}. "
-        "The user's text/caption above is the instruction for THIS file. Pass this exact "
-        "path as video_path to edit_gameplay_footage (gameplay/footage edits) or another "
-        "media tool — never invent a path and never claim the file is missing."
+        "The user's text/caption above is the instruction for THIS file. If the file is "
+        "video/gameplay footage, pass this exact path as video_path to "
+        "edit_gameplay_footage; for any other file type inspect it locally with "
+        "run_local_command (file, pdftotext, unzip, python) — never invent a path and "
+        "never claim the file is missing."
     )
 
 
@@ -3321,9 +3710,19 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # downloaded locally so its exact path can be handed to the pipeline.
     user_msg = ((getattr(message, "text", None) or "").strip()
                 or (getattr(message, "caption", None) or "").strip())
+    attached = (getattr(message, "video", None) or getattr(message, "document", None)
+                or getattr(message, "animation", None))
+    attached_name = str(getattr(attached, "file_name", "") or "").lower()
+    has_video_media = bool(
+        getattr(message, "video", None) or getattr(message, "animation", None)
+        or attached_name.endswith(VIDEO_MEDIA_SUFFIXES)
+    )
+    # Route from the user's own words (plus the attachment TYPE), never from the
+    # staging note below: that note mentions video_path/gameplay, and classifying
+    # it would turn every document upload into a video request.
+    task_mode = classify_task(user_msg, has_video_media=has_video_media)
     media_note = ""
-    if (getattr(message, "video", None) or getattr(message, "document", None)
-            or getattr(message, "animation", None)):
+    if attached:
         try:
             media_note = await _stage_telegram_media(message, context)
         except Exception as media_err:
@@ -3347,14 +3746,29 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(reply)
         return
 
+    # 0. Route the turn BEFORE any tool runs. A general task (code, shell, data,
+    #    research) can never reach the video pipeline; only an explicit video
+    #    request or an uploaded clip changes the route.
+    TASK_CONTEXT.update(
+        active=True,
+        mode=task_mode,
+        prompt=user_msg,
+        has_video_media=has_video_media,
+        started=time.monotonic(),
+    )
+    logger.info(
+        f"[Routing] mode={TASK_CONTEXT['mode']} video_media={has_video_media} "
+        f"prompt={user_msg[:120]!r}"
+    )
+
     # 1. Post the live progress card immediately at 15%.
     reset_progress()
     try:
         CURRENT_STATUS_MSG = await update.message.reply_text(
             f"Task/Project Progress\n[{progress_bar(15)}] 15%\n\n"
-            f"Current status: {PROGRESS_MILESTONES[0][1]}"
+            f"Current status: {stage_text(0)}"
         )
-        PROGRESS_STATE.update(percent=15, stage=PROGRESS_MILESTONES[0][1])
+        PROGRESS_STATE.update(percent=15, stage=stage_text(0))
     except Exception as e:
         logger.warning(f"Could not dispatch initial status card: {e}")
         CURRENT_STATUS_MSG = None
@@ -3363,7 +3777,21 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     #    render phase can never leave the card frozen at 15%.
     heartbeat = asyncio.create_task(progress_heartbeat())
     try:
-        reply = await generate_reasoning_response(user_msg)
+        reply = await asyncio.wait_for(
+            generate_reasoning_response(user_msg), timeout=REASONING_TIMEOUT_SECONDS
+        )
+    except asyncio.TimeoutError:
+        logger.error(
+            f"[Turn] reasoning exceeded the {REASONING_TIMEOUT_SECONDS}s hard timeout; "
+            "abandoning the request instead of stalling the card."
+        )
+        PROGRESS_STATE["turn_failed"] = (
+            f"reasoning pipeline exceeded its {REASONING_TIMEOUT_SECONDS}s hard timeout"
+        )
+        reply = (
+            f"[FAILED] this turn exceeded its {REASONING_TIMEOUT_SECONDS}s hard timeout and "
+            "was stopped. Re-send the task, or split it into smaller steps."
+        )
     except Exception as reasoning_err:
         logger.error(f"Reasoning pipeline error: {reasoning_err}", exc_info=True)
         PROGRESS_STATE["turn_failed"] = f"reasoning pipeline error: {reasoning_err}"
@@ -3375,23 +3803,29 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # 3. Walk the card through the finishing stages. A dispatched render reaches
     #    95% (mux/upload) and the Telegram send marks 100% when the MP4 lands.
-    #    A turn that produced NO video (tool-round ceiling, reasoning error) must
-    #    never be padded to the forced 100% "Complete! Video delivered." card.
+    #    A failed turn (dispatch error, reasoning timeout, tool-round ceiling) must
+    #    never be padded to a forced 100% card, and a general turn must never be
+    #    shown the video-delivery wording.
+    mode = TASK_CONTEXT.get("mode")
     if PROGRESS_STATE.get("video_dispatched"):
-        await update_progress_card(95, PROGRESS_MILESTONES[4][1])
+        await update_progress_card(95, VIDEO_PROGRESS_MILESTONES[4][1])
     turn_failed = str(PROGRESS_STATE.get("turn_failed") or "").strip()
     if turn_failed:
         held_percent = int(PROGRESS_STATE.get("percent") or 0)
-        logger.error(f"[Turn] ending with NO video produced: {turn_failed}")
-        await update_progress_card(
-            held_percent,
-            f"Stopped — no video produced ({turn_failed[:160]})",
-            force=True,
+        stage = (
+            f"Stopped — no video produced ({turn_failed[:160]})"
+            if mode == "video"
+            else f"Stopped — task failed ({turn_failed[:160]})"
         )
+        logger.error(f"[Turn] ending failed: {turn_failed}")
+        await update_progress_card(held_percent, stage, force=True)
     elif PROGRESS_STATE.get("video_dispatched"):
-        await update_progress_card(100, PROGRESS_MILESTONES[5][1], force=True)
+        await update_progress_card(100, VIDEO_PROGRESS_MILESTONES[5][1], force=True)
     else:
+        # A general (or video-less) turn finished its actual work: say so, and
+        # never claim a video that was never rendered.
         await update_progress_card(100, "Task complete.", force=True)
+    TASK_CONTEXT["active"] = False
 
     # 4. Deliver response text payload
     if len(reply) <= 4000:
@@ -3439,8 +3873,13 @@ async def startup_event():
             )
             await telegram_app.initialize()
             await telegram_app.start()
-            asyncio.create_task(telegram_app.updater.start_polling(drop_pending_updates=True))
-            logger.info("[Telegram Bot] Polling started cleanly.")
+            asyncio.create_task(
+                telegram_app.updater.start_polling(drop_pending_updates=True, error_callback=_on_polling_error)
+            )
+            logger.info(
+                "[Telegram Bot] Polling started cleanly (only ONE instance may poll "
+                "this token)."
+            )
         except Exception as te:
             logger.error(f"Telegram start error: {te}")
 
